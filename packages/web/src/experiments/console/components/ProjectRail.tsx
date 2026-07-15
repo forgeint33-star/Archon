@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState, type ReactElement } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router';
-import { Settings, Workflow, ArrowLeft, type LucideIcon } from 'lucide-react';
+import { Activity, Settings, Workflow, ArrowLeft, type LucideIcon } from 'lucide-react';
 import { ProjectRow } from './ProjectRow';
 import { EnvVarsDialog } from './EnvVarsDialog';
 import { useEntity, invalidate } from '../store/cache';
@@ -297,6 +297,12 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
       {/* Nav menu — settings + the classic-UI escape hatches, under Add project
           and separated from it by the border-t divider. */}
       <div className="flex flex-col gap-0.5 border-t border-border px-2.5 py-2">
+        <RailNavLink
+          to="/console/goviral"
+          icon={Activity}
+          label="GoViral Control Plane"
+          title="GoViral BrainOS and governance status"
+        />
         <RailNavLink
           to="/console/settings"
           icon={Settings}

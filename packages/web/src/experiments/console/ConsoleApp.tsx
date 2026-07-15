@@ -9,6 +9,7 @@ import { RunDetailPage } from './routes/RunDetailPage';
 import { ChatPage } from './routes/ChatPage';
 import { PreviewPage } from './routes/PreviewPage';
 import { SettingsPage } from './routes/SettingsPage';
+import { GoviralControlPlanePage } from './routes/GoviralControlPlanePage';
 import { invalidate } from './store/cache';
 import { K } from './store/keys';
 import { useKeymap, type Binding } from './lib/keymap';
@@ -73,6 +74,7 @@ export function ConsoleApp(): ReactElement {
           <Routes>
             <Route index element={<RunsPage />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="goviral" element={<GoviralControlPlanePage />} />
             <Route path="_preview" element={<PreviewPage />} />
             <Route path="p/:projectId" element={<RunsPage />} />
             <Route path="p/:projectId/chat" element={<ChatPage />} />

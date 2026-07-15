@@ -6,6 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
+import { registerGoviralRoutes } from './goviral-control-plane';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
@@ -1318,6 +1319,7 @@ export function registerApiRoutes(
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[]
 ): void {
+  registerGoviralRoutes(app);
   function apiError(
     c: Context,
     status: 400 | 401 | 404 | 422 | 500 | 503,
