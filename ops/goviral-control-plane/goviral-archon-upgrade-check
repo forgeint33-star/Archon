@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -uo pipefail
+umask 077
+
+SRC="/opt/goviral-archon-src"
+STATE="/var/lib/goviral-archon/.archon/upgrade-checks"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TMP="$(mktemp -d "/tmp/goviral-archon-upgrade.${STAMP}.XXXXXX")"
+WT="$TMP/worktree"
+REPORT="$STATE/${STAMP}.json"
+STATUS="UNKNOWN"
+DETAIL=""
+COMPATIBLE=false
+SERVER_CHECK="not_run"
+WEB_CHECK="not_run"
+BUILD_CHECK="not_run"
+HEAD="$(/usr/bin/git -c "safe.directory=$SRC" -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
+ORIGIN_DEV="unknown"
+
+cleanup() {
+  /usr/bin/git -c "safe.directory=$SRC" -C "$SRC" \
+    worktree remove --force "$WT" >/dev/null 2>&1 || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+mkdir -p "$STATE"
+chmod 0700 "$STATE"
+
+if [ -n "$(/usr/bin/git -c "safe.directory=$SRC" -C "$SRC" status --porcelain 2>/dev/null)" ]; then
+  STATUS="DIRTY_WORKTREE"
+  DETAIL="Production worktree is not clean; no upgrade test was attempted."
+elif ! /usr/bin/git -c "safe.directory=$SRC" -C "$SRC" fetch --prune origin dev >/dev/null 2>&1; then
+  STATUS="FETCH_UNAVAILABLE"
+  DETAIL="Could not fetch origin/dev; production was not modified."
+else
+  ORIGIN_DEV="$(/usr/bin/git -c "safe.directory=$SRC" -C "$SRC" rev-parse origin/dev)"
+  if ! /usr/bin/git -c "safe.directory=$SRC" -C "$SRC" worktree add --detach "$WT" HEAD >/dev/null 2>&1; then
+    STATUS="WORKTREE_FAILED"
+    DETAIL="Could not create isolated worktree."
+  elif ! /usr/bin/git -c "safe.directory=$WT" -C "$WT" \
+    -c user.name='GoViral Upgrade Check' \
+    -c user.email='upgrade-check@local' \
+    merge --no-commit --no-ff origin/dev >/dev/null 2>&1; then
+    STATUS="MERGE_CONFLICT"
+    DETAIL="origin/dev conflicts with the current GoViral customization. Production was not modified."
+  else
+    if [ -d "$SRC/node_modules" ] && [ ! -e "$WT/node_modules" ]; then
+      ln -s "$SRC/node_modules" "$WT/node_modules"
+    fi
+
+    if (cd "$WT" && /usr/bin/timeout 600 /usr/local/bin/bun --filter @archon/server type-check >/dev/null 2>&1); then
+      SERVER_CHECK="pass"
+    else
+      SERVER_CHECK="fail"
+    fi
+
+    if (cd "$WT" && /usr/bin/timeout 600 /usr/local/bin/bun --filter @archon/web type-check >/dev/null 2>&1); then
+      WEB_CHECK="pass"
+    else
+      WEB_CHECK="fail"
+    fi
+
+    if (cd "$WT" && /usr/bin/timeout 900 /usr/local/bin/bun --filter @archon/web build >/dev/null 2>&1); then
+      BUILD_CHECK="pass"
+    else
+      BUILD_CHECK="fail"
+    fi
+
+    if [ "$SERVER_CHECK" = "pass" ] && [ "$WEB_CHECK" = "pass" ] && [ "$BUILD_CHECK" = "pass" ]; then
+      STATUS="COMPATIBLE"
+      DETAIL="Isolated merge, type-checks and production build passed."
+      COMPATIBLE=true
+    else
+      STATUS="CHECKS_FAILED"
+      DETAIL="The isolated merge succeeded, but one or more validation checks failed."
+    fi
+  fi
+fi
+
+python3 - "$REPORT" "$STATUS" "$DETAIL" "$COMPATIBLE" "$HEAD" "$ORIGIN_DEV" "$SERVER_CHECK" "$WEB_CHECK" "$BUILD_CHECK" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import os
+import pwd
+import sys
+
+report = Path(sys.argv[1])
+payload = {
+    "status": sys.argv[2],
+    "detail": sys.argv[3],
+    "compatible": sys.argv[4].lower() == "true",
+    "head": sys.argv[5],
+    "origin_dev": sys.argv[6],
+    "server_typecheck": sys.argv[7],
+    "web_typecheck": sys.argv[8],
+    "web_build": sys.argv[9],
+    "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+}
+report.write_text(json.dumps(payload, indent=2) + "\n")
+report.chmod(0o600)
+account = pwd.getpwnam("goviral-archon")
+os.chown(report, account.pw_uid, account.pw_gid)
+PY
+
+echo "upgrade_check_status=$STATUS"
+echo "upgrade_check_compatible=$COMPATIBLE"
+echo "upgrade_check_report=$REPORT"
+echo "production_modified=false"

@@ -1,0 +1,17 @@
+[Unit]
+Description=GoViral Control Plane governed-action canary
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/sleep infinity
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
