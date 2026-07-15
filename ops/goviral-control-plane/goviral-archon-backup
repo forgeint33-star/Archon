@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+export HOME="/var/lib/goviral-archon"
+export GIT_OPTIONAL_LOCKS=0
+
+ROOT="/var/lib/goviral-archon/backups/control-plane"
+SRC="/opt/goviral-archon-src"
+STATE="/var/lib/goviral-archon/.archon"
+BRAIN="/var/lib/goviral-archon/workspaces/goviral-brain"
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+ARCHIVE="$ROOT/goviral-control-plane-${STAMP}.tar.gz"
+
+git_read() {
+  /usr/bin/git \
+    -c "safe.directory=$SRC" \
+    -C "$SRC" \
+    "$@"
+}
+
+mkdir -p "$ROOT"
+chmod 0700 "$ROOT"
+
+TMP="$(mktemp -d "$ROOT/.tmp.${STAMP}.XXXXXX")"
+
+cleanup() {
+  rm -rf "$TMP"
+}
+
+trap cleanup EXIT
+
+python3 - "$STATE/archon.db" "$TMP/archon.db" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+
+if source.is_file():
+    with sqlite3.connect(source) as source_db:
+        with sqlite3.connect(destination) as destination_db:
+            source_db.backup(destination_db)
+PY
+
+for source in \
+  "$STATE/config.yaml" \
+  "$STATE/goviral-control-audit.jsonl" \
+  "$BRAIN/.governance/approval/queue.json"
+do
+  if [ -f "$source" ]; then
+    /usr/bin/install \
+      -m 0600 \
+      "$source" \
+      "$TMP/$(basename "$source")"
+  fi
+done
+
+git_read rev-parse HEAD \
+  > "$TMP/archon-head.txt"
+
+git_read branch --show-current \
+  > "$TMP/archon-branch.txt"
+
+git_read diff --name-status \
+  > "$TMP/archon-working-diff.txt"
+
+git_read diff --cached --name-status \
+  > "$TMP/archon-staged-diff.txt"
+
+git_read ls-files --others --exclude-standard \
+  > "$TMP/archon-untracked-files.txt"
+
+git_read log --oneline --decorate -20 \
+  > "$TMP/archon-log.txt"
+
+git_read diff --binary origin/dev...HEAD \
+  > "$TMP/archon-custom.patch"
+
+cp -a \
+  "$SRC/ops/goviral-control-plane" \
+  "$TMP/operations-files"
+
+for source in \
+  "$SRC/packages/server/src/routes/goviral-control-plane.ts" \
+  "$SRC/packages/server/src/routes/goviral-phase2.ts" \
+  "$SRC/packages/server/src/routes/goviral-phase3.ts" \
+  "$SRC/packages/server/src/routes/goviral-phase4.ts" \
+  "$SRC/packages/web/src/experiments/console/routes/GoviralControlPlanePage.tsx" \
+  "$SRC/packages/web/src/experiments/console/components/GoviralOperationsPanels.tsx" \
+  "$SRC/packages/web/src/experiments/console/components/GoviralCommandCenter.tsx"
+do
+  if [ -f "$source" ]; then
+    destination="$TMP/custom-source${source#"$SRC"}"
+    mkdir -p "$(dirname "$destination")"
+    /usr/bin/install -m 0600 "$source" "$destination"
+  fi
+done
+
+/usr/bin/tar \
+  -C "$TMP" \
+  -czf "$ARCHIVE" \
+  .
+
+chmod 0600 "$ARCHIVE"
+
+/usr/bin/sha256sum "$ARCHIVE" \
+  > "$ARCHIVE.sha256"
+
+chmod 0600 "$ARCHIVE.sha256"
+
+ln -sfn \
+  "$(basename "$ARCHIVE")" \
+  "$ROOT/latest.tar.gz"
+
+find "$ROOT" \
+  -maxdepth 1 \
+  -type f \
+  \( -name '*.tar.gz' -o -name '*.sha256' \) \
+  -mtime +14 \
+  -delete
+
+echo "backup_created=$ARCHIVE"
+echo "backup_size_bytes=$(stat -c %s "$ARCHIVE")"

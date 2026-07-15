@@ -1,0 +1,1 @@
+goviral-archon ALL=(root) NOPASSWD: /usr/local/bin/goviral-control-action *

@@ -1,3 +1,4 @@
+import { GoviralCommandCenter } from '../components/GoviralCommandCenter';
 import { GoviralOperationsPanels } from '../components/GoviralOperationsPanels';
 import { useCallback, useEffect, useState, type ReactElement, type ReactNode } from 'react';
 
@@ -492,6 +493,7 @@ export function GoviralControlPlanePage(): ReactElement {
           </div>
         </Panel>
         <GoviralOperationsPanels />
+        <GoviralCommandCenter />
       </div>
     </div>
   );

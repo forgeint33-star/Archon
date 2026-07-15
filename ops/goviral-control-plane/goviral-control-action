@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+QUEUE = Path('/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json')
+AUDIT = Path('/var/lib/goviral-archon/.archon/goviral-control-audit.jsonl')
+LOCK = Path('/var/lock/goviral-control-action.lock')
+EXECUTOR = Path('/usr/local/bin/goviral-approval-split-executor')
+ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$')
+UNIT_RE = re.compile(r'^goviral-[a-z0-9-]+\.service$')
+DENIED_UNITS = {
+    'goviral-archon.service',
+    'goviral-action-firewall.service',
+    'goviral-workspace-guard.service',
+    'goviral-brainos-watchtower.service',
+    'goviral-watchdog-hourly.service',
+    'goviral-watchdog-daily.service',
+}
+ACTIONS = {
+    'approve',
+    'reject',
+    'execute',
+    'retry-unit',
+    'start-unit',
+    'stop-unit',
+}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def emit(payload: dict, code: int = 0) -> None:
+    print(json.dumps(payload, separators=(',', ':'), ensure_ascii=True))
+    raise SystemExit(code)
+
+
+def append_audit(action: str, target: str, status: str, detail: str) -> None:
+    AUDIT.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        'timestamp': now(),
+        'actor': os.environ.get('SUDO_USER') or os.environ.get('USER') or 'unknown',
+        'action': action,
+        'target': target,
+        'status': status,
+        'detail': detail[:400],
+    }
+    with AUDIT.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(record, separators=(',', ':'), ensure_ascii=True))
+        handle.write('\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def fail(action: str, target: str, detail: str, code: int = 2) -> None:
+    append_audit(action, target, 'denied', detail)
+    emit({'ok': False, 'action': action, 'target': target, 'error': detail}, code)
+
+
+def load_queue() -> tuple[dict, os.stat_result]:
+    st = QUEUE.stat()
+    data = json.loads(QUEUE.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('approval queue root must be an object')
+    for bucket in ('pending', 'approved', 'rejected', 'executed'):
+        if not isinstance(data.get(bucket), list):
+            raise ValueError(f'approval queue bucket is invalid: {bucket}')
+    return data, st
+
+
+def write_queue(data: dict, st: os.stat_result) -> None:
+    fd, temporary = tempfile.mkstemp(prefix='.queue.', suffix='.tmp', dir=str(QUEUE.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, st.st_mode & 0o777)
+        os.chown(temporary, st.st_uid, st.st_gid)
+        os.replace(temporary, QUEUE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def find_item(items: list, approval_id: str) -> tuple[int, dict] | None:
+    for index, value in enumerate(items):
+        if isinstance(value, dict) and str(value.get('id', '')) == approval_id:
+            return index, value
+    return None
+
+
+def move_approval(action: str, approval_id: str) -> None:
+    destination = 'approved' if action == 'approve' else 'rejected'
+    timestamp_key = 'approved_at' if action == 'approve' else 'rejected_at'
+    with LOCK.open('a+', encoding='utf-8') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        data, st = load_queue()
+        found = find_item(data['pending'], approval_id)
+        if found is None:
+            fail(action, approval_id, 'approval ID is not pending')
+        index, item = found
+        moved = dict(item)
+        moved['status'] = destination
+        moved[timestamp_key] = now()
+        data['pending'].pop(index)
+        data[destination].append(moved)
+        write_queue(data, st)
+    append_audit(action, approval_id, 'success', f'moved pending approval to {destination}')
+    emit({'ok': True, 'action': action, 'target': approval_id, 'status': destination})
+
+
+def execute_approval(approval_id: str) -> None:
+    data, _ = load_queue()
+    if find_item(data['approved'], approval_id) is None:
+        fail('execute', approval_id, 'approval ID is not approved')
+    if not EXECUTOR.is_file() or not os.access(EXECUTOR, os.X_OK):
+        fail('execute', approval_id, 'governed split executor is unavailable')
+    runuser = shutil.which('runuser')
+    if not runuser:
+        fail('execute', approval_id, 'runuser is unavailable')
+    result = subprocess.run(
+        [runuser, '-u', 'goviral-archon', '--', str(EXECUTOR), 'execute', approval_id],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env={**os.environ, 'HOME': '/var/lib/goviral-archon'},
+    )
+    output = (result.stdout or result.stderr).strip().replace('\n', ' ')[:500]
+    if result.returncode != 0:
+        fail('execute', approval_id, output or f'executor returned {result.returncode}')
+    append_audit('execute', approval_id, 'success', output or 'governed executor completed')
+    emit({'ok': True, 'action': 'execute', 'target': approval_id, 'status': 'completed', 'detail': output})
+
+
+def unit_state(unit: str) -> dict[str, str]:
+    result = subprocess.run(
+        ['/usr/bin/systemctl', 'show', unit, '--property=LoadState', '--property=ActiveState', '--property=SubState', '--property=UnitFileState'],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition('=')
+        if separator:
+            values[key] = value
+    return values
+
+
+def control_unit(action: str, unit: str) -> None:
+    if not UNIT_RE.fullmatch(unit):
+        fail(action, unit, 'unit name is not allowlisted')
+    if unit in DENIED_UNITS:
+        fail(action, unit, 'unit is protected from Control Plane actions')
+    state = unit_state(unit)
+    if state.get('LoadState') != 'loaded':
+        fail(action, unit, 'unit is not loaded')
+    active = state.get('ActiveState', 'unknown')
+    if action == 'retry-unit' and active != 'failed':
+        fail(action, unit, 'retry is allowed only for failed units')
+    if action == 'start-unit' and active == 'active':
+        fail(action, unit, 'unit is already active')
+    if action == 'stop-unit' and active != 'active':
+        fail(action, unit, 'stop is allowed only for active units')
+    commands = {
+        'retry-unit': [
+            ['/usr/bin/systemctl', 'reset-failed', unit],
+            ['/usr/bin/systemctl', 'start', unit],
+        ],
+        'start-unit': [['/usr/bin/systemctl', 'start', unit]],
+        'stop-unit': [['/usr/bin/systemctl', 'stop', unit]],
+    }
+    for command in commands[action]:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip().replace('\n', ' ')[:500]
+            fail(action, unit, detail or f'systemctl returned {result.returncode}')
+    final_state = unit_state(unit)
+    detail = f"{final_state.get('ActiveState', 'unknown')}/{final_state.get('SubState', 'unknown')}"
+    append_audit(action, unit, 'success', detail)
+    emit({'ok': True, 'action': action, 'target': unit, 'status': detail})
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        emit({'ok': False, 'error': 'root execution through the sudo policy is required'}, 2)
+    action = sys.argv[1] if len(sys.argv) > 1 else ''
+    target = sys.argv[2] if len(sys.argv) > 2 else ''
+    if action not in ACTIONS:
+        emit({'ok': False, 'error': 'unsupported action'}, 2)
+    if action in {'approve', 'reject', 'execute'}:
+        if not ID_RE.fullmatch(target):
+            fail(action, target, 'approval ID format is invalid')
+        if action in {'approve', 'reject'}:
+            move_approval(action, target)
+        execute_approval(target)
+    control_unit(action, target)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        action = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
+        target = sys.argv[2] if len(sys.argv) > 2 else 'unknown'
+        append_audit(action, target, 'error', str(exc))
+        emit({'ok': False, 'action': action, 'target': target, 'error': str(exc)[:300]}, 2)
