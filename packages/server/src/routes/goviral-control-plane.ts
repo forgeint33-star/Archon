@@ -1,3 +1,4 @@
+import { registerGoviralPhase2Routes } from './goviral-phase2';
 import type { OpenAPIHono } from '@hono/zod-openapi';
 import { readFile, readdir, stat } from 'fs/promises';
 import { basename, join, relative, resolve, sep } from 'path';
@@ -161,6 +162,7 @@ async function latestPrd(): Promise<JsonRecord | null> {
 }
 
 export function registerGoviralRoutes(app: OpenAPIHono): void {
+  registerGoviralPhase2Routes(app);
   app.get('/api/goviral/overview', async c => {
     const queuePath = join(BRAIN_ROOT, '.governance', 'approval', 'queue.json');
 
