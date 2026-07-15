@@ -1,3 +1,4 @@
+import { GoviralOperationsPanels } from '../components/GoviralOperationsPanels';
 import { useCallback, useEffect, useState, type ReactElement, type ReactNode } from 'react';
 
 interface OverviewData {
@@ -490,6 +491,7 @@ export function GoviralControlPlanePage(): ReactElement {
             </div>
           </div>
         </Panel>
+        <GoviralOperationsPanels />
       </div>
     </div>
   );
