@@ -1,0 +1,18 @@
+[Unit]
+Description=GoViral Archon weekly upstream compatibility check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HOME=/var/lib/goviral-archon
+Environment=GIT_OPTIONAL_LOCKS=0
+ExecStart=/usr/local/bin/goviral-archon-upgrade-check
+TimeoutStartSec=1800
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ReadOnlyPaths=/var/lib/goviral-archon/.archon
+ReadWritePaths=/var/lib/goviral-archon/.archon/upgrade-checks

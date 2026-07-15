@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Secure off-site backup configuration for GoViral Control Plane.
+
+Must be run as root. Prompts for S3-compatible endpoint, bucket, access key,
+secret key, and an age public key for encryption before upload.
+Stores credentials as root-owned 0600 files under /etc/goviral/credentials/.
+"""
+import getpass
+import json
+import os
+import sys
+from pathlib import Path
+
+CRED_DIR = Path('/etc/goviral/credentials')
+OFFSITE_CONFIG = CRED_DIR / 'offsite-backup.json'
+STATE_FILE = Path('/var/lib/goviral-archon/.archon/offsite-backup.json')
+TIMEOUT = 15
+
+
+def fail(message: str) -> None:
+    print(f'ERROR: {message}', file=sys.stderr)
+    raise SystemExit(1)
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail('This command must be run as root.')
+
+    print('GoViral Off-Site Backup Configuration')
+    print('=' * 40)
+    print()
+    print('This configures encrypted off-site backup to an S3-compatible target.')
+    print('Backups are encrypted with age before upload. No plaintext credentials are backed up.')
+    print()
+
+    endpoint = input('S3-compatible endpoint URL (e.g., https://s3.example.com): ').strip()
+    if not endpoint:
+        fail('Endpoint is required.')
+
+    bucket = input('Bucket name: ').strip()
+    if not bucket:
+        fail('Bucket name is required.')
+
+    prefix = input('Key prefix (default: goviral-backups/): ').strip() or 'goviral-backups/'
+
+    access_key = input('Access key: ').strip()
+    if not access_key:
+        fail('Access key is required.')
+
+    secret_key = getpass.getpass('Secret key (hidden): ').strip()
+    if not secret_key:
+        fail('Secret key is required.')
+
+    age_recipient = input('age public key for encryption (age1...): ').strip()
+    if not age_recipient or not age_recipient.startswith('age1'):
+        fail('A valid age public key is required for backup encryption.')
+
+    retention_days = input('Retention days (default: 30): ').strip() or '30'
+    try:
+        retention = int(retention_days)
+    except ValueError:
+        fail('Retention must be a number.')
+
+    # Store credentials
+    CRED_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CRED_DIR, 0o700)
+    os.chown(CRED_DIR, 0, 0)
+
+    config = {
+        'endpoint': endpoint,
+        'bucket': bucket,
+        'prefix': prefix,
+        'access_key': access_key,
+        'secret_key': secret_key,
+        'age_recipient': age_recipient,
+        'retention_days': retention,
+    }
+    OFFSITE_CONFIG.write_text(json.dumps(config, indent=2) + '\n')
+    os.chmod(OFFSITE_CONFIG, 0o600)
+    os.chown(OFFSITE_CONFIG, 0, 0)
+
+    # Update integration state
+    from datetime import datetime, timezone
+    import pwd
+    state = {
+        'configured': True,
+        'state': 'not_configured',
+        'detail': f'Credentials stored. Run a canary upload to {bucket}/{prefix} before enabling.',
+        'endpoint': endpoint,
+        'bucket': bucket,
+        'prefix': prefix,
+        'retention_days': retention,
+        'last_check': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+    }
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + '\n')
+    os.chmod(STATE_FILE, 0o600)
+    account = pwd.getpwnam('goviral-archon')
+    os.chown(STATE_FILE, account.pw_uid, account.pw_gid)
+
+    print()
+    print('Credentials stored:')
+    print(f'  {OFFSITE_CONFIG} (root:root 0600)')
+    print()
+    print('Next steps:')
+    print('  1. Install age: apt install age')
+    print('  2. Run a canary upload: goviral-offsite-canary')
+    print('  3. Verify the canary in the target bucket')
+    print('  4. Enable the off-site backup timer after verification')
+
+
+if __name__ == '__main__':
+    main()

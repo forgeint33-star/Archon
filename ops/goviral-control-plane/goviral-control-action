@@ -31,6 +31,7 @@ ACTIONS = {
     'retry-unit',
     'start-unit',
     'stop-unit',
+    'test-telegram',
 }
 
 
@@ -193,6 +194,42 @@ def control_unit(action: str, unit: str) -> None:
     emit({'ok': True, 'action': action, 'target': unit, 'status': detail})
 
 
+def test_telegram() -> None:
+    """Send a test message via Telegram to validate connectivity."""
+    import urllib.request as _req
+    import urllib.error as _err
+
+    token_file = Path('/etc/goviral/credentials/telegram-bot-token')
+    chat_file = Path('/etc/goviral/credentials/telegram-chat-id')
+    if not token_file.is_file() or not chat_file.is_file():
+        fail('test-telegram', 'test', 'Telegram credentials are not configured')
+    try:
+        token = token_file.read_text().strip()
+        chat_id = chat_file.read_text().strip()
+    except PermissionError:
+        fail('test-telegram', 'test', 'Cannot read Telegram credentials')
+    if not token or not chat_id:
+        fail('test-telegram', 'test', 'Telegram credentials are empty')
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    data = json.dumps({
+        'chat_id': chat_id,
+        'text': 'GoViral Control Plane: test notification sent by admin.',
+        'parse_mode': 'HTML',
+    }).encode()
+    request = _req.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    try:
+        with _req.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read())
+            if not result.get('ok'):
+                fail('test-telegram', 'test', 'Telegram API returned ok=false')
+    except _err.HTTPError as exc:
+        fail('test-telegram', 'test', f'Telegram API HTTP {exc.code}')
+    except _err.URLError as exc:
+        fail('test-telegram', 'test', f'Telegram network error: {exc.reason}')
+    append_audit('test-telegram', 'test', 'success', 'test message sent')
+    emit({'ok': True, 'action': 'test-telegram', 'target': 'test', 'status': 'sent'})
+
+
 def main() -> None:
     if os.geteuid() != 0:
         emit({'ok': False, 'error': 'root execution through the sudo policy is required'}, 2)
@@ -200,6 +237,8 @@ def main() -> None:
     target = sys.argv[2] if len(sys.argv) > 2 else ''
     if action not in ACTIONS:
         emit({'ok': False, 'error': 'unsupported action'}, 2)
+    if action == 'test-telegram':
+        test_telegram()
     if action in {'approve', 'reject', 'execute'}:
         if not ID_RE.fullmatch(target):
             fail(action, target, 'approval ID format is invalid')

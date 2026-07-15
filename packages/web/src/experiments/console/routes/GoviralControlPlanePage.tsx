@@ -1,4 +1,5 @@
 import { GoviralCommandCenter } from '../components/GoviralCommandCenter';
+import { GoviralControlPlaneV2 } from '../components/GoviralControlPlaneV2';
 import { GoviralOperationsPanels } from '../components/GoviralOperationsPanels';
 import { useCallback, useEffect, useState, type ReactElement, type ReactNode } from 'react';
 
@@ -259,13 +260,13 @@ export function GoviralControlPlanePage(): ReactElement {
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-2xl font-semibold text-white">GoViral Control Plane</h1>
-              <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs font-medium text-sky-200">
-                Read-only
+              <span className="rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-0.5 text-xs font-medium text-fuchsia-200">
+                v2
               </span>
             </div>
             <p className="mt-2 max-w-3xl text-sm text-white/50">
-              Governed operational view of BrainOS, approvals, agents, services and timers. No
-              execution actions are exposed.
+              Governed operational view with notifications, search, integrations, analytics,
+              disaster recovery and upstream compatibility checks.
             </p>
           </div>
 
@@ -494,6 +495,7 @@ export function GoviralControlPlanePage(): ReactElement {
         </Panel>
         <GoviralOperationsPanels />
         <GoviralCommandCenter />
+        <GoviralControlPlaneV2 />
       </div>
     </div>
   );

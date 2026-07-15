@@ -8,7 +8,15 @@ const MAX_AUDIT_BYTES = 128 * 1024;
 const MAX_AUDIT_ROWS = 80;
 const ACTION_TIMEOUT_MS = 180_000;
 
-const ACTIONS = ['approve', 'reject', 'execute', 'retry-unit', 'start-unit', 'stop-unit'] as const;
+const ACTIONS = [
+  'approve',
+  'reject',
+  'execute',
+  'retry-unit',
+  'start-unit',
+  'stop-unit',
+  'test-telegram',
+] as const;
 
 type ControlAction = (typeof ACTIONS)[number];
 type JsonRecord = Record<string, unknown>;
@@ -62,6 +70,10 @@ function isControlAction(value: unknown): value is ControlAction {
 }
 
 function actionTargetValid(action: ControlAction, target: string): boolean {
+  if (action === 'test-telegram') {
+    return target === 'test';
+  }
+
   if (['approve', 'reject', 'execute'].includes(action)) {
     return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(target);
   }
@@ -77,6 +89,7 @@ function confirmationFor(action: ControlAction, target: string): string {
     'retry-unit': 'RETRY',
     'start-unit': 'START',
     'stop-unit': 'STOP',
+    'test-telegram': 'TEST',
   };
 
   return `${verb[action]} ${target}`;
@@ -205,6 +218,7 @@ function actionMetadata(audit: AuditItem[]): ActionMetadata {
       'retry-unit': 'RETRY <unit-name>',
       'start-unit': 'START <unit-name>',
       'stop-unit': 'STOP <unit-name>',
+      'test-telegram': 'TEST test',
     },
     audit,
   };

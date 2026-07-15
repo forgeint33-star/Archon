@@ -1,0 +1,22 @@
+[Unit]
+Description=GoViral Telegram incident notification dispatcher
+After=network-online.target goviral-archon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/bin/goviral-telegram-notifier
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/etc/goviral/credentials
+ReadOnlyPaths=/var/lib/goviral-archon/.archon/goviral-control-health.json
+ReadOnlyPaths=/var/lib/goviral-archon/.archon/upgrade-checks
+ReadOnlyPaths=/var/lib/goviral-archon/.archon/restore-drills
+ReadWritePaths=/var/lib/goviral-archon/.archon/notifications

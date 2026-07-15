@@ -1,1 +1,2 @@
 goviral-archon ALL=(root) NOPASSWD: /usr/local/bin/goviral-control-action *
+goviral-archon ALL=(root) NOPASSWD: /usr/local/bin/goviral-archon-upgrade-check

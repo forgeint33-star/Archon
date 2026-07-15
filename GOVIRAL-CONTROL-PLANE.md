@@ -81,6 +81,49 @@ Qdrant is not required for the Control Plane. Current data is bounded structured
 
 The production bundle currently emits a Vite chunk-size warning but passes type-check and build. Code splitting remains a non-blocking optimization; it is not a reliability or security defect.
 
+## v2 Endpoints
+
+- `GET /api/goviral/telegram` — Telegram notification status
+- `GET /api/goviral/attention` — Needs Attention Today summary
+- `POST /api/goviral/attention/ack` — Acknowledge an attention item
+- `GET /api/goviral/search` — Enhanced search with filters and pagination
+- `GET /api/goviral/filters` — Saved search filters
+- `POST /api/goviral/filters` — Save a search filter
+- `GET /api/goviral/integrations/clickup` — ClickUp integration status
+- `GET /api/goviral/integrations/qdrant` — Qdrant integration status
+- `GET /api/goviral/analytics` — Operational analytics rollup
+- `GET /api/goviral/analytics/export` — CSV export of analytics
+- `GET /api/goviral/recovery` — Disaster recovery status
+- `GET /api/goviral/upgrade` — Upstream compatibility check status
+
+## v2 Governed Actions
+
+- `test-telegram` — Send a test Telegram message (admin only, requires configured credentials)
+
+## Telegram Notifications
+
+Configure with `sudo goviral-telegram-configure`. Credentials stored as root-owned 0600 files under `/etc/goviral/credentials/`. The notifier runs every 15 minutes via `goviral-telegram-notifier.timer`. A daily digest runs at 08:00 UTC via `goviral-daily-ops-report.timer`. Both timers are enabled only after credentials are configured. Deduplication and rate limiting prevent notification storms.
+
+## ClickUp Integration
+
+The old `goviral-clickup-autosync.timer` remains quarantined. A new gated integration is available via `sudo goviral-clickup-configure`. The integration progresses through states: not_configured → read_only_verified → dry_run_verified → canary_verified → production_enabled. Production sync is never enabled without explicit operator confirmation.
+
+## Off-Site Backup
+
+Configure with `sudo goviral-offsite-configure`. Requires an S3-compatible endpoint, an age public key for encryption, and a canary upload before enabling. Credentials are root-owned 0600 files. No plaintext credentials are ever backed up.
+
+## Weekly Upstream Compatibility Check
+
+Runs automatically via `goviral-archon-upgrade-check.timer` (Sundays 04:00 UTC). Creates an isolated worktree, merges origin/dev, runs type-checks and builds. Production is never modified. Results are visible in the Control Plane UI.
+
+## Secure Configuration Commands
+
+```bash
+sudo goviral-telegram-configure     # Telegram bot credentials
+sudo goviral-clickup-configure      # ClickUp API token
+sudo goviral-offsite-configure      # Off-site backup S3 + age key
+```
+
 ## Rollback
 
 To inspect the stable release without changing production:

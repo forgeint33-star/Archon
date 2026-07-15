@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily GoViral operations report at 08:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=goviral-daily-ops-report.service
+
+[Install]
+WantedBy=timers.target
