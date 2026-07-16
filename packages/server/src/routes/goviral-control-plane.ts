@@ -1,3 +1,4 @@
+import { registerGoviralPhase9Routes } from './goviral-phase9-deploy';
 import { registerGoviralPhase8Routes } from './goviral-phase8-analytics';
 import { registerGoviralPhase7Routes } from './goviral-phase7-upgrade';
 import { registerGoviralPhase5Routes } from './goviral-phase5';
@@ -169,6 +170,7 @@ async function latestPrd(): Promise<JsonRecord | null> {
 }
 
 export function registerGoviralRoutes(app: OpenAPIHono): void {
+  registerGoviralPhase9Routes(app);
   registerGoviralPhase8Routes(app);
   registerGoviralPhase7Routes(app);
   registerGoviralPhase5Routes(app);
