@@ -690,6 +690,91 @@ async function analyticsRollup(): Promise<AnalyticsRollup> {
   };
 }
 
+// ─── Phase 15: Agent Task Command Center ─────────────────────────────────────
+
+const TASK_STATE_FILE = join(STATE_DIR, 'agent-tasks.json');
+const AGENT_TASK_AUDIT_FILE = join(STATE_DIR, 'agent-task-audit.jsonl');
+
+interface AgentTask {
+  id: string;
+  title: string;
+  goal: string | null;
+  workflow: string | null;
+  status: 'pending' | 'confirmed' | 'running' | 'completed' | 'failed' | 'cancelled';
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  correlation_id: string;
+  result: string | null;
+}
+
+function generateCorrelationId(): string {
+  return `gvt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function appendAgentTaskAudit(record: JsonRecord): Promise<void> {
+  const dir = AGENT_TASK_AUDIT_FILE.substring(0, AGENT_TASK_AUDIT_FILE.lastIndexOf('/'));
+  await mkdir(dir, { recursive: true });
+  const line = JSON.stringify({ timestamp: new Date().toISOString(), ...record }) + '\n';
+  await writeFile(AGENT_TASK_AUDIT_FILE, line, { flag: 'a', mode: 0o600 });
+}
+
+async function loadAgentTasks(): Promise<AgentTask[]> {
+  const data = asRecord(await readBoundedJson(TASK_STATE_FILE));
+  return Array.isArray(data.tasks) ? (data.tasks as AgentTask[]) : [];
+}
+
+async function saveAgentTasks(tasks: AgentTask[]): Promise<void> {
+  await writeAtomicJson(TASK_STATE_FILE, {
+    tasks: tasks.slice(0, 100),
+    updated_at: new Date().toISOString(),
+  });
+}
+
+// ─── Phase 16: RBAC ──────────────────────────────────────────────────────────
+
+type GoviralRole = 'viewer' | 'operator' | 'admin';
+
+function resolveGoviralRole(headers: Headers): GoviralRole {
+  // Check Archon web auth session via standard header
+  const archonUser = safeText(headers.get('x-archon-user'), 160);
+  const tailscaleUser = safeText(headers.get('tailscale-user-login'), 160);
+
+  // For this single-operator Tailnet deployment, the Tailscale-authenticated
+  // user or X-Archon-User identity resolves to admin. When Archon multi-user
+  // auth is enabled, this should delegate to the user's role from the DB.
+  if (archonUser || tailscaleUser) {
+    return 'admin';
+  }
+
+  // Anonymous local requests get operator when GOVIRAL_ACTIONS_ENABLED=1
+  if (process.env.GOVIRAL_ACTIONS_ENABLED === '1') {
+    return 'operator';
+  }
+
+  return 'viewer';
+}
+
+function requireRole(role: GoviralRole, minimum: GoviralRole): boolean {
+  const rank: Record<GoviralRole, number> = { viewer: 0, operator: 1, admin: 2 };
+  return rank[role] >= rank[minimum];
+}
+
+function roleGate(
+  headers: Headers,
+  minimum: GoviralRole
+): { allowed: true; role: GoviralRole; identity: string } | { allowed: false; role: GoviralRole } {
+  const role = resolveGoviralRole(headers);
+  if (!requireRole(role, minimum)) {
+    return { allowed: false, role };
+  }
+  const identity =
+    safeText(headers.get('tailscale-user-login'), 160) ??
+    safeText(headers.get('x-archon-user'), 160) ??
+    'tailnet-client';
+  return { allowed: true, role, identity };
+}
+
 // ─── Route registration ─────────────────────────────────────────────────────
 
 export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
@@ -708,9 +793,14 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
     return c.json(await needsAttention());
   });
 
-  // Phase 12: Acknowledge incident
+  // Phase 12: Acknowledge incident (Phase 16: operator+ required)
   app.post('/api/goviral/attention/ack', async c => {
     c.header('Cache-Control', 'no-store');
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot acknowledge incidents` }, 403);
+    }
+
     let body: JsonRecord;
     try {
       body = asRecord((await c.req.json()) as unknown);
@@ -727,7 +817,7 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
     const entries = asRecord(ackData.entries);
     entries[incidentId] = {
       acknowledged_at: new Date().toISOString(),
-      acknowledged_by: safeText(body.acknowledged_by, 100) ?? 'operator',
+      acknowledged_by: gate.identity,
     };
 
     await writeAtomicJson(INCIDENTS_ACK_FILE, { entries, updated_at: new Date().toISOString() });
@@ -765,6 +855,11 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
   });
 
   app.post('/api/goviral/filters', async c => {
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot save filters` }, 403);
+    }
+
     let body: JsonRecord;
     try {
       body = asRecord((await c.req.json()) as unknown);
@@ -834,6 +929,217 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
   // Phase 20: Upgrade status
   app.get('/api/goviral/upgrade', async c => {
     return c.json(await upgradeStatus());
+  });
+
+  // Phase 15: Agent task list
+  app.get('/api/goviral/tasks', async c => {
+    const tasks = await loadAgentTasks();
+    return c.json({
+      generated_at: new Date().toISOString(),
+      tasks: tasks.slice(0, 50),
+      total: tasks.length,
+    });
+  });
+
+  // Phase 15: Create agent task (governed)
+  app.post('/api/goviral/tasks', async c => {
+    c.header('Cache-Control', 'no-store');
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot create tasks` }, 403);
+    }
+
+    let body: JsonRecord;
+    try {
+      body = asRecord((await c.req.json()) as unknown);
+    } catch {
+      return c.json({ ok: false, error: 'invalid JSON' }, 400);
+    }
+
+    const title = safeText(body.title, 200);
+    if (!title || title.length < 3) {
+      return c.json({ ok: false, error: 'title is required (3-200 chars)' }, 400);
+    }
+
+    const goal = safeText(body.goal, 2000);
+    const workflow = safeText(body.workflow, 120);
+
+    // Validate workflow exists if specified
+    if (workflow && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,118}$/.test(workflow)) {
+      return c.json({ ok: false, error: 'workflow name contains invalid characters' }, 400);
+    }
+
+    const correlationId = generateCorrelationId();
+    const task: AgentTask = {
+      id: correlationId,
+      title,
+      goal,
+      workflow,
+      status: 'pending',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      created_by: gate.identity,
+      correlation_id: correlationId,
+      result: null,
+    };
+
+    const tasks = await loadAgentTasks();
+    tasks.unshift(task);
+    await saveAgentTasks(tasks);
+
+    await appendAgentTaskAudit({
+      action: 'task_created',
+      task_id: task.id,
+      title: task.title,
+      workflow: task.workflow,
+      user: gate.identity,
+      correlation_id: correlationId,
+    });
+
+    return c.json({ ok: true, task });
+  });
+
+  // Phase 15: Confirm and execute agent task
+  app.post('/api/goviral/tasks/:taskId/confirm', async c => {
+    c.header('Cache-Control', 'no-store');
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot confirm tasks` }, 403);
+    }
+
+    const taskId = sanitizeId(c.req.param('taskId'));
+    const tasks = await loadAgentTasks();
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) {
+      return c.json({ ok: false, error: 'task not found' }, 404);
+    }
+    if (task.status !== 'pending') {
+      return c.json({ ok: false, error: `task status is ${task.status}, not pending` }, 409);
+    }
+
+    let body: JsonRecord;
+    try {
+      body = asRecord((await c.req.json()) as unknown);
+    } catch {
+      return c.json({ ok: false, error: 'invalid JSON' }, 400);
+    }
+
+    const confirmation = safeText(body.confirmation, 200) ?? '';
+    if (confirmation !== `CONFIRM ${taskId}`) {
+      return c.json({ ok: false, error: 'confirmation phrase does not match' }, 400);
+    }
+
+    // If workflow specified, attempt to run it via the CLI
+    if (task.workflow) {
+      task.status = 'confirmed';
+      task.updated_at = new Date().toISOString();
+      await saveAgentTasks(tasks);
+
+      try {
+        const child = Bun.spawn(
+          [
+            '/usr/local/bin/bun',
+            'run',
+            'cli',
+            'workflow',
+            'run',
+            task.workflow,
+            '--detach',
+            '--',
+            task.title,
+          ],
+          {
+            stdout: 'pipe',
+            stderr: 'pipe',
+            cwd: '/opt/goviral-archon-src',
+            env: { ...process.env, HOME: '/var/lib/goviral-archon' },
+          }
+        );
+        const [stdout, exitCode] = await Promise.all([
+          new Response(child.stdout).text(),
+          child.exited,
+        ]);
+
+        if (exitCode === 0) {
+          task.status = 'running';
+          task.result = stdout.trim().slice(0, 500);
+        } else {
+          task.status = 'failed';
+          task.result = `workflow launch failed (exit ${exitCode})`;
+        }
+      } catch (err) {
+        task.status = 'failed';
+        task.result = `launch error: ${err instanceof Error ? err.message : 'unknown'}`.slice(
+          0,
+          300
+        );
+      }
+    } else {
+      task.status = 'confirmed';
+      task.result = 'Task confirmed without workflow — manual execution required';
+    }
+
+    task.updated_at = new Date().toISOString();
+    await saveAgentTasks(tasks);
+
+    await appendAgentTaskAudit({
+      action: 'task_confirmed',
+      task_id: task.id,
+      status: task.status,
+      user: gate.identity,
+      correlation_id: task.correlation_id,
+    });
+
+    return c.json({ ok: true, task });
+  });
+
+  // Phase 15: Cancel agent task
+  app.post('/api/goviral/tasks/:taskId/cancel', async c => {
+    c.header('Cache-Control', 'no-store');
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot cancel tasks` }, 403);
+    }
+
+    const taskId = sanitizeId(c.req.param('taskId'));
+    const tasks = await loadAgentTasks();
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) {
+      return c.json({ ok: false, error: 'task not found' }, 404);
+    }
+    if (task.status !== 'pending' && task.status !== 'confirmed') {
+      return c.json({ ok: false, error: `cannot cancel task in ${task.status} state` }, 409);
+    }
+
+    task.status = 'cancelled';
+    task.updated_at = new Date().toISOString();
+    await saveAgentTasks(tasks);
+
+    await appendAgentTaskAudit({
+      action: 'task_cancelled',
+      task_id: task.id,
+      user: gate.identity,
+      correlation_id: task.correlation_id,
+    });
+
+    return c.json({ ok: true, task });
+  });
+
+  // Phase 16: RBAC status
+  app.get('/api/goviral/rbac', async c => {
+    const role = resolveGoviralRole(c.req.raw.headers);
+    return c.json({
+      generated_at: new Date().toISOString(),
+      role,
+      permissions: {
+        read: true,
+        write_actions: requireRole(role, 'operator'),
+        admin_config: requireRole(role, 'admin'),
+        test_telegram: requireRole(role, 'admin'),
+        enable_integrations: requireRole(role, 'admin'),
+        manage_tasks: requireRole(role, 'operator'),
+      },
+    });
   });
 
   // Phase 17: CSV export for analytics

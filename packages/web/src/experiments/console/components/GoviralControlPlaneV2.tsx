@@ -608,6 +608,244 @@ function UpgradePanel({ data }: { data: UpgradeStatus | null }): ReactElement {
   );
 }
 
+// ─── Agent Task Panel (Phase 15) ─────────────────────────────────────────────
+
+interface AgentTask {
+  id: string;
+  title: string;
+  goal: string | null;
+  workflow: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  correlation_id: string;
+  result: string | null;
+}
+
+interface TasksData {
+  tasks: AgentTask[];
+  total: number;
+}
+
+function AgentTaskPanel({
+  data,
+  onRefresh,
+}: {
+  data: TasksData | null;
+  onRefresh: () => void;
+}): ReactElement {
+  const [title, setTitle] = useState('');
+  const [workflow, setWorkflow] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [confirmText, setConfirmText] = useState('');
+  const [message, setMessage] = useState<string | null>(null);
+
+  const createTask = useCallback(async (): Promise<void> => {
+    if (!title.trim() || title.length < 3) return;
+    setBusy(true);
+    try {
+      const response = await fetch('/api/goviral/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: title.trim(),
+          workflow: workflow.trim() || undefined,
+        }),
+      });
+      const result = asRecord((await response.json()) as unknown);
+      if (result.ok) {
+        setTitle('');
+        setWorkflow('');
+        setMessage('Task created');
+        onRefresh();
+      } else {
+        setMessage(safeString(result.error) ?? 'Failed to create task');
+      }
+    } catch {
+      setMessage('Network error');
+    } finally {
+      setBusy(false);
+    }
+  }, [title, workflow, onRefresh]);
+
+  const confirmTask = useCallback(
+    async (taskId: string): Promise<void> => {
+      if (confirmText !== `CONFIRM ${taskId}`) return;
+      setBusy(true);
+      try {
+        const response = await fetch(`/api/goviral/tasks/${taskId}/confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmation: confirmText }),
+        });
+        const result = asRecord((await response.json()) as unknown);
+        setMessage(result.ok ? 'Task confirmed' : (safeString(result.error) ?? 'Failed'));
+        setConfirmingId(null);
+        setConfirmText('');
+        onRefresh();
+      } catch {
+        setMessage('Network error');
+      } finally {
+        setBusy(false);
+      }
+    },
+    [confirmText, onRefresh]
+  );
+
+  const cancelTask = useCallback(
+    async (taskId: string): Promise<void> => {
+      setBusy(true);
+      try {
+        await fetch(`/api/goviral/tasks/${taskId}/cancel`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        onRefresh();
+      } catch {
+        // silent
+      } finally {
+        setBusy(false);
+      }
+    },
+    [onRefresh]
+  );
+
+  return (
+    <Panel
+      title="Agent Task Command Center"
+      subtitle="Create, confirm, and track governed agent tasks"
+    >
+      {message ? (
+        <div className="mb-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-300">
+          {message}
+        </div>
+      ) : null}
+
+      <div className="mb-4 grid gap-2 sm:grid-cols-[1fr_200px_auto]">
+        <input
+          value={title}
+          onChange={(e): void => {
+            setTitle(e.target.value);
+          }}
+          placeholder="Task description (3-200 chars)..."
+          maxLength={200}
+          className="rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none placeholder:text-white/30 focus:border-fuchsia-500/40"
+          aria-label="Task title"
+        />
+        <input
+          value={workflow}
+          onChange={(e): void => {
+            setWorkflow(e.target.value);
+          }}
+          placeholder="Workflow name (optional)"
+          maxLength={120}
+          className="rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-sm text-white outline-none placeholder:text-white/30"
+          aria-label="Workflow name"
+        />
+        <button
+          type="button"
+          disabled={busy || title.trim().length < 3}
+          onClick={(): void => {
+            void createTask();
+          }}
+          className="rounded-md border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-2 text-sm font-medium text-fuchsia-200 disabled:opacity-35"
+        >
+          Create
+        </button>
+      </div>
+
+      <div className="max-h-[400px] space-y-2 overflow-y-auto">
+        {(data?.tasks ?? []).slice(0, 20).map(
+          (task): ReactElement => (
+            <div key={task.id} className="rounded-lg border border-white/10 bg-black/10 px-3 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-white/85">{task.title}</p>
+                  <p className="mt-1 text-xs text-white/40">
+                    {task.workflow ? `workflow: ${task.workflow} · ` : ''}
+                    {task.created_by} · {formatDate(task.created_at)}
+                  </p>
+                  {task.result ? (
+                    <p className="mt-1 truncate text-xs text-white/30">{task.result}</p>
+                  ) : null}
+                </div>
+                <Pill value={task.status} />
+              </div>
+              {task.status === 'pending' ? (
+                <div className="mt-2 flex gap-2">
+                  {confirmingId === task.id ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={confirmText}
+                        onChange={(e): void => {
+                          setConfirmText(e.target.value);
+                        }}
+                        placeholder={`CONFIRM ${task.id}`}
+                        className="rounded border border-white/10 bg-black/20 px-2 py-1 text-xs text-white outline-none"
+                        aria-label="Confirmation phrase"
+                      />
+                      <button
+                        type="button"
+                        disabled={busy || confirmText !== `CONFIRM ${task.id}`}
+                        onClick={(): void => {
+                          void confirmTask(task.id);
+                        }}
+                        className="rounded border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-1 text-xs text-fuchsia-200 disabled:opacity-35"
+                      >
+                        Run
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={(): void => {
+                          setConfirmingId(task.id);
+                          setConfirmText('');
+                        }}
+                        className="rounded border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-1 text-xs text-fuchsia-200 disabled:opacity-35"
+                      >
+                        Confirm & Execute
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={(): void => {
+                          void cancelTask(task.id);
+                        }}
+                        className="rounded border border-white/15 bg-white/5 px-2 py-1 text-xs text-white/50 disabled:opacity-35"
+                      >
+                        Cancel
+                      </button>
+                    </>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          )
+        )}
+        {(data?.tasks.length ?? 0) === 0 ? <EmptyState text="No agent tasks created yet." /> : null}
+      </div>
+    </Panel>
+  );
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
+function safeString(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  return null;
+}
+
 // ─── Main Component ──────────────────────────────────────────────────────────
 
 export function GoviralControlPlaneV2(): ReactElement {
@@ -618,6 +856,7 @@ export function GoviralControlPlaneV2(): ReactElement {
   const [analytics, setAnalytics] = useState<AnalyticsRollup | null>(null);
   const [recovery, setRecovery] = useState<RecoveryStatus | null>(null);
   const [upgrade, setUpgrade] = useState<UpgradeStatus | null>(null);
+  const [tasks, setTasks] = useState<TasksData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -629,6 +868,7 @@ export function GoviralControlPlaneV2(): ReactElement {
       fetchJson<AnalyticsRollup>('/api/goviral/analytics'),
       fetchJson<RecoveryStatus>('/api/goviral/recovery'),
       fetchJson<UpgradeStatus>('/api/goviral/upgrade'),
+      fetchJson<TasksData>('/api/goviral/tasks'),
     ]);
 
     const failures: string[] = [];
@@ -646,6 +886,8 @@ export function GoviralControlPlaneV2(): ReactElement {
     else failures.push('recovery');
     if (results[6].status === 'fulfilled') setUpgrade(results[6].value);
     else failures.push('upgrade');
+    if (results[7].status === 'fulfilled') setTasks(results[7].value);
+    else failures.push('tasks');
 
     setError(failures.length > 0 ? `Unable to refresh: ${failures.join(', ')}` : null);
   }, []);
@@ -694,6 +936,7 @@ export function GoviralControlPlaneV2(): ReactElement {
           <AttentionPanel data={attention} onAck={handleAck} />
           <TelegramPanel data={telegram} />
           <SearchPanel />
+          <AgentTaskPanel data={tasks} onRefresh={load} />
 
           <div className="grid gap-5 xl:grid-cols-2">
             <IntegrationsPanel clickup={clickup} qdrant={qdrant} />
