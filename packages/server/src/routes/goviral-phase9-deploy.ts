@@ -332,7 +332,7 @@ preflight() {
   fi
 
   # Approval queue check
-  AQ_HASH="\$(sha256sum /var/lib/goviral-archon/workspaces/goviral-brain/workspaces/command-center/approval-queue.md 2>/dev/null | cut -d' ' -f1)"
+  AQ_HASH="\$(sha256sum /var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json 2>/dev/null | cut -d' ' -f1)"
   log "Approval queue hash: $AQ_HASH"
 
   if [ "$ERRORS" -gt 0 ]; then
@@ -603,7 +603,7 @@ export function registerGoviralPhase9Routes(app: OpenAPIHono): void {
       const hashProc = Bun.spawn(
         [
           'sha256sum',
-          '/var/lib/goviral-archon/workspaces/goviral-brain/workspaces/command-center/approval-queue.md',
+          '/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json',
         ],
         { stdout: 'pipe', stderr: 'pipe' }
       );

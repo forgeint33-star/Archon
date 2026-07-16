@@ -274,7 +274,7 @@ describe('generateDeployScript', () => {
 
   test('checks approval queue hash', () => {
     expect(script).toContain('sha256sum');
-    expect(script).toContain('approval-queue.md');
+    expect(script).toContain('queue.json');
   });
 
   test('verifies loopback binding', () => {
