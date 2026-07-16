@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """GoViral daily operations digest for Telegram.
 
-Sends a comprehensive daily summary including doctor status, approval counts,
-active services, backup freshness, incident summary, agent runs, and latest PRD.
+Sends a comprehensive daily summary using the Brain snapshot API (v3):
+doctor status, approval counts, agent registry with drift, Brain inventory,
+integration state (4-layer evidence), backup freshness, and incidents.
 
 Credentials: /etc/goviral/credentials/telegram-bot-token and telegram-chat-id
 """
@@ -128,10 +129,157 @@ def failed_units() -> list[str]:
         return []
 
 
+def safe_int(data: dict, *keys: str) -> int:
+    """Extract an integer from nested dict keys, defaulting to 0."""
+    current = data
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, 0)
+        else:
+            return 0
+    return int(current) if isinstance(current, (int, float)) else 0
+
+
+def safe_str(data: dict, *keys: str, default: str = '—') -> str:
+    """Extract a string from nested dict keys with a safe default."""
+    current = data
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, default)
+        else:
+            return default
+    if isinstance(current, str):
+        return current or default
+    return str(current) if current is not None else default
+
+
+def format_ts(value: str | None) -> str:
+    """Format an ISO timestamp to a compact display form."""
+    if not value or value == '—':
+        return '—'
+    try:
+        return value[:16].replace('T', ' ')
+    except (TypeError, IndexError):
+        return '—'
+
+
+def build_section_agents(brain: dict, agents: dict) -> list[str]:
+    """Build the agent section from Brain overview + agents API."""
+    summary = brain.get('summary', {}).get('agents', {})
+    agent_summary = agents.get('summary', {})
+
+    # Use Brain snapshot as canonical source; fall back to v2 agent summary
+    has_brain = bool(summary)
+    registered = summary.get('registered', agent_summary.get('registered_count', agent_summary.get('total', 0)))
+    enabled = summary.get('enabled', agent_summary.get('enabled_count', agent_summary.get('total', 0) if not has_brain else 0))
+    disabled = max(0, registered - enabled)
+    active_now = summary.get('active_now', agent_summary.get('active_run_count', agent_summary.get('active', 0)))
+    runs_today = summary.get('runs_24h', agent_summary.get('runs_today_count', 0))
+    recent = agent_summary.get('recent_run_count', agent_summary.get('recent', 0))
+    drift = summary.get('registry_drift', agent_summary.get('drift_count', 0))
+
+    # Last run from the agents runs list
+    runs_list = agents.get('runs', agents.get('active_runs', []))
+    last_run = '—'
+    if runs_list:
+        last_modified = runs_list[0].get('modified_at') if runs_list else None
+        if last_modified:
+            last_run = format_ts(last_modified)
+
+    lines = [
+        '<b>Agents</b> (Brain registry)',
+        f'  Registered: {registered}  Enabled: {enabled}  Disabled: {disabled}',
+        f'  Active now: {active_now}  Runs today: {runs_today}  Recent: {recent}',
+        f'  Last run: {last_run}',
+    ]
+
+    if drift > 0:
+        drift_items = agents.get('registry_definition_drift', [])
+        drift_names = [d.get('agent', '?') for d in drift_items[:3]]
+        drift_detail = ', '.join(drift_names)
+        if len(drift_items) > 3:
+            drift_detail += f' (+{len(drift_items) - 3})'
+        lines.append(f'  Drift: {drift} ({drift_detail})')
+
+    return lines
+
+
+def build_section_inventory(brain: dict) -> list[str]:
+    """Build compact Brain inventory from the overview summary."""
+    s = brain.get('summary', {})
+    skills = s.get('skills', {})
+    tools = s.get('tools', {})
+    clients = s.get('clients', {})
+    projects = s.get('projects', {})
+    memory = s.get('memory', {})
+    brain_os = s.get('brain_os', {})
+
+    skill_total = (
+        skills.get('catalog', 0) +
+        skills.get('bridges', 0) +
+        skills.get('operational', 0)
+    )
+
+    return [
+        '<b>Brain Inventory</b>',
+        f'  Skills: {skill_total} ({skills.get("catalog", 0)} catalog, {skills.get("bridges", 0)} bridges, {skills.get("operational", 0)} ops)',
+        f'  Tools: {tools.get("registered", 0)} ({tools.get("active", 0)} active)  MCP: {tools.get("mcp_servers", 0)}',
+        f'  Clients: {clients.get("indexed", 0)} indexed  Projects: {projects.get("bridged", 0)}',
+        f'  Memory: {memory.get("brain_memory_entries", 0)} entries  Knowledge: {memory.get("runtime_knowledge", "—")}',
+        f'  BrainOS: phase {brain_os.get("phase", "—")} ({brain_os.get("status", "—")})',
+    ]
+
+
+def build_section_integrations(brain: dict) -> list[str]:
+    """Build integration state with 4-layer evidence per integration."""
+    s = brain.get('summary', {})
+    tg = s.get('telegram', {})
+    cu = s.get('clickup', {})
+    health = brain.get('health', 'unknown')
+
+    lines = ['<b>Integrations</b>']
+
+    # Telegram — 4 layers
+    tg_installed = True  # framework always installed (we are in the report script)
+    tg_creds = tg.get('configured', False)
+    tg_active = tg.get('notifier_active', False) or tg.get('digest_active', False)
+    tg_last = format_ts(tg.get('last_delivery'))
+    tg_state = 'operational' if (tg_creds and tg_active) else 'degraded' if tg_creds else 'not configured'
+    lines.append(f'  Telegram: {tg_state}')
+    lines.append(f'    installed=yes  creds={_yn(tg_creds)}  timer={_yn(tg_active)}  last={tg_last}')
+
+    # ClickUp — 4 layers
+    cu_installed = True  # framework always installed
+    cu_creds = cu.get('configured', False)
+    cu_state = cu.get('state', 'not_configured')
+    cu_policies = cu.get('policies', 0)
+    lines.append(f'  ClickUp: {cu_state}')
+    lines.append(f'    installed=yes  creds={_yn(cu_creds)}  policies={cu_policies}')
+
+    # Qdrant — dynamic, never hard-coded
+    qdrant = api_get('/api/goviral/integrations/qdrant') if health != 'error' else {}
+    qdrant_state = qdrant.get('state', qdrant.get('status', 'unknown'))
+    lines.append(f'  Qdrant: {qdrant_state}')
+
+    # Off-site backup — dynamic evidence
+    offsite = api_get('/api/goviral/integrations/offsite-backup') if health != 'error' else {}
+    offsite_state = offsite.get('state', offsite.get('status', 'unknown'))
+    lines.append(f'  Off-site backup: {offsite_state}')
+
+    return lines
+
+
+def _yn(value: bool) -> str:
+    return 'yes' if value else 'no'
+
+
 def build_digest() -> str:
-    """Build the daily digest message."""
+    """Build the daily digest message using Brain snapshot v3 API."""
     health = load_json(HEALTH_FILE)
     health_status = health.get('status', 'UNKNOWN')
+
+    # Primary data sources
+    brain = api_get('/api/goviral/brain/overview')
     overview = api_get('/api/goviral/overview')
     incidents = api_get('/api/goviral/incidents')
     agents = api_get('/api/goviral/agents')
@@ -147,7 +295,9 @@ def build_digest() -> str:
     upgrade = latest_file_in(UPGRADE_DIR)
     drill = latest_file_in(RESTORE_DIR)
 
-    doctor_status = overview.get('doctor', {}).get('status', 'UNKNOWN')
+    doctor_status = brain.get('summary', {}).get('brain_os', {}).get('status',
+                    overview.get('doctor', {}).get('status', 'UNKNOWN'))
+    brain_health = brain.get('health', 'unknown')
     prd_title = overview.get('latest_prd', {})
     prd_name = prd_title.get('title', '—') if prd_title else '—'
 
@@ -156,56 +306,50 @@ def build_digest() -> str:
     high_count = sum(1 for i in incident_list if i.get('severity') == 'high')
     warning_count = sum(1 for i in incident_list if i.get('severity') == 'warning')
 
-    agent_summary = agents.get('summary', {})
-    agent_registered = agent_summary.get('registered_count', agent_summary.get('total', 0))
-    agent_enabled = agent_summary.get('enabled_count', 0)
-    agent_active = agent_summary.get('active_run_count', agent_summary.get('active', 0))
-    agent_runs_today = agent_summary.get('runs_today_count', 0)
-
-    # Find last run timestamp from the runs list
-    runs_list = agents.get('runs', agents.get('active_runs', []))
-    last_run = '—'
-    if runs_list:
-        last_modified = runs_list[0].get('modified_at') if runs_list else None
-        if last_modified:
-            last_run = last_modified[:16].replace('T', ' ')
+    drift_count = brain.get('summary', {}).get('drift_count', 0)
 
     lines = [
-        '📊 <b>GoViral Daily Operations Report</b>',
+        '<b>GoViral Daily Ops Report</b>',
         f'<i>{now()}</i>',
         '',
-        f'<b>Health:</b> {health_status}',
-        f'<b>Doctor:</b> {doctor_status}',
-        '',
-        '<b>Approvals:</b>',
-        f'  Pending: {pending}  Approved: {approved}  Executed: {executed}',
-        '',
-        '<b>Incidents:</b>',
-        f'  Critical: {critical_count}  High: {high_count}  Warning: {warning_count}',
+        f'<b>Health:</b> {health_status}  <b>Brain:</b> {brain_health}  <b>Doctor:</b> {doctor_status}',
     ]
 
-    if failed:
-        lines.append('')
-        lines.append(f'<b>Failed Units:</b> {", ".join(failed[:5])}')
+    if drift_count > 0:
+        lines.append(f'<b>Drift items:</b> {drift_count}')
 
     lines.extend([
         '',
-        '<b>Backup:</b>',
+        '<b>Approvals</b>',
+        f'  Pending: {pending}  Approved: {approved}  Executed: {executed}',
+        '',
+        '<b>Incidents</b>',
+        f'  Critical: {critical_count}  High: {high_count}  Warning: {warning_count}',
+    ])
+
+    if failed:
+        lines.append(f'  Failed units: {", ".join(failed[:5])}')
+
+    lines.append('')
+    lines.extend(build_section_agents(brain, agents))
+    lines.append('')
+    lines.extend(build_section_inventory(brain))
+    lines.append('')
+    lines.extend(build_section_integrations(brain))
+    lines.extend([
+        '',
+        '<b>Backup</b>',
         f'  Latest: {f"{backup_hours}h ago" if backup_hours is not None else "none"}',
         f'  Restore drill: {drill.get("status", "not run")}',
         '',
-        '<b>Agents:</b>',
-        f'  Registered: {agent_registered}',
-        f'  Enabled: {agent_enabled}',
-        f'  Active now: {agent_active}',
-        f'  Runs today: {agent_runs_today}',
-        f'  Last run: {last_run}',
-        '',
-        f'<b>Upgrade check:</b> {upgrade.get("status", "not run")}',
+        f'<b>Upgrade:</b> {upgrade.get("status", "not run")}',
         f'<b>Latest PRD:</b> {prd_name}',
     ])
 
-    return '\n'.join(lines)
+    message = '\n'.join(lines)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        message = message[:MAX_MESSAGE_LENGTH - 20] + '\n\n<i>[truncated]</i>'
+    return message
 
 
 def main() -> None:
