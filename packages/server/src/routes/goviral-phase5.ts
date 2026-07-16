@@ -21,7 +21,6 @@ type JsonRecord = Record<string, unknown>;
 const STATE_DIR = '/var/lib/goviral-archon/.archon';
 const NOTIFICATIONS_DIR = join(STATE_DIR, 'notifications');
 const INCIDENTS_ACK_FILE = join(STATE_DIR, 'incidents-ack.json');
-const UPGRADE_DIR = join(STATE_DIR, 'upgrade-checks');
 const RESTORE_DIR = join(STATE_DIR, 'restore-drills');
 const HEALTH_FILE = join(STATE_DIR, 'goviral-control-health.json');
 const BACKUP_DIR = '/var/lib/goviral-archon/backups/control-plane';
@@ -522,54 +521,7 @@ async function recoveryStatus(): Promise<RecoveryStatus> {
   };
 }
 
-// ─── Upgrade Check Status ────────────────────────────────────────────────────
-
-interface UpgradeStatus {
-  generated_at: string;
-  latest: {
-    status: string;
-    compatible: boolean;
-    server_typecheck: string;
-    web_typecheck: string;
-    web_build: string;
-    checked_at: string | null;
-    detail: string;
-  } | null;
-  check_count: number;
-}
-
-async function upgradeStatus(): Promise<UpgradeStatus> {
-  const latest = await latestJsonInDir(UPGRADE_DIR);
-  let checkCount = 0;
-  try {
-    const entries = await readdir(UPGRADE_DIR);
-    checkCount = entries.filter(e => e.endsWith('.json')).length;
-  } catch {
-    // No upgrade directory
-  }
-
-  if (!latest.path) {
-    return {
-      generated_at: new Date().toISOString(),
-      latest: null,
-      check_count: checkCount,
-    };
-  }
-
-  return {
-    generated_at: new Date().toISOString(),
-    latest: {
-      status: safeText(latest.data.status, 40) ?? 'UNKNOWN',
-      compatible: latest.data.compatible === true,
-      server_typecheck: safeText(latest.data.server_typecheck, 20) ?? 'not_run',
-      web_typecheck: safeText(latest.data.web_typecheck, 20) ?? 'not_run',
-      web_build: safeText(latest.data.web_build, 20) ?? 'not_run',
-      checked_at: safeText(latest.data.checked_at, 80),
-      detail: safeText(latest.data.detail, 300) ?? '',
-    },
-    check_count: checkCount,
-  };
-}
+// ─── Upgrade Check Status (moved to goviral-phase7-upgrade.ts) ──────────────
 
 // ─── Analytics Rollups ───────────────────────────────────────────────────────
 
@@ -926,10 +878,8 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
     return c.json(await recoveryStatus());
   });
 
-  // Phase 20: Upgrade status
-  app.get('/api/goviral/upgrade', async c => {
-    return c.json(await upgradeStatus());
-  });
+  // Phase 20: Upgrade status — now handled by Phase 7 (goviral-phase7-upgrade.ts)
+  // Backward-compatible route preserved via Phase 7 registration
 
   // Phase 15: Agent task list
   app.get('/api/goviral/tasks', async c => {
