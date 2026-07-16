@@ -1,6 +1,7 @@
 import { open, readdir, readFile, stat } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { OpenAPIHono } from '@hono/zod-openapi';
+import { getBrainSnapshot } from './goviral-brain-snapshot';
 
 const BRAIN_ROOT = '/var/lib/goviral-archon/workspaces/goviral-brain';
 
@@ -104,15 +105,54 @@ interface AgentRun {
   bounded_events: AgentEvent[];
 }
 
+interface RegisteredAgent {
+  name: string;
+  display_name: string | null;
+  lane: string;
+  type: string;
+  enabled: boolean;
+  can_modify_prod: boolean;
+  consistency: string;
+  has_definition: boolean;
+  has_policy: boolean;
+}
+
+interface RegistryDefinitionDrift {
+  agent: string;
+  issue: string;
+  recommendation: string;
+}
+
 interface AgentsResponse {
   generated_at: string;
+  /** New canonical fields — clearly separated semantics */
+  registered_agents: RegisteredAgent[];
+  discovered_definitions: string[];
+  enabled_agents: RegisteredAgent[];
+  disabled_agents: RegisteredAgent[];
+  active_runs: AgentRun[];
+  runs_today: AgentRun[];
+  recent_runs: AgentRun[];
+  registry_definition_drift: RegistryDefinitionDrift[];
   summary: {
+    registered_count: number;
+    discovered_definition_count: number;
+    enabled_count: number;
+    disabled_count: number;
+    active_run_count: number;
+    runs_today_count: number;
+    recent_run_count: number;
+    drift_count: number;
+    /** @deprecated Use registered_count. Kept for backward compatibility. */
     total: number;
+    /** @deprecated Use active_run_count. Kept for backward compatibility. */
     active: number;
+    /** @deprecated Use recent_run_count. Kept for backward compatibility. */
     recent: number;
     idle: number;
     unknown: number;
   };
+  /** @deprecated Use active_runs/recent_runs. Kept for backward compatibility. */
   runs: AgentRun[];
 }
 
@@ -822,6 +862,45 @@ async function agentRunFromDirectory(directoryName: string): Promise<AgentRun | 
 }
 
 async function agentsResponse(): Promise<AgentsResponse> {
+  // --- Registered agents from Brain snapshot (canonical source) ---
+  const snapshot = await getBrainSnapshot();
+  const brainAgents = snapshot.agents.data.items;
+
+  const registeredAgents: RegisteredAgent[] = brainAgents
+    .filter(a => a.registry_source)
+    .map(a => ({
+      name: a.name,
+      display_name: a.display_name,
+      lane: a.lane,
+      type: a.type,
+      enabled: a.can_execute,
+      can_modify_prod: a.can_modify_prod,
+      consistency: a.consistency,
+      has_definition: a.definition_source,
+      has_policy: a.policy_source,
+    }));
+
+  const discoveredDefinitions = brainAgents.filter(a => a.definition_source).map(a => a.name);
+
+  const enabledAgents = registeredAgents.filter(a => a.enabled);
+  const disabledAgents = registeredAgents.filter(a => !a.enabled);
+
+  // --- Drift ---
+  const driftItems: RegistryDefinitionDrift[] = brainAgents
+    .filter(
+      a =>
+        a.consistency !== 'consistent' && a.type !== 'orchestrator' && a.type !== 'operator_persona'
+    )
+    .map(a => ({
+      agent: a.name,
+      issue: a.consistency.replace('drift_', ''),
+      recommendation:
+        a.consistency === 'drift_missing_registry'
+          ? `Add "${a.name}" to registry.json or remove orphaned definition`
+          : `Add missing ${a.consistency.replace('drift_missing_', '')} for "${a.name}"`,
+    }));
+
+  // --- Runtime activity from agent-bus threads ---
   let directoryNames: string[] = [];
 
   try {
@@ -838,7 +917,7 @@ async function agentsResponse(): Promise<AgentsResponse> {
     directoryNames = [];
   }
 
-  const runs = (
+  const allRuns = (
     await Promise.all(
       directoryNames.map(
         async (directoryName): Promise<AgentRun | null> => agentRunFromDirectory(directoryName)
@@ -853,16 +932,45 @@ async function agentsResponse(): Promise<AgentsResponse> {
       return rightTime - leftTime;
     });
 
+  const activeRuns = allRuns.filter(r => r.activity === 'active');
+  const recentRuns = allRuns.filter(r => r.activity === 'recent');
+
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const runsToday = allRuns.filter(r => {
+    if (!r.modified_at) return false;
+    return Date.parse(r.modified_at) >= oneDayAgo;
+  });
+
+  const idleCount = allRuns.filter(r => r.activity === 'idle').length;
+  const unknownCount = allRuns.filter(r => r.activity === 'unknown').length;
+
   return {
     generated_at: new Date().toISOString(),
+    registered_agents: registeredAgents,
+    discovered_definitions: discoveredDefinitions,
+    enabled_agents: enabledAgents,
+    disabled_agents: disabledAgents,
+    active_runs: activeRuns,
+    runs_today: runsToday,
+    recent_runs: recentRuns,
+    registry_definition_drift: driftItems,
     summary: {
-      total: runs.length,
-      active: runs.filter((run): boolean => run.activity === 'active').length,
-      recent: runs.filter((run): boolean => run.activity === 'recent').length,
-      idle: runs.filter((run): boolean => run.activity === 'idle').length,
-      unknown: runs.filter((run): boolean => run.activity === 'unknown').length,
+      registered_count: registeredAgents.length,
+      discovered_definition_count: discoveredDefinitions.length,
+      enabled_count: enabledAgents.length,
+      disabled_count: disabledAgents.length,
+      active_run_count: activeRuns.length,
+      runs_today_count: runsToday.length,
+      recent_run_count: recentRuns.length,
+      drift_count: driftItems.length,
+      // Backward-compatible fields
+      total: registeredAgents.length,
+      active: activeRuns.length,
+      recent: recentRuns.length,
+      idle: idleCount,
+      unknown: unknownCount,
     },
-    runs,
+    runs: allRuns,
   };
 }
 

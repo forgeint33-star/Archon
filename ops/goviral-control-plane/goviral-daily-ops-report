@@ -157,8 +157,18 @@ def build_digest() -> str:
     warning_count = sum(1 for i in incident_list if i.get('severity') == 'warning')
 
     agent_summary = agents.get('summary', {})
-    agent_total = agent_summary.get('total', 0)
-    agent_active = agent_summary.get('active', 0)
+    agent_registered = agent_summary.get('registered_count', agent_summary.get('total', 0))
+    agent_enabled = agent_summary.get('enabled_count', 0)
+    agent_active = agent_summary.get('active_run_count', agent_summary.get('active', 0))
+    agent_runs_today = agent_summary.get('runs_today_count', 0)
+
+    # Find last run timestamp from the runs list
+    runs_list = agents.get('runs', agents.get('active_runs', []))
+    last_run = '—'
+    if runs_list:
+        last_modified = runs_list[0].get('modified_at') if runs_list else None
+        if last_modified:
+            last_run = last_modified[:16].replace('T', ' ')
 
     lines = [
         '📊 <b>GoViral Daily Operations Report</b>',
@@ -185,7 +195,11 @@ def build_digest() -> str:
         f'  Restore drill: {drill.get("status", "not run")}',
         '',
         '<b>Agents:</b>',
-        f'  Total: {agent_total}  Active: {agent_active}',
+        f'  Registered: {agent_registered}',
+        f'  Enabled: {agent_enabled}',
+        f'  Active now: {agent_active}',
+        f'  Runs today: {agent_runs_today}',
+        f'  Last run: {last_run}',
         '',
         f'<b>Upgrade check:</b> {upgrade.get("status", "not run")}',
         f'<b>Latest PRD:</b> {prd_name}',
