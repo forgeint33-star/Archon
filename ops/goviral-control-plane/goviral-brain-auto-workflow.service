@@ -1,0 +1,20 @@
+[Unit]
+Description=GoViral Prompt-to-PRD Autonomous Brain Workflow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/lib/goviral-archon/workspaces/goviral-brain
+ExecStart=/usr/local/bin/goviral-brain-auto-workflow run-all --write
+User=root
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+# Brain workflow is heavier (PRD generation, task decomposition); 15 minutes.
+RuntimeMaxSec=900
+TimeoutStartSec=120
+
+# Lower scheduling priority for batch work (nice 10, idle I/O)
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Concurrency-guarded wrapper for goviral-prompt-command-center.
+#
+# This wrapper replaces the production hotfix. It sources the shared
+# concurrency guard library and delegates to the real implementation.
+#
+# Non-mutating commands (status, dashboard, etc.) pass through ungarded.
+# "run-all --write" is flock-guarded — only one instance runs at a time.
+# Overlapping invocations exit 0 with overlap_skipped=true.
+# ──────────────────────────────────────────────────────────────────────────────
+set -u -o pipefail
+
+# Guard against recursive self-execution
+if [ "${_GOVIRAL_GUARD_ACTIVE:-}" = "goviral-prompt-command-center" ]; then
+  echo "ERROR: recursive guard invocation detected" >&2
+  exit 99
+fi
+export _GOVIRAL_GUARD_ACTIVE="goviral-prompt-command-center"
+
+# Source shared guard library
+# shellcheck source=lib-concurrency-guard.sh
+source /usr/local/bin/goviral-lib-concurrency-guard.sh
+
+concurrency_guard "goviral-prompt-command-center" "$@"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Run GoViral Prompt Command Center every 3 minutes
+
+[Timer]
+# Staggered boot: wait 3 min + 30s offset to avoid simultaneous fan-out
+OnBootSec=3min 30s
+OnUnitActiveSec=3min
+AccuracySec=30s
+Persistent=true
+# Prevent accumulation of pending triggers while the service is still running
+# (requires systemd >= 229, no-op on older)
+# RandomizedDelaySec=15
+
+[Install]
+WantedBy=timers.target
