@@ -7,6 +7,7 @@ import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
 import { registerGoviralRoutes } from './goviral-control-plane';
+import { registerGoviralBrainRoutes } from './goviral-brain-api';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
@@ -1320,6 +1321,7 @@ export function registerApiRoutes(
   activePlatforms?: readonly string[]
 ): void {
   registerGoviralRoutes(app);
+  registerGoviralBrainRoutes(app);
   function apiError(
     c: Context,
     status: 400 | 401 | 404 | 422 | 500 | 503,
