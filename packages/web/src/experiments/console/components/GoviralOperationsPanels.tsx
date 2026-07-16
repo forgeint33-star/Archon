@@ -73,15 +73,53 @@ interface AgentRun {
   latest_event: AgentEvent | null;
 }
 
+interface RegisteredAgent {
+  name: string;
+  display_name: string | null;
+  lane: string;
+  type: string;
+  enabled: boolean;
+  can_modify_prod: boolean;
+  consistency: string;
+  has_definition: boolean;
+  has_policy: boolean;
+}
+
+interface RegistryDrift {
+  agent: string;
+  issue: string;
+  recommendation: string;
+}
+
 interface AgentsData {
   generated_at: string;
+  registered_agents: RegisteredAgent[];
+  discovered_definitions: string[];
+  enabled_agents: RegisteredAgent[];
+  disabled_agents: RegisteredAgent[];
+  active_runs: AgentRun[];
+  runs_today: AgentRun[];
+  recent_runs: AgentRun[];
+  registry_definition_drift: RegistryDrift[];
   summary: {
+    registered_count: number;
+    discovered_definition_count: number;
+    enabled_count: number;
+    disabled_count: number;
+    active_run_count: number;
+    runs_today_count: number;
+    recent_run_count: number;
+    drift_count: number;
+    /** @deprecated backward compat */
     total: number;
+    /** @deprecated backward compat */
     active: number;
+    /** @deprecated backward compat */
     recent: number;
     idle: number;
     unknown: number;
   };
+  /** @deprecated Use active_runs/recent_runs */
   runs: AgentRun[];
 }
 
@@ -387,18 +425,19 @@ export function GoviralOperationsPanels(): ReactElement {
 
       <Panel
         title="Agents & Recent Runs"
-        subtitle="Activity is inferred from bounded Agent Bus metadata; prompts and message bodies are not exposed."
+        subtitle="Brain snapshot registry with live Agent Bus activity. Prompts and message bodies are not exposed."
       >
-        {agents && agents.runs.length > 0 ? (
+        {agents ? (
           <>
-            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-6">
               {(
                 [
-                  ['Total', agents.summary.total],
-                  ['Active', agents.summary.active],
-                  ['Recent', agents.summary.recent],
-                  ['Idle', agents.summary.idle],
-                  ['Unknown', agents.summary.unknown],
+                  ['Registered', agents.summary.registered_count],
+                  ['Enabled', agents.summary.enabled_count],
+                  ['Definitions', agents.summary.discovered_definition_count],
+                  ['Active runs', agents.summary.active_run_count],
+                  ['Today', agents.summary.runs_today_count],
+                  ['Drift', agents.summary.drift_count],
                 ] as [string, number][]
               ).map(
                 ([label, value]): ReactElement => (
@@ -410,47 +449,123 @@ export function GoviralOperationsPanels(): ReactElement {
               )}
             </div>
 
-            <div className="grid gap-3 lg:grid-cols-2">
-              {agents.runs.map(
-                (run): ReactElement => (
-                  <div
-                    key={run.id}
-                    className="rounded-lg border border-white/10 bg-black/10 px-4 py-3"
-                  >
-                    <div className="flex items-start justify-between gap-3">
+            {agents.registry_definition_drift.length > 0 ? (
+              <div className="mb-4 space-y-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-white/40">
+                  Registry drift
+                </p>
+                {agents.registry_definition_drift.map(
+                  (drift): ReactElement => (
+                    <div
+                      key={drift.agent}
+                      className="flex items-start justify-between gap-3 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2"
+                    >
                       <div className="min-w-0">
-                        <p className="truncate text-sm font-medium text-white/85">{run.title}</p>
-                        <p className="mt-1 text-xs text-white/40">
-                          {run.agent} · {formatDate(run.modified_at)}
-                        </p>
+                        <p className="text-sm font-medium text-white/85">{drift.agent}</p>
+                        <p className="mt-1 text-xs text-white/45">{drift.recommendation}</p>
                       </div>
-                      <Pill value={run.activity} />
+                      <Pill value={drift.issue} />
                     </div>
+                  )
+                )}
+              </div>
+            ) : null}
 
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <Pill value={run.status} />
-                      {run.activity_inferred ? (
-                        <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-white/35">
-                          inferred activity
-                        </span>
-                      ) : null}
-                    </div>
-
-                    {run.latest_event ? (
-                      <div className="mt-3 rounded-md border border-white/10 bg-black/20 px-3 py-2">
-                        <p className="text-xs font-medium text-white/55">{run.latest_event.type}</p>
-                        <p className="mt-1 truncate text-xs text-white/40">
-                          {run.latest_event.summary ?? 'Event metadata only'}
-                        </p>
+            {agents.registered_agents.length > 0 ? (
+              <div className="mb-5">
+                <p className="mb-3 text-xs font-medium uppercase tracking-wide text-white/40">
+                  Registered agents
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  {agents.registered_agents.map(
+                    (agent): ReactElement => (
+                      <div
+                        key={agent.name}
+                        className="rounded-lg border border-white/10 bg-black/10 px-3 py-3"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="truncate text-sm font-medium text-white/85">
+                            {agent.display_name ?? agent.name}
+                          </p>
+                          <Pill value={agent.enabled ? 'enabled' : 'disabled'} />
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-white/40">
+                            {agent.lane}
+                          </span>
+                          <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-white/40">
+                            {agent.type}
+                          </span>
+                          {agent.can_modify_prod ? (
+                            <span className="rounded-full border border-red-500/20 bg-red-500/5 px-2 py-0.5 text-xs text-red-300">
+                              prod-write
+                            </span>
+                          ) : null}
+                          {agent.consistency !== 'consistent' ? (
+                            <Pill value={agent.consistency.replace('drift_', '')} />
+                          ) : null}
+                        </div>
                       </div>
-                    ) : null}
-                  </div>
-                )
+                    )
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="border-t border-white/10 pt-5">
+              <p className="mb-3 text-xs font-medium uppercase tracking-wide text-white/40">
+                Recent Agent Bus runs
+              </p>
+              {agents.runs.length > 0 ? (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {agents.runs.map(
+                    (run): ReactElement => (
+                      <div
+                        key={run.id}
+                        className="rounded-lg border border-white/10 bg-black/10 px-4 py-3"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium text-white/85">
+                              {run.title}
+                            </p>
+                            <p className="mt-1 text-xs text-white/40">
+                              {run.agent} · {formatDate(run.modified_at)}
+                            </p>
+                          </div>
+                          <Pill value={run.activity} />
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Pill value={run.status} />
+                          {run.activity_inferred ? (
+                            <span className="rounded-full border border-white/10 px-2 py-0.5 text-xs text-white/35">
+                              inferred
+                            </span>
+                          ) : null}
+                        </div>
+
+                        {run.latest_event ? (
+                          <div className="mt-3 rounded-md border border-white/10 bg-black/20 px-3 py-2">
+                            <p className="text-xs font-medium text-white/55">
+                              {run.latest_event.type}
+                            </p>
+                            <p className="mt-1 truncate text-xs text-white/40">
+                              {run.latest_event.summary ?? 'Event metadata only'}
+                            </p>
+                          </div>
+                        ) : null}
+                      </div>
+                    )
+                  )}
+                </div>
+              ) : (
+                <EmptyState text="No bounded Agent Bus run metadata available." />
               )}
             </div>
           </>
         ) : (
-          <EmptyState text="No bounded Agent Bus run metadata available." />
+          <EmptyState text="Loading agent registry…" />
         )}
       </Panel>
     </>

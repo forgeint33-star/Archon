@@ -261,12 +261,12 @@ export function GoviralControlPlanePage(): ReactElement {
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-2xl font-semibold text-white">GoViral Control Plane</h1>
               <span className="rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-0.5 text-xs font-medium text-fuchsia-200">
-                v2
+                v3
               </span>
             </div>
             <p className="mt-2 max-w-3xl text-sm text-white/50">
-              Governed operational view with notifications, search, integrations, analytics,
-              disaster recovery and upstream compatibility checks.
+              Governed operational view with Brain snapshot integration, agent registry, drift
+              detection, notifications, search, analytics, and disaster recovery.
             </p>
           </div>
 

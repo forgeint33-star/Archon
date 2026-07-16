@@ -44,6 +44,46 @@ export interface GoviralOverview {
   } | null;
 }
 
+export interface GoviralRegisteredAgent {
+  name: string;
+  display_name: string | null;
+  lane: string;
+  type: string;
+  enabled: boolean;
+  can_modify_prod: boolean;
+  consistency: string;
+  has_definition: boolean;
+  has_policy: boolean;
+}
+
+export interface GoviralAgentDrift {
+  agent: string;
+  issue: string;
+  recommendation: string;
+}
+
+export interface GoviralAgentsSummary {
+  registered_count: number;
+  discovered_definition_count: number;
+  enabled_count: number;
+  disabled_count: number;
+  active_run_count: number;
+  runs_today_count: number;
+  recent_run_count: number;
+  drift_count: number;
+}
+
+export interface GoviralAgentsResponse {
+  generated_at: string;
+  registered_agents: GoviralRegisteredAgent[];
+  registry_definition_drift: GoviralAgentDrift[];
+  summary: GoviralAgentsSummary;
+}
+
 export async function fetchGoviralOverview(): Promise<GoviralOverview> {
   return requestJson<GoviralOverview>('/api/goviral/overview');
+}
+
+export async function fetchGoviralAgents(): Promise<GoviralAgentsResponse> {
+  return requestJson<GoviralAgentsResponse>('/api/goviral/agents');
 }
