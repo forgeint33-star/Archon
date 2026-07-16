@@ -104,6 +104,41 @@ account = pwd.getpwnam("goviral-archon")
 os.chown(report, account.pw_uid, account.pw_gid)
 PY
 
+# Send Telegram summary if configured
+TELEGRAM_TOKEN_FILE="/etc/goviral/credentials/telegram-bot-token"
+TELEGRAM_CHAT_FILE="/etc/goviral/credentials/telegram-chat-id"
+if [ -f "$TELEGRAM_TOKEN_FILE" ] && [ -f "$TELEGRAM_CHAT_FILE" ]; then
+  TG_TOKEN="$(cat "$TELEGRAM_TOKEN_FILE" | tr -d '\r\n')"
+  TG_CHAT="$(cat "$TELEGRAM_CHAT_FILE" | tr -d '\r\n')"
+  if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+    python3 - "$TG_TOKEN" "$TG_CHAT" "$STATUS" "$COMPATIBLE" "$SERVER_CHECK" "$WEB_CHECK" "$BUILD_CHECK" <<'PYNOTIFY'
+import json, sys, urllib.request, urllib.error
+token, chat_id = sys.argv[1], sys.argv[2]
+status, compatible = sys.argv[3], sys.argv[4]
+server, web, build = sys.argv[5], sys.argv[6], sys.argv[7]
+emoji = "✅" if compatible.lower() == "true" else "⚠️"
+text = (
+    f"{emoji} <b>GoViral Upgrade Check</b>\n\n"
+    f"<b>Status:</b> {status}\n"
+    f"<b>Compatible:</b> {compatible}\n"
+    f"<b>Server typecheck:</b> {server}\n"
+    f"<b>Web typecheck:</b> {web}\n"
+    f"<b>Web build:</b> {build}\n"
+    f"\nProduction was not modified."
+)
+data = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode()
+req = urllib.request.Request(
+    f"https://api.telegram.org/bot{token}/sendMessage",
+    data=data, headers={"Content-Type": "application/json"},
+)
+try:
+    urllib.request.urlopen(req, timeout=15)
+except Exception:
+    pass  # notification failure must not break the upgrade check
+PYNOTIFY
+  fi
+fi
+
 echo "upgrade_check_status=$STATUS"
 echo "upgrade_check_compatible=$COMPATIBLE"
 echo "upgrade_check_report=$REPORT"

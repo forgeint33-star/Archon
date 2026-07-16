@@ -31,7 +31,9 @@ for script in \
   goviral-daily-ops-report \
   goviral-telegram-configure \
   goviral-clickup-configure \
-  goviral-offsite-configure
+  goviral-offsite-configure \
+  goviral-offsite-backup \
+  goviral-analytics-rollup
 do
   install -o root -g root -m 0755 "$OPS/$script" "/usr/local/bin/$script"
   echo "  installed $script"
@@ -52,7 +54,9 @@ for unit in \
   goviral-daily-ops-report.service \
   goviral-daily-ops-report.timer \
   goviral-archon-upgrade-check.service \
-  goviral-archon-upgrade-check.timer
+  goviral-archon-upgrade-check.timer \
+  goviral-analytics-rollup.service \
+  goviral-analytics-rollup.timer
 do
   install -o root -g root -m 0644 "$OPS/$unit" "/etc/systemd/system/$unit"
   echo "  installed $unit"
@@ -107,6 +111,8 @@ systemctl enable --now goviral-control-healthcheck.timer
 echo "  goviral-control-healthcheck.timer enabled"
 systemctl enable --now goviral-archon-upgrade-check.timer
 echo "  goviral-archon-upgrade-check.timer enabled"
+systemctl enable --now goviral-analytics-rollup.timer
+echo "  goviral-analytics-rollup.timer enabled"
 
 # ─── Telegram timers (only if credentials exist) ─────────────────────────────
 if [ -f /etc/goviral/credentials/telegram-bot-token ] && \

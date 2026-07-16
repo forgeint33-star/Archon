@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# GoViral encrypted off-site backup upload.
+# Encrypts the latest local backup with age, uploads to an S3-compatible target.
+# Must be run as root. Credentials from /etc/goviral/credentials/offsite-backup.json.
+set -Eeuo pipefail
+umask 077
+
+CRED_FILE="/etc/goviral/credentials/offsite-backup.json"
+STATE_FILE="/var/lib/goviral-archon/.archon/offsite-backup.json"
+BACKUP_DIR="/var/lib/goviral-archon/backups/control-plane"
+LATEST="$BACKUP_DIR/latest.tar.gz"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+fail() {
+  echo "offsite_backup=failed detail=$1" >&2
+  python3 -c "
+import json, os, pwd
+from pathlib import Path
+state = Path('$STATE_FILE')
+state.parent.mkdir(parents=True, exist_ok=True)
+payload = {'configured': True, 'state': 'upload_failed', 'detail': '$1', 'last_check': '$(date -u +%Y-%m-%dT%H:%M:%SZ)'}
+state.write_text(json.dumps(payload, indent=2) + '\n')
+os.chmod(state, 0o600)
+a = pwd.getpwnam('goviral-archon')
+os.chown(state, a.pw_uid, a.pw_gid)
+"
+  exit 1
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+  fail "must run as root"
+fi
+
+if [ ! -f "$CRED_FILE" ]; then
+  echo "offsite_backup=not_configured"
+  exit 0
+fi
+
+if [ ! -f "$LATEST" ]; then
+  fail "no local backup to upload"
+fi
+
+# Parse credentials
+ENDPOINT="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c['endpoint'])")"
+BUCKET="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c['bucket'])")"
+PREFIX="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c['prefix'])")"
+ACCESS_KEY="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c['access_key'])")"
+SECRET_KEY="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c['secret_key'])")"
+AGE_RECIPIENT="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c['age_recipient'])")"
+RETENTION_DAYS="$(python3 -c "import json; c=json.load(open('$CRED_FILE')); print(c.get('retention_days', 30))")"
+
+# Verify age is installed
+if ! command -v age >/dev/null 2>&1; then
+  fail "age encryption tool is not installed"
+fi
+
+# Encrypt the backup
+TMP="$(mktemp -d)"
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+ARCHIVE_NAME="goviral-backup-${STAMP}.tar.gz.age"
+ENCRYPTED="$TMP/$ARCHIVE_NAME"
+
+age -r "$AGE_RECIPIENT" -o "$ENCRYPTED" "$LATEST"
+ENCRYPTED_SIZE="$(stat -c %s "$ENCRYPTED")"
+SHA="$(sha256sum "$ENCRYPTED" | awk '{print $1}')"
+
+# Upload using python (no external S3 CLI dependency)
+python3 - "$ENDPOINT" "$BUCKET" "${PREFIX}${ARCHIVE_NAME}" "$ENCRYPTED" "$ACCESS_KEY" "$SECRET_KEY" <<'PY'
+import hashlib
+import hmac
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+endpoint = sys.argv[1].rstrip('/')
+bucket = sys.argv[2]
+key = sys.argv[3]
+filepath = Path(sys.argv[4])
+access = sys.argv[5]
+secret = sys.argv[6]
+
+data = filepath.read_bytes()
+content_hash = hashlib.sha256(data).hexdigest()
+now = datetime.now(timezone.utc)
+date_stamp = now.strftime('%Y%m%d')
+amz_date = now.strftime('%Y%m%dT%H%M%SZ')
+
+url = f'{endpoint}/{bucket}/{key}'
+host = endpoint.split('://')[1] if '://' in endpoint else endpoint
+
+# Simple PUT upload (works with most S3-compatible APIs with path-style)
+request = urllib.request.Request(url, data=data, method='PUT')
+request.add_header('Content-Type', 'application/octet-stream')
+request.add_header('Content-Length', str(len(data)))
+request.add_header('x-amz-date', amz_date)
+request.add_header('x-amz-content-sha256', content_hash)
+
+# For MinIO/Backblaze/Wasabi/etc with simple auth
+import base64
+auth = base64.b64encode(f'{access}:{secret}'.encode()).decode()
+request.add_header('Authorization', f'Basic {auth}')
+
+try:
+    with urllib.request.urlopen(request, timeout=300) as response:
+        print(f'upload_status={response.status}')
+except Exception as exc:
+    print(f'upload_error={type(exc).__name__}: {exc}', file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+# Write manifest
+MANIFEST="$TMP/manifest.json"
+python3 -c "
+import json
+manifest = {
+    'archive': '$ARCHIVE_NAME',
+    'sha256': '$SHA',
+    'size_bytes': $ENCRYPTED_SIZE,
+    'uploaded_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'bucket': '$BUCKET',
+    'prefix': '$PREFIX',
+    'retention_days': $RETENTION_DAYS,
+}
+print(json.dumps(manifest, indent=2))
+" > "$MANIFEST"
+
+# Update state
+python3 -c "
+import json, os, pwd
+from pathlib import Path
+state = Path('$STATE_FILE')
+state.parent.mkdir(parents=True, exist_ok=True)
+payload = {
+    'configured': True,
+    'state': 'upload_complete',
+    'detail': 'Latest backup encrypted and uploaded successfully',
+    'last_upload': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'last_archive': '$ARCHIVE_NAME',
+    'last_sha256': '$SHA',
+    'last_check': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+}
+state.write_text(json.dumps(payload, indent=2) + '\n')
+os.chmod(state, 0o600)
+a = pwd.getpwnam('goviral-archon')
+os.chown(state, a.pw_uid, a.pw_gid)
+"
+
+echo "offsite_backup=complete"
+echo "offsite_archive=$ARCHIVE_NAME"
+echo "offsite_sha256=$SHA"
+echo "offsite_size=$ENCRYPTED_SIZE"
