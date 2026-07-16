@@ -1319,3 +1319,21 @@ export async function getBrainSnapshot(forceRefresh = false): Promise<BrainSnaps
 export function getCachedSnapshot(): BrainSnapshot | null {
   return cachedSnapshot;
 }
+
+export function getSnapshotCacheStatus(): {
+  has_cached: boolean;
+  cached_at: string | null;
+  age_ms: number | null;
+  ttl_ms: number;
+  stale: boolean;
+} {
+  const now = Date.now();
+  const age = cacheTimestamp > 0 ? now - cacheTimestamp : null;
+  return {
+    has_cached: cachedSnapshot !== null,
+    cached_at: cacheTimestamp > 0 ? new Date(cacheTimestamp).toISOString() : null,
+    age_ms: age,
+    ttl_ms: CACHE_TTL_MS,
+    stale: age === null || age >= CACHE_TTL_MS,
+  };
+}

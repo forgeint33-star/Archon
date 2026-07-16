@@ -2,6 +2,7 @@ import { registerGoviralPhase5Routes } from './goviral-phase5';
 import { registerGoviralPhase4Routes } from './goviral-phase4';
 import { registerGoviralPhase3Routes } from './goviral-phase3';
 import { registerGoviralPhase2Routes } from './goviral-phase2';
+import { getCachedSnapshot, getSnapshotCacheStatus } from './goviral-brain-snapshot';
 import type { OpenAPIHono } from '@hono/zod-openapi';
 import { readFile, readdir, stat } from 'fs/promises';
 import { basename, join, relative, resolve, sep } from 'path';
@@ -250,6 +251,27 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
             ? 'FAIL'
             : 'UNKNOWN';
 
+    // Non-blocking Brain snapshot enrichment (uses cached, never triggers refresh)
+    const brainCache = getSnapshotCacheStatus();
+    const brainSnapshot = getCachedSnapshot();
+    const brain = brainSnapshot
+      ? {
+          health: brainSnapshot.health,
+          schema_version: brainSnapshot.schema_version,
+          generated_at: brainSnapshot.generated_at,
+          drift_count: brainSnapshot.drift.length,
+          warning_count: brainSnapshot.warnings.length,
+          cache: brainCache,
+        }
+      : {
+          health: null,
+          schema_version: null,
+          generated_at: null,
+          drift_count: null,
+          warning_count: null,
+          cache: brainCache,
+        };
+
     return c.json({
       generated_at: new Date().toISOString(),
       brain_root: BRAIN_ROOT,
@@ -265,6 +287,7 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
         executed: countArray(queue, 'executed'),
         modified_at: await modifiedAt(queuePath),
       },
+      brain,
       modules,
       recent_threads: await recentAgentThreads(),
       latest_prd: await latestPrd(),

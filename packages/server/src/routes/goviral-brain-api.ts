@@ -7,7 +7,7 @@
  */
 
 import type { OpenAPIHono } from '@hono/zod-openapi';
-import { getBrainSnapshot } from './goviral-brain-snapshot';
+import { getBrainSnapshot, getSnapshotCacheStatus } from './goviral-brain-snapshot';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -554,6 +554,77 @@ export function registerGoviralBrainRoutes(app: OpenAPIHono): void {
         ),
       },
       items,
+    });
+  });
+
+  // ===========================================================================
+  // Snapshot cache management
+  // ===========================================================================
+  app.get('/api/goviral/brain/snapshot', async c => {
+    const query = c.req.query();
+    const forceRefresh = query.refresh === 'true';
+    const cacheStatus = getSnapshotCacheStatus();
+
+    if (forceRefresh) {
+      const snapshot = await getBrainSnapshot(true);
+      return c.json({
+        generated_at: snapshot.generated_at,
+        health: snapshot.health,
+        schema_version: snapshot.schema_version,
+        refresh_duration_ms: snapshot.refresh_duration_ms,
+        cache: getSnapshotCacheStatus(),
+        warning_count: snapshot.warnings.length,
+        drift_count: snapshot.drift.length,
+        section_status: {
+          agents: snapshot.agents.status,
+          skills: snapshot.skills.status,
+          tools: snapshot.tools.status,
+          clients: snapshot.clients.status,
+          projects: snapshot.projects.status,
+          memory: snapshot.memory.status,
+          brain_os: snapshot.brain_os.status,
+          councils: snapshot.councils.status,
+          telegram: snapshot.telegram.status,
+          clickup: snapshot.clickup.status,
+        },
+      });
+    }
+
+    // Without refresh, return cache status and summary if available
+    if (!cacheStatus.has_cached) {
+      return c.json({
+        generated_at: null,
+        health: null,
+        schema_version: null,
+        refresh_duration_ms: null,
+        cache: cacheStatus,
+        warning_count: null,
+        drift_count: null,
+        section_status: null,
+      });
+    }
+
+    const snapshot = await getBrainSnapshot();
+    return c.json({
+      generated_at: snapshot.generated_at,
+      health: snapshot.health,
+      schema_version: snapshot.schema_version,
+      refresh_duration_ms: snapshot.refresh_duration_ms,
+      cache: cacheStatus,
+      warning_count: snapshot.warnings.length,
+      drift_count: snapshot.drift.length,
+      section_status: {
+        agents: snapshot.agents.status,
+        skills: snapshot.skills.status,
+        tools: snapshot.tools.status,
+        clients: snapshot.clients.status,
+        projects: snapshot.projects.status,
+        memory: snapshot.memory.status,
+        brain_os: snapshot.brain_os.status,
+        councils: snapshot.councils.status,
+        telegram: snapshot.telegram.status,
+        clickup: snapshot.clickup.status,
+      },
     });
   });
 }
