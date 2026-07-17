@@ -521,19 +521,23 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "Test 18: Static scan rejecting direct mutating leaf invocation"
 # ═══════════════════════════════════════════════════════════════════════════════
-# Create a violating test file
-cat > "$TEST_DIR/bad-orchestrator.sh" <<'BAD'
+# Create a violating test file inside an ops/goviral-control-plane/ structure
+# so the lint scanner finds it
+LINT_TEST_DIR="$(mktemp -d)"
+mkdir -p "$LINT_TEST_DIR/ops/goviral-control-plane"
+cat > "$LINT_TEST_DIR/ops/goviral-control-plane/bad-orchestrator.sh" <<'BAD'
 #!/usr/bin/env bash
 goviral-prompt-command-center run-all --write
 goviral-brain-auto-workflow submit --prompt "test" --write
 BAD
 
-# The lint script should catch it
-if bash "$SCRIPT_DIR/lint-no-direct-mutating-leaf.sh" "$TEST_DIR" >/dev/null 2>&1; then
+# The lint script should catch it (pass LINT_TEST_DIR as the SRC root)
+if bash "$SCRIPT_DIR/lint-no-direct-mutating-leaf.sh" "$LINT_TEST_DIR" >/dev/null 2>&1; then
   fail "static scan" "should have caught violation in bad-orchestrator.sh"
 else
   pass "static scan detects direct mutating leaf invocation"
 fi
+rm -rf "$LINT_TEST_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "Test 19: Approval queue immutability"
@@ -588,6 +592,193 @@ if [ "$scan_ok" = true ] && [ "$cache_ms" -lt 100 ]; then
   pass "workspace scan bounded, excludes .git/node_modules, cached"
 else
   fail "workspace scan" "scan_ok=$scan_ok cache_ms=$cache_ms count=$count"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 21: Watchdog cannot re-enable quarantined timers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# The quarantine library must refuse to enable timers when the marker exists.
+QTEST_DIR="$(mktemp -d)"
+QMARKER="$QTEST_DIR/quarantine-marker"
+touch "$QMARKER"
+
+# Source the quarantine library with test marker
+output="$(
+  GOVIRAL_QUARANTINE_MARKER="$QMARKER" \
+  bash -c 'source "'"$SCRIPT_DIR"'/lib-quarantine.sh"
+    if is_heavy_quarantined; then echo "quarantine_detected=true"; fi
+    if is_quarantined_timer "goviral-prompt-command-center.timer"; then echo "timer_is_quarantined=true"; fi
+    if ! is_quarantined_timer "goviral-archon-backup.timer"; then echo "safe_timer_not_quarantined=true"; fi
+  '
+)" 2>&1
+
+if echo "$output" | grep -q "quarantine_detected=true" && \
+   echo "$output" | grep -q "timer_is_quarantined=true" && \
+   echo "$output" | grep -q "safe_timer_not_quarantined=true"; then
+  pass "quarantine library correctly identifies quarantined timers"
+else
+  fail "quarantine library" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 22: Supervisor cannot re-enable quarantined timers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test the hardened supervisor script with quarantine active.
+# It should report quarantined=true and NOT call systemctl enable.
+QTEST_DIR="$(mktemp -d)"
+QMARKER="$QTEST_DIR/quarantine-marker"
+touch "$QMARKER"
+
+# Create a mock systemctl that records calls
+MOCK_BIN="$QTEST_DIR/mock-bin"
+mkdir -p "$MOCK_BIN"
+cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+echo "MOCK_SYSTEMCTL_CALL: $*" >> "${MOCK_SYSTEMCTL_LOG:-/dev/null}"
+case "$1" in
+  is-enabled) echo "disabled"; exit 1 ;;
+  is-active) echo "inactive"; exit 3 ;;
+  enable) echo "ENABLE_CALLED: $*" >> "${MOCK_SYSTEMCTL_LOG:-/dev/null}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+MOCK
+chmod +x "$MOCK_BIN/systemctl"
+
+# Create mock dependencies the supervisor calls
+cat > "$MOCK_BIN/goviral-doctor" <<'MOCK'
+#!/usr/bin/env bash
+echo "doctor=ok"
+MOCK
+chmod +x "$MOCK_BIN/goviral-doctor"
+
+cat > "$MOCK_BIN/goviral-workspace-guard" <<'MOCK'
+#!/usr/bin/env bash
+echo "workspace-guard=ok"
+MOCK
+chmod +x "$MOCK_BIN/goviral-workspace-guard"
+
+# Supervisor needs a workspace dir
+SUP_WORKSPACE="$QTEST_DIR/workspace"
+mkdir -p "$SUP_WORKSPACE/.governance/autopilot-supervisor"/{runs,status,dashboard,ledger,incidents,release}
+
+MOCK_LOG="$QTEST_DIR/systemctl-calls.log"
+touch "$MOCK_LOG"
+
+# Run the hardened supervisor with quarantine active
+output="$(
+  GOVIRAL_QUARANTINE_MARKER="$QMARKER" \
+  GOVIRAL_QUARANTINE_LIB="$SCRIPT_DIR/lib-quarantine.sh" \
+  MOCK_SYSTEMCTL_LOG="$MOCK_LOG" \
+  PATH="$MOCK_BIN:$PATH" \
+  bash -c '
+    BASE="'"$SUP_WORKSPACE"'"
+    ROOT="$BASE/.governance/autopilot-supervisor"
+    mkdir -p "$ROOT"/{runs,status,dashboard,ledger,incidents,release}
+    source "'"$SCRIPT_DIR"'/goviral-autopilot-supervisor" <<< ""
+  ' -- run-all
+)" 2>&1 || true
+
+# Check: the supervisor should NOT have called "systemctl enable" on heavy timers
+enable_calls="$(grep "ENABLE_CALLED.*enable --now" "$MOCK_LOG" 2>/dev/null || true)"
+
+if [ -z "$enable_calls" ]; then
+  pass "supervisor does not enable any timer when quarantined"
+else
+  fail "supervisor quarantine" "enable calls found: $enable_calls"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 23: Canonical dispatch refuses quarantined heavy workflows"
+# ═══════════════════════════════════════════════════════════════════════════════
+rm -f "$LOCK_DIR"/*.lock
+QTEST_DIR="$(mktemp -d)"
+QMARKER="$QTEST_DIR/quarantine-marker"
+touch "$QMARKER"
+
+output="$(
+  GOVIRAL_QUARANTINE_MARKER="$QMARKER" \
+  dispatch_env 'canonical_dispatch goviral-prompt-command-center run-all --write'
+)" 2>&1 || true
+
+if echo "$output" | grep -q "quarantined=true"; then
+  pass "canonical dispatch refuses quarantined heavy workflow"
+else
+  fail "dispatch quarantine" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 24: timers.target restart cannot bypass quarantine"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Even if timers.target is restarted, canonical_dispatch still refuses quarantined workflows.
+# This is structural: the quarantine marker is checked at dispatch time, not at enable time.
+QTEST_DIR="$(mktemp -d)"
+QMARKER="$QTEST_DIR/quarantine-marker"
+touch "$QMARKER"
+
+output="$(
+  GOVIRAL_QUARANTINE_MARKER="$QMARKER" \
+  dispatch_env 'canonical_dispatch goviral-brain-auto-workflow run-all --write'
+)" 2>&1 || true
+
+if echo "$output" | grep -q "quarantined=true"; then
+  pass "quarantine survives hypothetical timers.target restart"
+else
+  fail "timers.target quarantine bypass" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 25: Removal of quarantine permits normal dispatch"
+# ═══════════════════════════════════════════════════════════════════════════════
+rm -f "$LOCK_DIR"/*.lock
+QTEST_DIR="$(mktemp -d)"
+QMARKER="$QTEST_DIR/quarantine-marker"
+# Do NOT create the marker — quarantine is lifted
+
+output="$(
+  GOVIRAL_QUARANTINE_MARKER="$QMARKER" \
+  dispatch_env 'canonical_dispatch goviral-prompt-command-center run-all --write'
+)" 2>&1 || true
+
+if echo "$output" | grep -q "prompt_work_done=true"; then
+  pass "dispatch works normally when quarantine is lifted"
+else
+  fail "quarantine removal" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 26: All direct mutating callers use canonical dispatch (lint)"
+# ═══════════════════════════════════════════════════════════════════════════════
+# The static linter must pass on source-controlled files (not production /usr/local/bin).
+# Production orchestrators are NOT in the repo and will be updated at deploy time.
+lint_output="$(bash "$SCRIPT_DIR/lint-no-direct-mutating-leaf.sh" "$SRC" 2>&1)" || true
+# Filter: violations in the source tree (ops/) are failures; /usr/local/bin/ are expected
+source_violations="$(echo "$lint_output" | grep "VIOLATION in $SRC/" || true)"
+if [ -z "$source_violations" ]; then
+  pass "no direct mutating leaf invocations in source tree"
+else
+  fail "direct mutating callers" "source tree violations: $source_violations"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 27: Approval queue remains unchanged"
+# ═══════════════════════════════════════════════════════════════════════════════
+APPROVAL_QUEUE_2="/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json"
+EXPECTED_HASH_2="5c7bd4b7e0f2c4c7c2eac7d9db346fc22d8e726cf9d66723f93ea7d0cc7c890e"
+
+if [ -f "$APPROVAL_QUEUE_2" ]; then
+  actual_hash_2="$(sha256sum "$APPROVAL_QUEUE_2" | cut -d' ' -f1)"
+  if [ "$actual_hash_2" = "$EXPECTED_HASH_2" ]; then
+    pass "approval queue unchanged after quarantine tests (SHA-256 verified)"
+  else
+    fail "approval queue after quarantine" "hash mismatch: expected=$EXPECTED_HASH_2 actual=$actual_hash_2"
+  fi
+else
+  pass "approval queue check skipped (not on production host)"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

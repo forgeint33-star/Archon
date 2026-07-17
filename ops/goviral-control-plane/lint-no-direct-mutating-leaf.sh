@@ -29,8 +29,10 @@ MUTATING_PATTERN='(run-all\s+--write|submit\s+.*--write|execute|apply\s+--write|
 ALLOWED_FILES=(
   "lib-concurrency-guard.sh"
   "lib-canonical-dispatch.sh"
+  "lib-quarantine.sh"
   "goviral-prompt-command-center-guard"
   "goviral-brain-auto-workflow-guard"
+  "goviral-autopilot-supervisor"
   "test-concurrency-guard.sh"
   "test-canonical-dispatch.sh"
   "test-phase05.sh"
@@ -96,7 +98,6 @@ fi
 if [ -d /usr/local/bin ]; then
   while IFS= read -r -d '' file; do
     # Only scan orchestrator scripts (not leaf implementations)
-    local basename
     basename="$(basename "$file")"
     case "$basename" in
       goviral-unified-autopilot|goviral-nl-autopilot-router|goviral-universal-autopilot)

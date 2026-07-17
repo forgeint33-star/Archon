@@ -25,6 +25,7 @@ LOCK_DIR="${GOVIRAL_LOCK_DIR:-/run/lock}"
 METRICS_DIR="${GOVIRAL_METRICS_DIR:-/var/lib/goviral-archon/.archon/concurrency-metrics}"
 BIN_DIR="${GOVIRAL_BIN_DIR:-/usr/local/bin}"
 CAPACITY_STATE="${GOVIRAL_CAPACITY_STATE:-/run/goviral-capacity}"
+QUARANTINE_MARKER="${GOVIRAL_QUARANTINE_MARKER:-/run/goviral-heavy-automation-quarantined}"
 
 # ── Global backpressure configuration ─────────────────────────────────────────
 MAX_HEAVY_WORKFLOWS="${GOVIRAL_MAX_HEAVY_WORKFLOWS:-2}"
@@ -36,6 +37,20 @@ HEAVY_WORKFLOWS=(
   goviral-prompt-command-center
   goviral-brain-auto-workflow
 )
+
+# ── Quarantine check ─────────────────────────────────────────────────────────
+_is_quarantined_heavy() {
+  local workflow="$1"
+  if [ ! -f "$QUARANTINE_MARKER" ]; then
+    return 1  # Not quarantined
+  fi
+  for wf in "${HEAVY_WORKFLOWS[@]}"; do
+    if [ "$workflow" = "$wf" ]; then
+      return 0  # This heavy workflow is quarantined
+    fi
+  done
+  return 1  # Not a heavy workflow
+}
 
 # ── Mutating command detection ────────────────────────────────────────────────
 _is_mutating_command() {
@@ -187,6 +202,16 @@ canonical_dispatch() {
     echo "ERROR: recursive dispatch of $workflow detected — aborting safely" >&2
     _emit_dispatch_metric "$workflow" "recursion_rejected" "same_workflow=$workflow"
     return 99
+  fi
+
+  # ── 2b. Quarantine check ────────────────────────────────────────────────
+  if _is_quarantined_heavy "$workflow"; then
+    echo "quarantined=true"
+    echo "workflow=${workflow}"
+    echo "marker=${QUARANTINE_MARKER}"
+    echo "action=refused (heavy automation quarantined)"
+    _emit_dispatch_metric "$workflow" "quarantine_refused" "marker=$QUARANTINE_MARKER"
+    return 0
   fi
 
   # ── 3. Global capacity check ────────────────────────────────────────────

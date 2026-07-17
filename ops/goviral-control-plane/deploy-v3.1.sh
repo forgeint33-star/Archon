@@ -61,6 +61,8 @@ preflight() {
     lib-concurrency-guard.sh \
     lib-canonical-dispatch.sh \
     lib-workspace-scan.sh \
+    lib-quarantine.sh \
+    goviral-autopilot-supervisor \
     goviral-prompt-command-center-guard \
     goviral-brain-auto-workflow-guard \
     goviral-unified-autopilot-guard \
@@ -86,18 +88,65 @@ preflight() {
     AQ_HASH_BEFORE=""
   fi
 
-  # Timers must NOT be active (safety check)
+  # Quarantine marker check
+  QUARANTINE_MARKER="/run/goviral-heavy-automation-quarantined"
+  if [ -f "$QUARANTINE_MARKER" ]; then
+    pass "Quarantine marker present: $QUARANTINE_MARKER"
+  else
+    warn "Quarantine marker NOT present — supervisor may re-enable timers during deploy"
+    warn "  Create it: touch $QUARANTINE_MARKER"
+  fi
+
+  # Supervisor timer: must be stopped or quarantine must be active
+  if systemctl is-active goviral-autopilot-supervisor.timer >/dev/null 2>&1; then
+    if [ ! -f "$QUARANTINE_MARKER" ]; then
+      fail "goviral-autopilot-supervisor.timer is active WITHOUT quarantine — it will re-enable heavy timers within 2 minutes"
+    else
+      warn "goviral-autopilot-supervisor.timer is active but quarantine is set (safe — supervisor will skip heavy timers)"
+    fi
+  else
+    pass "goviral-autopilot-supervisor.timer is not active"
+  fi
+
+  # Timers must NOT be active (safety check with detailed diagnostics)
   for timer in \
     goviral-unified-autopilot \
     goviral-nl-autopilot-router \
     goviral-prompt-command-center \
     goviral-brain-auto-workflow
   do
-    if systemctl is-active "${timer}.timer" >/dev/null 2>&1; then
-      fail "Timer ${timer}.timer is still active — must be stopped before deploy"
-    else
-      pass "Timer ${timer}.timer is inactive (safe)"
-    fi
+    local active_state load_state sub_state
+    active_state="$(systemctl show -p ActiveState --value "${timer}.timer" 2>/dev/null || echo "not-found")"
+    load_state="$(systemctl show -p LoadState --value "${timer}.timer" 2>/dev/null || echo "not-found")"
+    sub_state="$(systemctl show -p SubState --value "${timer}.timer" 2>/dev/null || echo "not-found")"
+
+    case "$active_state" in
+      active|activating)
+        # Try to identify who last started this timer
+        local invocation_id trigger_info
+        invocation_id="$(systemctl show -p InvocationID --value "${timer}.timer" 2>/dev/null || true)"
+        trigger_info="$(systemctl show -p TriggeredBy --value "${timer}.timer" 2>/dev/null || true)"
+        fail "Timer ${timer}.timer is ${active_state} (sub=${sub_state}, load=${load_state})"
+        log "  InvocationID: ${invocation_id:-unknown}"
+        log "  TriggeredBy: ${trigger_info:-unknown}"
+        log "  LIKELY CAUSE: goviral-autopilot-supervisor re-enabled it"
+        log "  FIX: touch $QUARANTINE_MARKER && systemctl stop ${timer}.timer"
+        ;;
+      inactive)
+        pass "Timer ${timer}.timer is inactive (safe)"
+        ;;
+      failed)
+        pass "Timer ${timer}.timer is failed (safe — not running)"
+        ;;
+      *)
+        # not-found or other
+        if [ "$load_state" = "not-found" ]; then
+          pass "Timer ${timer}.timer is not-found (not installed — safe)"
+        else
+          warn "Timer ${timer}.timer in unexpected state: active=${active_state} load=${load_state} sub=${sub_state}"
+        fi
+        ;;
+    esac
   done
 
   # Archon service should be healthy
@@ -130,7 +179,8 @@ do_install() {
     goviral-prompt-command-center goviral-prompt-command-center-guard \
     goviral-brain-auto-workflow goviral-brain-auto-workflow-guard \
     goviral-lib-concurrency-guard.sh goviral-lib-canonical-dispatch.sh \
-    goviral-lib-workspace-scan.sh
+    goviral-lib-workspace-scan.sh goviral-lib-quarantine.sh \
+    goviral-autopilot-supervisor
   do
     [ -f "/usr/local/bin/$f" ] && cp -p "/usr/local/bin/$f" "$BACKUP_DIR/scripts/$f"
   done
@@ -151,7 +201,12 @@ do_install() {
   install -o root -g root -m 0644 "$OPS/lib-concurrency-guard.sh" /usr/local/bin/goviral-lib-concurrency-guard.sh
   install -o root -g root -m 0644 "$OPS/lib-canonical-dispatch.sh" /usr/local/bin/goviral-lib-canonical-dispatch.sh
   install -o root -g root -m 0644 "$OPS/lib-workspace-scan.sh" /usr/local/bin/goviral-lib-workspace-scan.sh
+  install -o root -g root -m 0644 "$OPS/lib-quarantine.sh" /usr/local/bin/goviral-lib-quarantine.sh
   pass "Libraries installed"
+
+  # Install hardened supervisor (quarantine-aware)
+  install -o root -g root -m 0755 "$OPS/goviral-autopilot-supervisor" /usr/local/bin/goviral-autopilot-supervisor
+  pass "Hardened supervisor installed"
 
   # ── 3. Install guard wrappers ──────────────────────────────────────────────
   log "[3/6] Installing guard wrappers..."
