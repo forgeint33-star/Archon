@@ -165,7 +165,7 @@ do_install() {
   # ── 2. Build web bundle as goviral-archon ──────────────────────────────────
   log "[2/8] Building production web bundle as goviral-archon..."
   sudo -u goviral-archon -H env HOME=/var/lib/goviral-archon \
-    /usr/local/bin/bun --filter @archon/web build --cwd "$SRC"
+    /usr/local/bin/bun run --cwd "$SRC" --filter @archon/web build
 
   [ -f "$SRC/packages/web/dist/index.html" ] && pass "Web dist built" || { fail "Web build failed"; return 1; }
 
@@ -417,8 +417,21 @@ do_verify() {
     fi
   done
 
-  # ── Web UI bundle ──────────────────────────────────────────────────────────
-  [ -f "$SRC/packages/web/dist/index.html" ] && pass "Web UI bundle present" || fail "Web UI bundle missing"
+  # ── Web UI bundle (present + fresh) ─────────────────────────────────────────
+  if [ -f "$SRC/packages/web/dist/index.html" ]; then
+    pass "Web UI bundle present"
+    # Freshness: dist/index.html must be newer than the backup marker
+    # (created at install step 1), proving it was rebuilt during this deploy.
+    if [ -d "${BACKUP_DIR:-/nonexistent}" ] && [ -f "${BACKUP_DIR}/web-dist/index.html.bak" ]; then
+      if [ "$SRC/packages/web/dist/index.html" -nt "${BACKUP_DIR}/web-dist/index.html.bak" ]; then
+        pass "Web UI bundle is fresh (newer than backup)"
+      else
+        fail "Web UI bundle is stale (not rebuilt since backup)"
+      fi
+    fi
+  else
+    fail "Web UI bundle missing"
+  fi
 
   # ── Concurrency guard chain ─────────────────────────────────────────────────
   for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
@@ -500,19 +513,30 @@ do_verify() {
   done
 
   # Verify finite timeouts on ALL services (no unit should run forever)
+  # For Type=oneshot, RuntimeMaxSec is IGNORED — check TimeoutStartUSec instead.
+  # Only Type=simple/notify services use RuntimeMaxUSec.
   for svc in \
     goviral-archon-backup goviral-control-healthcheck goviral-archon-upgrade-check \
     goviral-analytics-rollup goviral-prompt-command-center goviral-brain-auto-workflow \
-    goviral-daily-ops-report goviral-telegram-notifier goviral-control-canary
+    goviral-daily-ops-report goviral-telegram-notifier
   do
-    local rmax
-    rmax="$(systemctl show "${svc}.service" --property=RuntimeMaxUSec 2>/dev/null | cut -d= -f2 || true)"
-    if [ "$rmax" != "infinity" ] && [ -n "$rmax" ]; then
-      pass "Finite RuntimeMaxSec: ${svc} ($rmax)"
+    local tstart
+    tstart="$(systemctl show "${svc}.service" --property=TimeoutStartUSec 2>/dev/null | cut -d= -f2 || true)"
+    if [ "$tstart" != "infinity" ] && [ -n "$tstart" ]; then
+      pass "Finite TimeoutStartSec (oneshot bound): ${svc} ($tstart)"
     else
-      fail "No finite RuntimeMaxSec: ${svc}"
+      fail "No finite TimeoutStartSec: ${svc}"
     fi
   done
+
+  # Canary is Type=simple — RuntimeMaxSec is the effective bound there
+  local rmax
+  rmax="$(systemctl show goviral-control-canary.service --property=RuntimeMaxUSec 2>/dev/null | cut -d= -f2 || true)"
+  if [ "$rmax" != "infinity" ] && [ -n "$rmax" ]; then
+    pass "Finite RuntimeMaxSec (simple): goviral-control-canary ($rmax)"
+  else
+    fail "No finite RuntimeMaxSec: goviral-control-canary"
+  fi
 
   # ── Failed units ───────────────────────────────────────────────────────────
   local failed_count

@@ -162,8 +162,9 @@ interface TimerConfig {
   persistent: boolean;
   randomDelay: string;
   priority: 'batch' | 'normal';
+  /** TimeoutStartSec — the real execution bound for Type=oneshot services.
+   *  RuntimeMaxSec is IGNORED by systemd for oneshot; we do not emit it. */
   timeoutSec: number;
-  runtimeMaxSec: number;
 }
 
 export const TIMER_CONFIGS: TimerConfig[] = [
@@ -175,7 +176,6 @@ export const TIMER_CONFIGS: TimerConfig[] = [
     randomDelay: '5m',
     priority: 'batch',
     timeoutSec: 300,
-    runtimeMaxSec: 600,
   },
   {
     name: 'goviral-archon-backup',
@@ -185,7 +185,6 @@ export const TIMER_CONFIGS: TimerConfig[] = [
     randomDelay: '10m',
     priority: 'batch',
     timeoutSec: 900,
-    runtimeMaxSec: 1800,
   },
   {
     name: 'goviral-archon-upgrade-check',
@@ -195,7 +194,6 @@ export const TIMER_CONFIGS: TimerConfig[] = [
     randomDelay: '30m',
     priority: 'batch',
     timeoutSec: 1800,
-    runtimeMaxSec: 2400,
   },
   {
     name: 'goviral-control-healthcheck',
@@ -205,13 +203,15 @@ export const TIMER_CONFIGS: TimerConfig[] = [
     randomDelay: '2m',
     priority: 'batch',
     timeoutSec: 120,
-    runtimeMaxSec: 180,
   },
 ];
 
 export function generateHardenedService(config: TimerConfig): string {
   const nice = config.priority === 'batch' ? 'Nice=19\nIOSchedulingClass=idle\n' : '';
 
+  // For Type=oneshot, RuntimeMaxSec is IGNORED by systemd (logged as warning).
+  // TimeoutStartSec is the real execution bound — the only timeout that kills
+  // a hung oneshot process.
   return `[Unit]
 Description=${config.description}
 After=network-online.target goviral-archon.service
@@ -224,8 +224,8 @@ Group=root
 Environment=HOME=/var/lib/goviral-archon
 Environment=GIT_OPTIONAL_LOCKS=0
 ExecStart=/usr/local/bin/${config.name}
+# For Type=oneshot, only TimeoutStartSec acts as the execution bound.
 TimeoutStartSec=${config.timeoutSec}
-RuntimeMaxSec=${config.runtimeMaxSec}
 ${nice}NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

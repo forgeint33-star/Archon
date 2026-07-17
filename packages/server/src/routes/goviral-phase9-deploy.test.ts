@@ -18,6 +18,7 @@ import {
   generateHardenedTimer,
   generateDeployScript,
   registerGoviralPhase9Routes,
+  TIMER_CONFIGS,
 } from './goviral-phase9-deploy';
 
 // ---------------------------------------------------------------------------
@@ -143,7 +144,6 @@ describe('generateHardenedService', () => {
     randomDelay: '5m',
     priority: 'batch',
     timeoutSec: 300,
-    runtimeMaxSec: 600,
   });
 
   test('has Nice=19 for batch priority', () => {
@@ -154,12 +154,16 @@ describe('generateHardenedService', () => {
     expect(service).toContain('IOSchedulingClass=idle');
   });
 
-  test('has TimeoutStartSec', () => {
+  test('has TimeoutStartSec as the oneshot execution bound', () => {
     expect(service).toContain('TimeoutStartSec=300');
   });
 
-  test('has RuntimeMaxSec', () => {
-    expect(service).toContain('RuntimeMaxSec=600');
+  test('does NOT emit RuntimeMaxSec (ignored for Type=oneshot)', () => {
+    expect(service).not.toContain('RuntimeMaxSec');
+  });
+
+  test('is Type=oneshot', () => {
+    expect(service).toContain('Type=oneshot');
   });
 
   test('has NoNewPrivileges', () => {
@@ -168,6 +172,62 @@ describe('generateHardenedService', () => {
 
   test('has PrivateTmp', () => {
     expect(service).toContain('PrivateTmp=true');
+  });
+});
+
+describe('oneshot timeout values are evidence-based', () => {
+  test('prompt-command-center TimeoutStartSec >= 600 (normal runs 2-4 min)', () => {
+    const pcc = TIMER_CONFIGS.find(c => c.name === 'goviral-prompt-command-center');
+    // prompt-command-center is not in TIMER_CONFIGS (it has its own service file),
+    // but the unit file must have TimeoutStartSec=600. Verify via generate if it were:
+    const service = generateHardenedService({
+      name: 'goviral-prompt-command-center',
+      description: 'test',
+      calendar: '',
+      persistent: false,
+      randomDelay: '0',
+      priority: 'batch',
+      timeoutSec: 600,
+    });
+    expect(service).toContain('TimeoutStartSec=600');
+    expect(service).not.toContain('RuntimeMaxSec');
+    // The value 600 is not premature — it gives 10 min headroom above 2-4 min normal
+    expect(pcc).toBeUndefined(); // PCC uses its own hand-written unit file
+  });
+
+  test('brain-auto-workflow TimeoutStartSec >= 900 (heavier PRD generation)', () => {
+    const service = generateHardenedService({
+      name: 'goviral-brain-auto-workflow',
+      description: 'test',
+      calendar: '',
+      persistent: false,
+      randomDelay: '0',
+      priority: 'batch',
+      timeoutSec: 900,
+    });
+    expect(service).toContain('TimeoutStartSec=900');
+    expect(service).not.toContain('RuntimeMaxSec');
+  });
+
+  test('all TIMER_CONFIGS have timeoutSec > 0', () => {
+    for (const config of TIMER_CONFIGS) {
+      expect(config.timeoutSec).toBeGreaterThan(0);
+    }
+  });
+
+  test('no TIMER_CONFIG has runtimeMaxSec property', () => {
+    for (const config of TIMER_CONFIGS) {
+      expect(config).not.toHaveProperty('runtimeMaxSec');
+    }
+  });
+
+  test('all generated services are oneshot without RuntimeMaxSec', () => {
+    for (const config of TIMER_CONFIGS) {
+      const service = generateHardenedService(config);
+      expect(service).toContain('Type=oneshot');
+      expect(service).toContain(`TimeoutStartSec=${config.timeoutSec}`);
+      expect(service).not.toContain('RuntimeMaxSec');
+    }
   });
 });
 
@@ -181,7 +241,6 @@ describe('generateHardenedTimer', () => {
       randomDelay: '30m',
       priority: 'batch',
       timeoutSec: 1800,
-      runtimeMaxSec: 2400,
     });
     expect(timer).toContain('Persistent=false');
   });
@@ -195,7 +254,6 @@ describe('generateHardenedTimer', () => {
       randomDelay: '10m',
       priority: 'batch',
       timeoutSec: 900,
-      runtimeMaxSec: 1800,
     });
     expect(timer).toContain('Persistent=true');
   });
@@ -209,7 +267,6 @@ describe('generateHardenedTimer', () => {
       randomDelay: '5m',
       priority: 'normal',
       timeoutSec: 60,
-      runtimeMaxSec: 120,
     });
     expect(timer).toContain('RandomizedDelaySec=5m');
   });

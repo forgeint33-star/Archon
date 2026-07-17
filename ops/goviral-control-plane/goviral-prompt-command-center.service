@@ -10,9 +10,9 @@ ExecStart=/usr/local/bin/goviral-prompt-command-center-guard run-all --write
 User=root
 
 # ── Hardening ────────────────────────────────────────────────────────────────
-# Prompt command center processes the full queue; 10 minutes is generous.
-RuntimeMaxSec=600
-TimeoutStartSec=120
+# For Type=oneshot, only TimeoutStartSec acts as the execution bound.
+# Normal runs complete in 2–4 minutes; 600s (10 min) is generous headroom.
+TimeoutStartSec=600
 
 # Lower scheduling priority for batch work (nice 10, idle I/O)
 Nice=10
