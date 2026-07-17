@@ -1,0 +1,19 @@
+[Unit]
+Description=GoViral Natural Language Autopilot Router
+After=network-online.target goviral-archon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/lib/goviral-archon/workspaces/goviral-brain
+ExecStart=/usr/local/bin/goviral-nl-autopilot-router-guard run-all --write
+User=root
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+# Router dispatches to prompt-command-center; 6 min timeout
+TimeoutStartSec=360
+
+# Lower scheduling priority for batch work
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7

@@ -1,12 +1,16 @@
 [Unit]
-Description=Run GoViral Prompt-to-PRD Autonomous Brain Workflow every 5 minutes
+Description=Run GoViral Prompt-to-PRD Autonomous Brain Workflow every 12 minutes (staggered)
 
 [Timer]
-# Staggered boot: wait 4 min to avoid simultaneous fan-out with prompt-command-center (3m30s)
-OnBootSec=4min
-OnUnitActiveSec=5min
+# Boot: 12 minutes (staggered well after other timers)
+OnBootSec=12min
+# Interval: 12 minutes (was 5 min — heaviest workflow, needs breathing room)
+OnUnitActiveSec=12min
 AccuracySec=30s
-Persistent=true
+# Randomized delay prevents alignment
+RandomizedDelaySec=45
+# Persistent=false: do NOT catch up missed runs after reboot/sleep.
+Persistent=false
 
 [Install]
 WantedBy=timers.target

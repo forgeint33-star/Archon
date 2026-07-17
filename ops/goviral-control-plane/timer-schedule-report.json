@@ -1,0 +1,108 @@
+{
+  "report": "Phase 0.5 Timer Schedule Audit",
+  "generated": "2026-07-17",
+  "vcpu_count": 4,
+  "max_heavy_workflows": 2,
+  "timers": [
+    {
+      "name": "goviral-unified-autopilot",
+      "role": "Top-level orchestrator",
+      "previous": {
+        "on_boot_sec": "2min",
+        "on_unit_active_sec": "1min",
+        "randomized_delay_sec": null,
+        "persistent": true,
+        "timeout_start_sec": null,
+        "notes": "No guard, no hardening, 1-min interval, boot stampede with nl-autopilot-router"
+      },
+      "proposed": {
+        "on_boot_sec": "5min",
+        "on_unit_active_sec": "10min",
+        "randomized_delay_sec": "60s",
+        "persistent": false,
+        "timeout_start_sec": "480s",
+        "notes": "Guard added, hardened, 10x slower interval, staggered boot, no catch-up"
+      }
+    },
+    {
+      "name": "goviral-nl-autopilot-router",
+      "role": "NL routing orchestrator",
+      "previous": {
+        "on_boot_sec": "2min",
+        "on_unit_active_sec": "2min",
+        "randomized_delay_sec": null,
+        "persistent": true,
+        "timeout_start_sec": null,
+        "notes": "No guard, no hardening, boot stampede with unified-autopilot"
+      },
+      "proposed": {
+        "on_boot_sec": "7min",
+        "on_unit_active_sec": "8min",
+        "randomized_delay_sec": "45s",
+        "persistent": false,
+        "timeout_start_sec": "360s",
+        "notes": "Guard added, hardened, 4x slower interval, staggered boot, no catch-up"
+      }
+    },
+    {
+      "name": "goviral-prompt-command-center",
+      "role": "Leaf: prompt queue processing",
+      "previous": {
+        "on_boot_sec": "3min 30s",
+        "on_unit_active_sec": "3min",
+        "randomized_delay_sec": null,
+        "persistent": true,
+        "timeout_start_sec": "600s",
+        "notes": "Guard present, hardened, but Persistent=true and no RandomizedDelaySec"
+      },
+      "proposed": {
+        "on_boot_sec": "9min",
+        "on_unit_active_sec": "6min",
+        "randomized_delay_sec": "30s",
+        "persistent": false,
+        "timeout_start_sec": "600s",
+        "notes": "Existing guard, 2x slower interval, Persistent=false, randomized delay"
+      }
+    },
+    {
+      "name": "goviral-brain-auto-workflow",
+      "role": "Leaf: PRD/task pipeline (heaviest)",
+      "previous": {
+        "on_boot_sec": "4min",
+        "on_unit_active_sec": "5min",
+        "randomized_delay_sec": null,
+        "persistent": true,
+        "timeout_start_sec": "900s",
+        "notes": "Guard present, hardened, but Persistent=true and no RandomizedDelaySec"
+      },
+      "proposed": {
+        "on_boot_sec": "12min",
+        "on_unit_active_sec": "12min",
+        "randomized_delay_sec": "45s",
+        "persistent": false,
+        "timeout_start_sec": "900s",
+        "notes": "Existing guard, 2.4x slower interval, Persistent=false, randomized delay"
+      }
+    }
+  ],
+  "boot_sequence": [
+    { "time_min": 5, "timer": "goviral-unified-autopilot", "notes": "first mover" },
+    { "time_min": 7, "timer": "goviral-nl-autopilot-router", "notes": "+2min gap" },
+    { "time_min": 9, "timer": "goviral-prompt-command-center", "notes": "+2min gap" },
+    { "time_min": 12, "timer": "goviral-brain-auto-workflow", "notes": "+3min gap" }
+  ],
+  "worst_case_simultaneous_heavy": {
+    "with_guards": 2,
+    "explanation": "Global backpressure cap at 2; flock ensures at most 1 instance per workflow; RandomizedDelaySec + staggered OnBootSec makes alignment unlikely",
+    "without_guards_previous": 7,
+    "explanation_previous": "3x prompt + 4x brain observed during 2026-07-16 incident"
+  },
+  "non_heavy_timers_unchanged": [
+    "goviral-archon-backup.timer",
+    "goviral-control-healthcheck.timer",
+    "goviral-archon-upgrade-check.timer",
+    "goviral-analytics-rollup.timer",
+    "goviral-daily-ops-report.timer",
+    "goviral-telegram-notifier.timer"
+  ]
+}

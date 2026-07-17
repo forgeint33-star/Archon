@@ -1,0 +1,17 @@
+[Unit]
+Description=Run GoViral Unified Autopilot every 10 minutes (staggered)
+
+[Timer]
+# Boot: 5 minutes offset to avoid simultaneous startup with other timers
+OnBootSec=5min
+# Interval: 10 minutes (was 1 min — root cause of CPU storm)
+OnUnitActiveSec=10min
+AccuracySec=30s
+# Randomized delay prevents timer alignment drift
+RandomizedDelaySec=60
+# Persistent=false: do NOT catch up missed runs after reboot/sleep.
+# A missed run simply waits for the next scheduled tick.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

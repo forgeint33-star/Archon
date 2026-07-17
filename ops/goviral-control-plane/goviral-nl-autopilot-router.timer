@@ -1,0 +1,16 @@
+[Unit]
+Description=Run GoViral Natural Language Autopilot Router every 8 minutes (staggered)
+
+[Timer]
+# Boot: 7 minutes (staggered after unified at 5min)
+OnBootSec=7min
+# Interval: 8 minutes (was 2 min — contributed to CPU storm)
+OnUnitActiveSec=8min
+AccuracySec=30s
+# Randomized delay prevents alignment
+RandomizedDelaySec=45
+# Persistent=false: do NOT catch up missed runs
+Persistent=false
+
+[Install]
+WantedBy=timers.target

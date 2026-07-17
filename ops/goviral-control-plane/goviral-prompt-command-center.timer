@@ -1,15 +1,17 @@
 [Unit]
-Description=Run GoViral Prompt Command Center every 3 minutes
+Description=Run GoViral Prompt Command Center every 6 minutes (staggered)
 
 [Timer]
-# Staggered boot: wait 3 min + 30s offset to avoid simultaneous fan-out
-OnBootSec=3min 30s
-OnUnitActiveSec=3min
+# Boot: 9 minutes (staggered after router at 7min)
+OnBootSec=9min
+# Interval: 6 minutes (was 3 min)
+OnUnitActiveSec=6min
 AccuracySec=30s
-Persistent=true
-# Prevent accumulation of pending triggers while the service is still running
-# (requires systemd >= 229, no-op on older)
-# RandomizedDelaySec=15
+# Randomized delay prevents alignment with other timers
+RandomizedDelaySec=30
+# Persistent=false: do NOT catch up missed runs after reboot/sleep.
+# Prevents catch-up storms where systemd fires multiple triggers at once.
+Persistent=false
 
 [Install]
 WantedBy=timers.target

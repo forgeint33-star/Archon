@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Concurrency-guarded wrapper for goviral-unified-autopilot (orchestrator).
+#
+# Provides the same flock-based protection as leaf guards but recognizes
+# this script's role as an orchestrator: child dispatches go through
+# canonical_dispatch() (lib-canonical-dispatch.sh), never direct execution.
+#
+# Non-mutating commands (status, dashboard, memory) pass through unguarded.
+# "run-all --write" is flock-guarded — only one instance runs at a time.
+# ──────────────────────────────────────────────────────────────────────────────
+set -u -o pipefail
+
+# Guard against recursive self-execution
+if [ "${_GOVIRAL_GUARD_ACTIVE:-}" = "goviral-unified-autopilot" ]; then
+  echo "ERROR: recursive guard invocation detected" >&2
+  exit 99
+fi
+export _GOVIRAL_GUARD_ACTIVE="goviral-unified-autopilot"
+
+# Source shared guard library
+# shellcheck source=lib-concurrency-guard.sh
+source /usr/local/bin/goviral-lib-concurrency-guard.sh
+
+concurrency_guard "goviral-unified-autopilot" "$@"
