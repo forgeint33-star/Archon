@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GoViral Control Plane v3.1 — Phase 0.5.2 Stabilization deployment.
+# GoViral Control Plane v3.1 — Phase 0.5.3 Stabilization deployment.
 #
 # Extends deploy-v3.sh with:
 #   - Canonical dispatch library + quarantine library
@@ -65,7 +65,7 @@ fi
 # PREFLIGHT
 # ═══════════════════════════════════════════════════════════════════════════════
 preflight() {
-  log "=== PREFLIGHT (v3.1 Phase 0.5.2) ==="
+  log "=== PREFLIGHT (v3.1 Phase 0.5.3) ==="
 
   local branch
   branch="$(git -C "$SRC" branch --show-current 2>/dev/null || echo unknown)"
@@ -216,109 +216,202 @@ preflight() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STEP TRACKING — idempotent re-run support
+# ═══════════════════════════════════════════════════════════════════════════════
+STEP_STATE_DIR="/var/lib/goviral-archon/.archon/deploy-v3.1-state"
+
+_step_done() {
+  [ -f "${STEP_STATE_DIR}/step-${1}.done" ]
+}
+
+_mark_step() {
+  mkdir -p "$STEP_STATE_DIR" 2>/dev/null || true
+  date -u +%Y-%m-%dT%H:%M:%SZ > "${STEP_STATE_DIR}/step-${1}.done"
+}
+
+_print_step_state() {
+  log "--- Installed step state ---"
+  for s in 1 2 3 4 5 6 7 8; do
+    if _step_done "$s"; then
+      log "  step $s: completed ($(cat "${STEP_STATE_DIR}/step-${s}.done"))"
+    else
+      log "  step $s: pending"
+    fi
+  done
+}
+
+_print_partial_failure() {
+  local failed_step="$1"
+  local completed=""
+  for s in 1 2 3 4 5 6 7 8; do
+    if _step_done "$s"; then
+      completed="${completed:+$completed,}$s"
+    fi
+  done
+  echo ""
+  echo "install_partial=true"
+  echo "completed_steps=${completed:-none}"
+  echo "failed_step=${failed_step}"
+  echo "backup_path=${BACKUP_DIR}"
+  echo "quarantine_preserved=$(is_quarantined && echo true || echo false)"
+  echo "rollback_required=operator_decision"
+}
+
+# Classify failure: functional product failure vs expected quarantine refusal
+# vs test harness isolation failure
+_classify_failure() {
+  local step="$1"
+  local output="$2"
+  if echo "$output" | grep -q "quarantined=true.*action=refused"; then
+    echo "expected_quarantine_refusal"
+  elif echo "$output" | grep -q "live production markers.*leak\|GOVIRAL_QUARANTINE_MARKER_PERSISTENT.*production"; then
+    echo "test_harness_isolation_failure"
+  else
+    echo "functional_product_failure"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # INSTALL
 # ═══════════════════════════════════════════════════════════════════════════════
 do_install() {
-  log "=== INSTALL (v3.1 Phase 0.5.2) ==="
+  log "=== INSTALL (v3.1 Phase 0.5.3) ==="
+  _print_step_state
 
   # ── 1. Backup ──────────────────────────────────────────────────────────────
-  log "[1/8] Backing up current state..."
-  mkdir -p "$BACKUP_DIR/scripts" "$BACKUP_DIR/units"
+  if _step_done 1; then
+    log "[1/8] Backup already completed (idempotent skip)"
+  else
+    log "[1/8] Backing up current state..."
+    mkdir -p "$BACKUP_DIR/scripts" "$BACKUP_DIR/units"
 
-  for f in \
-    goviral-unified-autopilot goviral-unified-autopilot-guard \
-    goviral-nl-autopilot-router goviral-nl-autopilot-router-guard \
-    goviral-prompt-command-center goviral-prompt-command-center-guard \
-    goviral-brain-auto-workflow goviral-brain-auto-workflow-guard \
-    goviral-lib-concurrency-guard.sh goviral-lib-canonical-dispatch.sh \
-    goviral-lib-workspace-scan.sh goviral-lib-quarantine.sh \
-    goviral-autopilot-supervisor goviral-quarantine
-  do
-    [ -f "/usr/local/bin/$f" ] && cp -p "/usr/local/bin/$f" "$BACKUP_DIR/scripts/$f"
-  done
+    for f in \
+      goviral-unified-autopilot goviral-unified-autopilot-guard \
+      goviral-nl-autopilot-router goviral-nl-autopilot-router-guard \
+      goviral-prompt-command-center goviral-prompt-command-center-guard \
+      goviral-brain-auto-workflow goviral-brain-auto-workflow-guard \
+      goviral-lib-concurrency-guard.sh goviral-lib-canonical-dispatch.sh \
+      goviral-lib-workspace-scan.sh goviral-lib-quarantine.sh \
+      goviral-autopilot-supervisor goviral-quarantine
+    do
+      [ -f "/usr/local/bin/$f" ] && cp -p "/usr/local/bin/$f" "$BACKUP_DIR/scripts/$f"
+    done
 
-  for unit in \
-    goviral-unified-autopilot.service goviral-unified-autopilot.timer \
-    goviral-nl-autopilot-router.service goviral-nl-autopilot-router.timer \
-    goviral-prompt-command-center.service goviral-prompt-command-center.timer \
-    goviral-brain-auto-workflow.service goviral-brain-auto-workflow.timer \
-    goviral-autopilot-supervisor.service goviral-autopilot-supervisor.timer
-  do
-    [ -f "/etc/systemd/system/$unit" ] && cp -p "/etc/systemd/system/$unit" "$BACKUP_DIR/units/$unit"
-  done
+    for unit in \
+      goviral-unified-autopilot.service goviral-unified-autopilot.timer \
+      goviral-nl-autopilot-router.service goviral-nl-autopilot-router.timer \
+      goviral-prompt-command-center.service goviral-prompt-command-center.timer \
+      goviral-brain-auto-workflow.service goviral-brain-auto-workflow.timer \
+      goviral-autopilot-supervisor.service goviral-autopilot-supervisor.timer
+    do
+      [ -f "/etc/systemd/system/$unit" ] && cp -p "/etc/systemd/system/$unit" "$BACKUP_DIR/units/$unit"
+    done
 
-  pass "Backup complete: $BACKUP_DIR"
+    _mark_step 1
+    pass "Backup complete: $BACKUP_DIR"
+  fi
 
   # ── 2. Install libraries ──────────────────────────────────────────────────
-  log "[2/8] Installing libraries..."
-  install -o root -g root -m 0644 "$OPS/lib-concurrency-guard.sh" /usr/local/bin/goviral-lib-concurrency-guard.sh
-  install -o root -g root -m 0644 "$OPS/lib-canonical-dispatch.sh" /usr/local/bin/goviral-lib-canonical-dispatch.sh
-  install -o root -g root -m 0644 "$OPS/lib-workspace-scan.sh" /usr/local/bin/goviral-lib-workspace-scan.sh
-  install -o root -g root -m 0644 "$OPS/lib-quarantine.sh" /usr/local/bin/goviral-lib-quarantine.sh
-  pass "Libraries installed"
+  if _step_done 2; then
+    log "[2/8] Libraries already installed (idempotent skip)"
+  else
+    log "[2/8] Installing libraries..."
+    install -o root -g root -m 0644 "$OPS/lib-concurrency-guard.sh" /usr/local/bin/goviral-lib-concurrency-guard.sh
+    install -o root -g root -m 0644 "$OPS/lib-canonical-dispatch.sh" /usr/local/bin/goviral-lib-canonical-dispatch.sh
+    install -o root -g root -m 0644 "$OPS/lib-workspace-scan.sh" /usr/local/bin/goviral-lib-workspace-scan.sh
+    install -o root -g root -m 0644 "$OPS/lib-quarantine.sh" /usr/local/bin/goviral-lib-quarantine.sh
+    _mark_step 2
+    pass "Libraries installed"
+  fi
 
   # ── 3. Install supervisor + quarantine admin ──────────────────────────────
-  log "[3/8] Installing supervisor and quarantine admin..."
-  install -o root -g root -m 0755 "$OPS/goviral-autopilot-supervisor" /usr/local/bin/goviral-autopilot-supervisor
-  install -o root -g root -m 0755 "$OPS/goviral-quarantine" /usr/local/bin/goviral-quarantine
-  pass "Supervisor and quarantine admin installed"
+  if _step_done 3; then
+    log "[3/8] Supervisor already installed (idempotent skip)"
+  else
+    log "[3/8] Installing supervisor and quarantine admin..."
+    install -o root -g root -m 0755 "$OPS/goviral-autopilot-supervisor" /usr/local/bin/goviral-autopilot-supervisor
+    install -o root -g root -m 0755 "$OPS/goviral-quarantine" /usr/local/bin/goviral-quarantine
+    _mark_step 3
+    pass "Supervisor and quarantine admin installed"
+  fi
 
   # ── 4. Install guard wrappers ──────────────────────────────────────────────
-  log "[4/8] Installing guard wrappers..."
-  for script in \
-    goviral-unified-autopilot-guard \
-    goviral-nl-autopilot-router-guard \
-    goviral-prompt-command-center-guard \
-    goviral-brain-auto-workflow-guard
-  do
-    install -o root -g root -m 0755 "$OPS/$script" "/usr/local/bin/$script"
-    log "  installed $script"
-  done
-
-  # Restore leaf implementations from hotfix .impl if needed
-  for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
-    impl_file="$(ls "/usr/local/bin/${script}.impl."* 2>/dev/null | head -1 || true)"
-    if [ -n "$impl_file" ] && [ -f "$impl_file" ]; then
-      log "  restoring $script from hotfix .impl"
-      cp -p "$impl_file" "/usr/local/bin/$script"
-      chmod 0755 "/usr/local/bin/$script"
-    fi
-  done
-
-  pass "Guard wrappers installed"
-
-  # ── 5. Run tests ───────────────────────────────────────────────────────────
-  log "[5/8] Running Phase 0.5 tests..."
-  if bash "$OPS/test-phase05.sh"; then
-    pass "Phase 0.5 tests passed"
+  if _step_done 4; then
+    log "[4/8] Guard wrappers already installed (idempotent skip)"
   else
-    fail "Phase 0.5 tests failed"
-    return 1
+    log "[4/8] Installing guard wrappers..."
+    for script in \
+      goviral-unified-autopilot-guard \
+      goviral-nl-autopilot-router-guard \
+      goviral-prompt-command-center-guard \
+      goviral-brain-auto-workflow-guard
+    do
+      install -o root -g root -m 0755 "$OPS/$script" "/usr/local/bin/$script"
+      log "  installed $script"
+    done
+
+    # Restore leaf implementations from hotfix .impl if needed
+    for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
+      impl_file="$(ls "/usr/local/bin/${script}.impl."* 2>/dev/null | head -1 || true)"
+      if [ -n "$impl_file" ] && [ -f "$impl_file" ]; then
+        log "  restoring $script from hotfix .impl"
+        cp -p "$impl_file" "/usr/local/bin/$script"
+        chmod 0755 "/usr/local/bin/$script"
+      fi
+    done
+
+    _mark_step 4
+    pass "Guard wrappers installed"
   fi
 
-  if bash "$OPS/test-concurrency-guard.sh"; then
-    pass "Concurrency guard tests passed"
-  else
-    fail "Concurrency guard tests failed"
+  # ── 5. Run tests (hermetic — never uses live marker paths) ─────────────────
+  log "[5/8] Running Phase 0.5 tests (hermetic)..."
+  local test_output=""
+  test_output="$(bash "$OPS/test-phase05.sh" 2>&1)" || {
+    local failure_type
+    failure_type="$(_classify_failure 5 "$test_output")"
+    fail "Phase 0.5 tests failed (type=$failure_type)"
+    echo "$test_output" | tail -20
+    _print_partial_failure 5
     return 1
-  fi
+  }
+  echo "$test_output" | tail -5
+  pass "Phase 0.5 tests passed"
+
+  test_output="$(bash "$OPS/test-concurrency-guard.sh" 2>&1)" || {
+    local failure_type
+    failure_type="$(_classify_failure 5 "$test_output")"
+    fail "Concurrency guard tests failed (type=$failure_type)"
+    echo "$test_output" | tail -20
+    _print_partial_failure 5
+    return 1
+  }
+  echo "$test_output" | tail -3
+  pass "Concurrency guard tests passed"
+  _mark_step 5
 
   # ── 6. Install systemd units ──────────────────────────────────────────────
-  log "[6/8] Installing systemd units..."
-  for unit in \
-    goviral-unified-autopilot.service goviral-unified-autopilot.timer \
-    goviral-nl-autopilot-router.service goviral-nl-autopilot-router.timer \
-    goviral-prompt-command-center.service goviral-prompt-command-center.timer \
-    goviral-brain-auto-workflow.service goviral-brain-auto-workflow.timer
-  do
-    install -o root -g root -m 0644 "$OPS/$unit" "/etc/systemd/system/$unit"
-    log "  installed $unit"
-  done
+  if _step_done 6; then
+    log "[6/8] Systemd units already installed (idempotent skip)"
+  else
+    log "[6/8] Installing systemd units..."
+    for unit in \
+      goviral-unified-autopilot.service goviral-unified-autopilot.timer \
+      goviral-nl-autopilot-router.service goviral-nl-autopilot-router.timer \
+      goviral-prompt-command-center.service goviral-prompt-command-center.timer \
+      goviral-brain-auto-workflow.service goviral-brain-auto-workflow.timer
+    do
+      install -o root -g root -m 0644 "$OPS/$unit" "/etc/systemd/system/$unit"
+      log "  installed $unit"
+    done
 
-  systemctl daemon-reload
-  pass "systemd daemon-reload complete"
+    systemctl daemon-reload
+    _mark_step 6
+    pass "systemd daemon-reload complete"
+  fi
 
   # ── 7. Disable quarantined timers (remove enabled symlinks) ───────────────
+  # Idempotent: safe to run multiple times — disable is a no-op if already disabled
   log "[7/8] Disabling quarantined timers (removing enabled symlinks)..."
   for timer in "${QUARANTINED_TIMERS[@]}"; do
     if systemctl cat "$timer" >/dev/null 2>&1; then
@@ -328,6 +421,7 @@ do_install() {
       log "  not installed (skip): $timer"
     fi
   done
+  _mark_step 7
   pass "Quarantined timers disabled — enabled symlinks removed"
 
   # Do NOT remove quarantine markers (persistent or runtime)
@@ -336,10 +430,17 @@ do_install() {
   fi
 
   # Do NOT enable heavy timers — that's a separate operator step
+  # Do NOT unmask timers
+  # Do NOT restart Archon
+  # Do NOT modify approval entries
 
   # ── 8. Verify ──────────────────────────────────────────────────────────────
   log "[8/8] Post-install verification..."
-  do_verify
+  do_verify || {
+    _print_partial_failure 8
+    return 1
+  }
+  _mark_step 8
 
   log ""
   log "══════════════════════════════════════════════════════════"
@@ -349,13 +450,14 @@ do_install() {
   log "   1. goviral-quarantine deactivate"
   log "   2. goviral-quarantine enable-timers"
   log "══════════════════════════════════════════════════════════"
+  _print_step_state
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VERIFY
 # ═══════════════════════════════════════════════════════════════════════════════
 do_verify() {
-  log "=== VERIFY (v3.1 Phase 0.5.2) ==="
+  log "=== VERIFY (v3.1 Phase 0.5.3) ==="
 
   # Guard chain
   for script in goviral-unified-autopilot goviral-nl-autopilot-router \
@@ -470,7 +572,7 @@ AQ_HASH_BEFORE=""
 
 case "$MODE" in
   --dry-run)  preflight ;;
-  --install)  preflight || exit 1; do_install || { log "=== INSTALL FAILED ==="; exit 1; } ;;
+  --install)  preflight || exit 1; do_install || { log "=== INSTALL FAILED (do NOT rollback quarantine protections) ==="; exit 1; } ;;
   --verify)   do_verify ;;
   --rollback) do_rollback ;;
   *)          echo "Usage: $0 [--dry-run|--install|--verify|--rollback]" >&2; exit 1 ;;
