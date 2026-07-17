@@ -273,7 +273,7 @@ archon workflow run archon-fix-github-issue --branch fix/issue-42 "Fix issue #42
 
 That's it. The CLI auto-detects the git repo, uses SQLite for state tracking (`~/.archon/archon.db`), and streams output to stdout.
 
-> **The target directory must be a git repository.** Archon uses git worktrees for isolation, so it needs a `.git` folder. If your project isn't a git repo yet, run `git init && git add . && git commit -m "initial commit"` first.
+> **The target directory is usually a git repository.** Archon uses git worktrees for isolation, so a git repo gets a `.git` folder and per-run branch isolation. But a non-git directory — a multi-repo root or an ops folder — can be registered as a [folder project](/getting-started/concepts/#folder-projects-non-git-workspaces) with `--folder` instead, running in place with no worktree. If you want git isolation and your project isn't a repo yet, run `git init && git add . && git commit -m "initial commit"` first.
 
 ---
 
@@ -311,8 +311,8 @@ archon workflow run <name> --cwd /path/to/repo "<message>"
 | `archon workflow runs` | List recent runs of every status for this project |
 | `archon workflow get <id>` | Show detail for a single run (any status) |
 | `archon workflow resume <id>` | Resume a failed workflow |
-| `archon workflow abandon <id>` | Abandon a non-terminal run |
-| `archon workflow approve <id> [comment]` | Approve an interactive loop gate |
+| `archon workflow abandon <id>` | Abandon a run (running, paused, or failed) |
+| `archon workflow approve <id> [comment]` | Approve an interactive loop gate (no comment on a signal-bearing gate = accept & complete; a comment runs another iteration) |
 | `archon workflow reject <id> [--reason "..."]` | Reject an approval gate |
 | `archon workflow cleanup [days]` | Delete old run records (default: 7 days) |
 | `archon workflow event emit` | Emit a workflow event |

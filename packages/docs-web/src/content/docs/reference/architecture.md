@@ -343,10 +343,15 @@ export type MessageChunk =
       structuredOutput?: unknown;
       isError?: boolean;
       errorSubtype?: string;
+      errors?: string[];
       cost?: number;
       stopReason?: string;
       numTurns?: number;
       modelUsage?: Record<string, unknown>;
+      // Session-resume outcome: true = restored, false = requested but fell back
+      // to a fresh session, omitted = no resume requested. Set only when
+      // resumeSessionId was passed (stamp it via withResumedOutcome).
+      resumed?: boolean;
     }
   | { type: 'rate_limit'; rateLimitInfo: Record<string, unknown> }
   | { type: 'tool'; toolName: string; toolInput?: Record<string, unknown>; toolCallId?: string }
@@ -452,7 +457,7 @@ YOUR_ASSISTANT_MODEL=<model-name>
 **Transition triggers** (`packages/core/src/state/session-transitions.ts`):
 - `first-message` - No existing session
 - `plan-to-execute` - Plan phase completed, starting execution (creates new session immediately)
-- `isolation-changed`, `codebase-changed`, `reset-requested`, etc. - Deactivate current session
+- `isolation-changed`, `project-changed`, `reset-requested`, etc. - Deactivate current session
 
 **Orchestrator logic** (`packages/core/src/orchestrator/orchestrator.ts`):
 
@@ -1048,6 +1053,7 @@ remote_agent_codebases
 ├── default_cwd (VARCHAR)
 ├── default_branch (VARCHAR, nullable) -- detected branch used as sync context when available
 ├── ai_assistant_type (VARCHAR) -- registered provider identifier (e.g. 'claude', 'codex')
+├── kind (VARCHAR, default 'repo') -- 'repo' | 'folder' (folder projects are non-git, run in place)
 └── commands (JSONB) -- {command_name: {path, description}}
 
 remote_agent_conversations
@@ -1055,7 +1061,7 @@ remote_agent_conversations
 ├── platform_type (VARCHAR) -- 'web' | 'telegram' | 'github' | 'slack' | 'discord' | 'gitea' | 'gitlab' | 'cli'
 ├── platform_conversation_id (VARCHAR) -- Platform-specific ID
 ├── codebase_id (UUID -> remote_agent_codebases.id)
-├── cwd (VARCHAR) -- Current working directory
+├── cwd (VARCHAR) -- Explicit working-directory override, usually null (set by worktree create/remove; effective cwd falls back to codebase.default_cwd)
 ├── ai_assistant_type (VARCHAR) -- LOCKED at creation
 ├── title (VARCHAR) -- User-friendly conversation title (Web UI)
 ├── deleted_at (TIMESTAMP) -- Soft-delete support

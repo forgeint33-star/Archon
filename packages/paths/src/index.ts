@@ -7,6 +7,7 @@ export {
   ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
   getArchonConfigPath,
+  getCredentialKeyPath,
   getArchonEnvPath,
   getRepoArchonEnvPath,
   getHomeWorkflowsPath,
@@ -28,6 +29,14 @@ export {
   getProjectLogsPath,
   getRunArtifactsPath,
   getRunLogPath,
+  sanitizeScopeSegment,
+  getScopeArtifactsPath,
+  slugifyFolderName,
+  getFolderProjectRoot,
+  getFolderProjectArtifactsPath,
+  getFolderProjectLogsPath,
+  getFolderRunArtifactsPath,
+  ensureFolderProjectStructure,
   resolveProjectRootFromCwd,
   ensureProjectStructure,
   createProjectSourceSymlink,
@@ -53,6 +62,10 @@ export {
   parseLatestRelease,
 } from './update-check';
 export type { UpdateCheckResult } from './update-check';
+
+// Tier notice (one-time CLI notice for unconfigured tier-keyword workflows)
+export { readTierNoticeState, markTierNoticeShown } from './tier-notice';
+export type { TierNoticeState } from './tier-notice';
 
 // Anonymous telemetry
 export {

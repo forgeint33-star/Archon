@@ -9,15 +9,17 @@ import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, captureWorkflowCompleted } from '@archon/paths';
 import { getDefaultBranch, toRepoPath } from '@archon/git';
 import type {
+  DagNode,
   WorkflowDefinition,
   WorkflowRun,
   WorkflowExecutionResult,
   WorkflowSource,
 } from './schemas';
-import { isLoopNode, isApprovalNode, isScriptNode, isBashNode } from './schemas';
+import { isLoopNode, isLoopGroupNode, isApprovalNode, isScriptNode, isBashNode } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
+import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import {
@@ -223,23 +225,41 @@ async function resolveUserProviderEnvForWorkflow(
 /**
  * Resolve the artifacts and log directories for a workflow run.
  * Looks up the codebase by ID once, parses owner/repo, and returns project-scoped paths.
- * Falls back to cwd-based paths for unregistered repos.
+ * Folder projects route to `_folder/<slug>/` storage; falls back to cwd-based
+ * paths for unregistered repos.
+ *
+ * `artifactsRoot` is the parent of the `runs/` layout (`.../artifacts`) — the base
+ * that run-scoped (`runs/<id>/`) and scope-scoped (`scopes/<workflow>/<scope>/`,
+ * #1846) storage both hang off, whichever branch resolved it.
+ *
+ * Exported for unit testing of the kind-based branch selection.
  */
-async function resolveProjectPaths(
+export async function resolveProjectPaths(
   deps: WorkflowDeps,
   cwd: string,
   workflowRunId: string,
   codebaseId?: string
-): Promise<{ artifactsDir: string; logDir: string }> {
+): Promise<{ artifactsDir: string; logDir: string; artifactsRoot: string }> {
   if (codebaseId) {
     try {
       const codebase = await deps.store.getCodebase(codebaseId);
       if (codebase) {
+        // Folder projects run in place — route their named storage to
+        // _folder/<slug>/ instead of owner/repo/ (the name isn't owner/repo).
+        if (codebase.kind === 'folder') {
+          const slug = archonPaths.slugifyFolderName(codebase.name);
+          return {
+            artifactsDir: archonPaths.getFolderRunArtifactsPath(slug, workflowRunId),
+            logDir: archonPaths.getFolderProjectLogsPath(slug),
+            artifactsRoot: archonPaths.getFolderProjectArtifactsPath(slug),
+          };
+        }
         const parsed = archonPaths.parseOwnerRepo(codebase.name);
         if (parsed) {
           return {
             artifactsDir: archonPaths.getRunArtifactsPath(parsed.owner, parsed.repo, workflowRunId),
             logDir: archonPaths.getProjectLogsPath(parsed.owner, parsed.repo),
+            artifactsRoot: archonPaths.getProjectArtifactsPath(parsed.owner, parsed.repo),
           };
         }
         getLog().warn({ codebaseName: codebase.name }, 'codebase_name_not_owner_repo_format');
@@ -256,7 +276,29 @@ async function resolveProjectPaths(
   return {
     artifactsDir: join(cwd, '.archon', 'artifacts', 'runs', workflowRunId),
     logDir: join(cwd, '.archon', 'logs'),
+    artifactsRoot: join(cwd, '.archon', 'artifacts'),
   };
+}
+
+/**
+ * Resolve the stable cross-invocation artifact scope dir for a run (#1846), or
+ * undefined when the feature doesn't apply. Applies only when the workflow uses
+ * cross-run session persistence (workflow-level `persist_sessions` or any node
+ * `persist_session: true`) AND the run has a conversation scope — the same
+ * opt-in + scope key the session store uses. No persistence → no new dirs,
+ * default behavior unchanged.
+ */
+export function resolveScopeArtifactsDir(
+  workflow: { name: string; nodes: readonly DagNode[]; persist_sessions?: boolean },
+  conversationId: string | null | undefined,
+  artifactsRoot: string
+): string | undefined {
+  if (!conversationId) return undefined;
+  const usesPersistence =
+    workflow.persist_sessions === true ||
+    workflow.nodes.some(n => 'persist_session' in n && n.persist_session === true);
+  if (!usesPersistence) return undefined;
+  return archonPaths.getScopeArtifactsPath(artifactsRoot, workflow.name, conversationId);
 }
 
 /**
@@ -281,6 +323,12 @@ type ResumePayload =
 export type ExecuteWorkflowOptions = ResumePayload & {
   /** Codebase ID for env vars + isolation context. */
   codebaseId?: string;
+  /**
+   * Caller-provided base branch fallback for `$BASE_BRANCH`, normally the
+   * codebase's stored `default_branch`. Repo config still wins when
+   * `worktree.baseBranch` is set; git auto-detection remains the last resort.
+   */
+  baseBranch?: string;
   /**
    * GitHub issue/PR context. When provided:
    * - Stored in `WorkflowRun.metadata` as `{ github_context }`
@@ -378,6 +426,7 @@ export async function executeWorkflow(
     priorCompletedNodes,
     userId,
     source,
+    baseBranch: callerBaseBranch,
   } = opts;
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -403,11 +452,15 @@ export async function executeWorkflow(
   };
   const configuredCommandFolder = config.commands.folder;
 
-  // Auto-detect base branch when not configured. Config takes priority.
+  // Resolve base branch: config takes priority, then the caller-provided
+  // codebase default, then git auto-detection.
   // If detection fails, leave empty — substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
+  const fallbackBaseBranch = callerBaseBranch?.trim();
   let baseBranch: string;
   if (config.baseBranch) {
     baseBranch = config.baseBranch;
+  } else if (fallbackBaseBranch) {
+    baseBranch = fallbackBaseBranch;
   } else {
     try {
       baseBranch = await getDefaultBranch(toRepoPath(cwd));
@@ -670,11 +723,27 @@ export async function executeWorkflow(
   }
 
   // Resolve external artifact and log directories
-  const { artifactsDir, logDir } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId);
+  const { artifactsDir, logDir, artifactsRoot } = await resolveProjectPaths(
+    deps,
+    cwd,
+    workflowRun.id,
+    codebaseId
+  );
+
+  // Stable cross-invocation artifact scope (#1846): only for persist_session
+  // workflows with a conversation scope. Undefined otherwise — zero new dirs.
+  const scopeArtifactsDir = resolveScopeArtifactsDir(
+    workflow,
+    workflowRun.conversation_id,
+    artifactsRoot
+  );
 
   // Pre-create the artifacts directory so commands can write to it immediately
+  // (and the durable scope dir, when the workflow opted into one — same disk,
+  // same failure mode, same fatal treatment).
   try {
     await mkdir(artifactsDir, { recursive: true });
+    if (scopeArtifactsDir) await mkdir(scopeArtifactsDir, { recursive: true });
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     getLog().error(
@@ -711,7 +780,14 @@ export async function executeWorkflow(
   const userProviderEnv = await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
   config.envVars = { ...config.envVars, ...userProviderEnv };
 
-  // Wrap execution in try-catch to ensure workflow is marked as failed on any error
+  // Wrap execution in try-catch to ensure workflow is marked as failed on any error.
+  //
+  // Hold a Windows keep-awake request for the executing window (see
+  // utils/keep-awake.ts for the Modern Standby / mid-run-death rationale and
+  // best-effort semantics). Placed HERE, not at function top, so the
+  // early-return validation paths above never leak an unpaired acquire; the
+  // matching release is the first statement of this try's finally.
+  keepAwake.acquire();
   try {
     getLog().info(
       {
@@ -747,6 +823,7 @@ export async function executeWorkflow(
       model: resolvedModel,
       nodeCount: workflow.nodes.length,
       usesLoop: workflow.nodes.some(isLoopNode),
+      usesLoopGroup: workflow.nodes.some(isLoopGroupNode),
       usesApproval: workflow.nodes.some(isApprovalNode),
       usesScript: workflow.nodes.some(isScriptNode),
       usesBash: workflow.nodes.some(isBashNode),
@@ -883,7 +960,8 @@ export async function executeWorkflow(
       dagPriorCompletedNodes,
       source,
       aiProfile,
-      workflowPreset
+      workflowPreset,
+      scopeArtifactsDir
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result
@@ -977,6 +1055,10 @@ export async function executeWorkflow(
     // Return failure result instead of re-throwing
     return { success: false, workflowRunId: workflowRun.id, error: err.message };
   } finally {
+    // Release the keep-awake request FIRST — before the backstop DB calls that
+    // may throw — so it always pairs with the acquire above this try, on every
+    // exit path (success, thrown error, or backstop failure).
+    keepAwake.release();
     // Defensive backstop: if the workflow run is still 'running' after all
     // normal and exceptional code paths, flip it to 'failed' to prevent zombie
     // accumulation. Guards against any future code path that exits without

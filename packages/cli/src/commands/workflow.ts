@@ -3,20 +3,40 @@
  */
 import {
   registerRepository,
+  registerFolder,
   loadConfig,
   loadRepoConfig,
   generateAndSetTitle,
   createWorkflowStore,
+  getUserAiPrefs,
+  isPerUserGitHubEnabled,
+  getDecryptedAccessToken,
 } from '@archon/core';
 import { WORKFLOW_EVENT_TYPES, type WorkflowEventType } from '@archon/workflows/store';
+import {
+  isTierName,
+  buildAiProfile,
+  TIER_NAMES,
+  type TierName,
+  type RawTiersConfig,
+} from '@archon/workflows/model-validation';
 import { configureIsolation, getIsolationProvider } from '@archon/isolation';
-import { createLogger, getArchonHome, BUNDLED_IS_BINARY } from '@archon/paths';
+import {
+  createLogger,
+  getArchonHome,
+  BUNDLED_IS_BINARY,
+  BUNDLED_VERSION,
+  readTierNoticeState,
+  markTierNoticeShown,
+} from '@archon/paths';
 import { join } from 'node:path';
 import { mkdirSync, openSync, closeSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import { assertWorkflowRequirementsMet } from '@archon/workflows/utils/workflow-requirements';
 import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
@@ -27,7 +47,7 @@ import type {
   WorkflowSource,
   WorkflowWithSource,
 } from '@archon/workflows/schemas/workflow';
-import { workflowRunStatusSchema } from '@archon/workflows/schemas/workflow-run';
+import { workflowRunStatusSchema, isApprovalContext } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import {
   approveWorkflow,
@@ -71,6 +91,12 @@ export interface WorkflowRunOptions {
   branchName?: string;
   fromBranch?: string;
   noWorktree?: boolean;
+  /**
+   * Register the current non-git cwd as a folder project on first use and run
+   * in place (no worktree isolation). No-op when the cwd is already a registered
+   * project or a git repository.
+   */
+  folder?: boolean;
   resume?: boolean;
   codebaseId?: string; // Skips path-based codebase lookup when resume/approve/reject already resolved it
   /**
@@ -177,12 +203,34 @@ function spawnDetachedWorkflowRun(
   }
 
   try {
-    const child = Bun.spawn({
-      cmd,
+    // Node's spawn with `detached: true` puts the child in its own process
+    // group so it survives the parent's exit. Bun.spawn + unref() does NOT
+    // detach on Windows — the child was killed ~1s in (at worktree_creating)
+    // when the launching shell/console tore down. `detached: true` is the
+    // standard fix, also used by setup.ts's trySpawn(); if a kill-on-close Job
+    // Object wrapper ever defeats it, a `start /b` breakaway fallback is the
+    // next step. `windowsHide` keeps the child headless.
+    const child = spawn(cmd[0], cmd.slice(1), {
       cwd,
       env: process.env,
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
+      detached: true,
+      windowsHide: true,
     });
+    // Unlike Bun.spawn, Node's spawn does NOT throw synchronously on a bad
+    // executable or cwd — the failure arrives as an async 'error' event, which
+    // would crash the CLI as an uncaught exception without this listener.
+    child.on('error', (error: Error) => {
+      getLog().error(
+        { err: error, execPath: cmd[0], conversationId },
+        'cli.detached_run_spawn_failed'
+      );
+    });
+    // pid is set synchronously iff the OS-level spawn succeeded (same check as
+    // setup.ts's trySpawn) — fail fast instead of acking a run that never started.
+    if (child.pid === undefined) {
+      throw new Error(`Failed to start detached workflow child (executable: ${cmd[0]})`);
+    }
     child.unref();
   } finally {
     // The child inherits its own dup of the log fd; close the parent's copy so a
@@ -249,6 +297,98 @@ function buildRegistrationFailureError(action: string, error: Error): Error {
   );
 }
 
+/** Error for --branch/--from used against a folder project (no worktree). */
+function folderWorktreeOptionError(): Error {
+  return new Error(
+    'Worktree options require a git-repo project.\n' +
+      '  --branch/--from create an isolated git worktree, which folder projects do not use.\n' +
+      '  Drop --branch/--from — folder projects always run in place.'
+  );
+}
+
+/** Error for a worktree-pinned workflow run against a folder project. */
+function folderWorktreePolicyError(workflowName: string): Error {
+  return new Error(
+    `Workflow '${workflowName}' requires a worktree (worktree.enabled: true), ` +
+      'which is not available for folder projects (no git repo to isolate).\n' +
+      '  Run this workflow against a git-repo project, or change its worktree policy.'
+  );
+}
+
+/**
+ * Error for a failed `--folder` project registration. Distinct from
+ * {@link buildRegistrationFailureError} (which mentions worktrees / `--no-worktree`)
+ * because no worktree is ever created for a folder project — that hint would be
+ * misleading here.
+ */
+function buildFolderRegistrationFailureError(error: Error): Error {
+  return new Error(
+    'Cannot register folder project.\n' +
+      `Error: ${error.message}\n` +
+      'Hint: Check that the directory is readable and your Archon home ' +
+      '(~/.archon) is writable, then retry.'
+  );
+}
+
+/**
+ * Fail fast if `--branch`/`--from` (git-worktree-only options) are used against a
+ * folder project. Called at three sites — flag-declared (pre-detach), the detach
+ * fast-path, and post-lookup (authoritative) — so the check lives in one place.
+ */
+function assertNoWorktreeOptionsForFolder(
+  isFolderProject: boolean,
+  options: WorkflowRunOptions
+): void {
+  if (isFolderProject && (options.branchName !== undefined || options.fromBranch !== undefined)) {
+    throw folderWorktreeOptionError();
+  }
+}
+
+/** Fail fast if a `worktree.enabled: true` workflow is run against a folder project. */
+function assertWorkflowNotWorktreePinnedForFolder(
+  isFolderProject: boolean,
+  pinnedEnabled: boolean | undefined,
+  workflowName: string
+): void {
+  if (isFolderProject && pinnedEnabled === true) {
+    throw folderWorktreePolicyError(workflowName);
+  }
+}
+
+/**
+ * Capability gate for the CLI run path.
+ *
+ * Mirrors the orchestrator's `requires: [github]` enforcement
+ * (orchestrator-agent.ts `dispatchOrchestratorWorkflow`) so a workflow that
+ * declares `requires: [github]` is hard-blocked BEFORE any worktree/clone/AI
+ * cost — and before the `--detach` fork — when the acting CLI user hasn't
+ * connected their GitHub identity. Throws WorkflowRequirementError, surfaced by
+ * the CLI top-level handler (cli.ts) as a clean, actionable `Error: ...` line.
+ *
+ * No-op on solo PAT installs: `isPerUserGitHubEnabled()` is false unless the
+ * GitHub App + TOKEN_ENCRYPTION_KEY are both configured — identical semantics
+ * to the orchestrator gate.
+ */
+async function assertCliWorkflowRequirementsMet(workflow: WorkflowDefinition): Promise<void> {
+  if (!isPerUserGitHubEnabled() || !workflow.requires?.length) return;
+
+  // Resolve the acting CLI user (ARCHON_USER_ID, else $USER/$USERNAME) → Archon
+  // user id, then check for a stored GitHub connection. An unresolvable user or
+  // a lookup failure means "not connected" — fail closed, never silently allow.
+  const cliId = resolveCliUserId();
+  let githubConnected = false;
+  if (cliId) {
+    try {
+      const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+      githubConnected = Boolean(await getDecryptedAccessToken(cliUser.id));
+    } catch (error) {
+      getLog().warn({ err: error as Error, cliId }, 'cli.requirement_gate_user_resolve_failed');
+    }
+  }
+
+  assertWorkflowRequirementsMet(workflow, { githubConnected });
+}
+
 /**
  * Resolve the provider used for CLI conversation titles from the workflow itself.
  * This keeps auxiliary title generation aligned with workflow execution instead
@@ -268,12 +408,119 @@ function resolveTitleAssistantType(
   return fallbackAssistant;
 }
 
+/**
+ * Print a one-time per-version tier notice to stderr when the workflow uses
+ * unconfigured tier-keyword nodes (small/medium/large resolving via built-in
+ * defaults). Suppressed under --quiet. Uses the same 7-char tier column as
+ * `archon ai tier list`.
+ */
+export async function maybePrintTierNotice(
+  workflow: WorkflowDefinition,
+  cwd: string,
+  cliUserId: string | undefined,
+  quiet: boolean | undefined
+): Promise<void> {
+  if (quiet) return;
+
+  // Collect tier keywords used by the workflow — check the workflow-level default
+  // first (model: large at the top level applies to all nodes without overrides),
+  // then per-node overrides.
+  const usedTiers = new Set<TierName>();
+  if (typeof workflow.model === 'string' && isTierName(workflow.model)) {
+    usedTiers.add(workflow.model);
+  }
+  for (const node of workflow.nodes) {
+    if ('model' in node && typeof node.model === 'string' && isTierName(node.model)) {
+      usedTiers.add(node.model);
+    }
+  }
+  if (usedTiers.size === 0) return;
+
+  // Load install config to see which tiers are explicitly configured.
+  let config: Awaited<ReturnType<typeof loadConfig>>;
+  try {
+    config = await loadConfig(cwd);
+  } catch (err) {
+    getLog().debug({ err }, 'tier_notice.config_load_failed');
+    return;
+  }
+  const configuredTiers: RawTiersConfig = config.tiers ?? {};
+
+  // Layer in the CLI user's personal tier prefs (best-effort, non-fatal).
+  let userTiers: RawTiersConfig = {};
+  let userDefaultProvider: string | undefined;
+  if (cliUserId) {
+    try {
+      const prefs = await getUserAiPrefs(cliUserId);
+      userTiers = prefs.tiers ?? {};
+      userDefaultProvider = prefs.defaultProvider;
+    } catch {
+      // Non-fatal — proceed without user tier info.
+    }
+  }
+
+  // Only notify when at least one used tier is unconfigured (built-in default).
+  const hasUnconfigured = [...usedTiers].some(t => !configuredTiers[t] && !userTiers[t]);
+  if (!hasUnconfigured) return;
+
+  // One-time per Archon version (a version bump may ship new tier defaults).
+  const version = BUNDLED_VERSION;
+  if (readTierNoticeState()?.shownForVersion === version) return;
+
+  // Build the resolved profile for the effective default assistant.
+  const effectiveAssistant = userDefaultProvider ?? config.assistant;
+  let aliases: ReturnType<typeof buildAiProfile>['aliases'];
+  try {
+    aliases = buildAiProfile(effectiveAssistant, {
+      globalTiers: configuredTiers,
+      userTiers,
+    }).aliases;
+  } catch (err) {
+    // Non-fatal: a corrupt tier/alias config can make buildAiProfile throw —
+    // skip the notice rather than blocking the run.
+    getLog().debug({ err }, 'tier_notice.build_profile_failed');
+    return;
+  }
+
+  const lines: string[] = [
+    "ℹ️  This workflow uses model tiers (small/medium/large). You haven't configured them —",
+    `   using built-in defaults for '${effectiveAssistant}':`,
+  ];
+  for (const t of TIER_NAMES) {
+    const preset = aliases[t];
+    if (preset) lines.push(`     ${t.padEnd(7)} → ${preset.provider}/${preset.model}`);
+  }
+  // Plan-dependent 1M note for the large→opus row (the CLI can't detect the plan).
+  const largePreset = aliases.large;
+  if (largePreset?.provider === 'claude' && largePreset.model === 'opus') {
+    lines.push(
+      '   (Opus runs a 1M context window on API keys and Max/Team/Enterprise;',
+      "    on Pro it's 200K unless you set the `large` tier to `opus[1m]`.)"
+    );
+  }
+  lines.push(
+    '   Customize: `archon ai tier set <tier> <provider> <model>`',
+    '              or `tiers:` in .archon/config.yaml',
+    '   See anytime: `archon ai tier list`           (shown once per version)',
+    ''
+  );
+  process.stderr.write(lines.join('\n') + '\n');
+
+  markTierNoticeShown(version);
+}
+
 /** Render a workflow event to stderr as a progress line. Called only when --quiet is not set. */
 function renderWorkflowEvent(event: WorkflowEmitterEvent, verbose: boolean): void {
   switch (event.type) {
-    case 'node_started':
-      process.stderr.write(`[${event.nodeName}] Started\n`);
+    case 'node_started': {
+      let suffix = '';
+      if (event.provider !== undefined && event.model !== undefined) {
+        const tierPart = event.tier !== undefined ? ` ← ${event.tier}` : '';
+        suffix = `  (${event.provider}/${event.model}${tierPart})`;
+      }
+      process.stderr.write(`[${event.nodeName}] Started${suffix}\n`);
       break;
+    }
     case 'node_completed':
       process.stderr.write(`[${event.nodeName}] Completed (${formatDuration(event.duration)})\n`);
       break;
@@ -520,18 +767,56 @@ export async function workflowRunCommand(
   const wantsIsolation =
     !options.resume && pinnedEnabled !== undefined ? pinnedEnabled : flagWantsIsolation;
 
+  // Worktree options require a git repo. When the caller explicitly declares
+  // folder intent via --folder, reject --branch/--from and worktree-pinned
+  // workflows synchronously (no DB needed). The authoritative kind-based guard
+  // for ALREADY-registered folder projects (no --folder flag) lives after the
+  // codebase lookup below. Fail fast — never silently ignore the flags.
+  assertNoWorktreeOptionsForFolder(options.folder === true, options);
+  assertWorkflowNotWorktreePinnedForFolder(options.folder === true, pinnedEnabled, workflow.name);
+
+  // Capability gate: hard-fail before the --detach fork and any worktree/clone/
+  // AI cost if the workflow declares `requires: [github]` and the acting CLI
+  // user hasn't connected. No-op on solo PAT installs. Mirrors the orchestrator
+  // gate (dispatchOrchestratorWorkflow) so CLI, REST (via orchestrator), and
+  // chat dispatch enforce `requires: [github]` identically.
+  await assertCliWorkflowRequirementsMet(workflow);
+
   // --detach: hand the whole run to a detached background child and return now.
-  // Done BEFORE any DB/worktree work (the child does all of it) but AFTER workflow
-  // resolution + flag validation above, so unknown-workflow / bad-flag errors are
-  // still surfaced synchronously to the caller rather than lost in the child.
+  // Done AFTER workflow resolution + flag validation above (so unknown-workflow /
+  // bad-flag errors surface synchronously to the caller, not lost in the child)
+  // and before any *worktree* work (the child creates the worktree). A read-only
+  // codebase lookup does happen here — see the folder-detection probe below —
+  // to decide folder-vs-repo branch pinning before forking.
   if (options.detach) {
     const childConversationId = options.conversationId ?? generateConversationId();
     const extraArgs: string[] = [];
     let pinnedBranch: string | undefined;
+    // Determine folder-ness so we never pin a worktree branch on the child for a
+    // folder project. The --folder flag signals it directly; an already-registered
+    // folder project (no flag) is detected via a read-only DB lookup. This lookup
+    // only runs on the detach fast-path (which returns immediately), so the
+    // non-detach path keeps a single authoritative codebase lookup below.
+    // Non-fatal: a DB hiccup falls back to the normal repo path.
+    let detachIsFolder = options.folder === true;
+    if (!detachIsFolder) {
+      try {
+        const existing =
+          (await codebaseDb.findCodebaseByDefaultCwd(cwd)) ??
+          (await codebaseDb.findCodebaseByPathPrefix(cwd));
+        if (existing?.kind === 'folder') detachIsFolder = true;
+      } catch (err) {
+        getLog().debug({ err: err as Error, cwd }, 'cli.folder_detect_probe_failed');
+      }
+    }
+    // Surface worktree-option conflicts synchronously in the parent rather than
+    // letting the child fail after fork.
+    assertNoWorktreeOptionsForFolder(detachIsFolder, options);
     // Pin a generated branch only when isolating AND the caller didn't pass
     // --branch (an explicit --branch is already in argv). Without this, the child
     // would generate its own timestamped branch and fork a second worktree.
-    if (wantsIsolation && options.branchName === undefined) {
+    // Never pin a branch for folder projects — they run in place with no worktree.
+    if (wantsIsolation && !detachIsFolder && options.branchName === undefined) {
       pinnedBranch = `${workflowName}-${String(Date.now())}`;
       extraArgs.push('--branch', pinnedBranch);
     }
@@ -561,7 +846,13 @@ export async function workflowRunCommand(
     } else {
       console.log(`Started '${workflow.name}' in the background.`);
       console.log('Track it with: archon workflow runs');
-      if (logPath) console.log(`Child output: ${logPath}`);
+      if (logPath) {
+        console.log(`Child output: ${logPath}`);
+      } else {
+        // Log file couldn't be opened — the child runs with its output discarded,
+        // so if it dies before creating a run record there will be no trail.
+        console.warn('Warning: could not open a log file — child output will not be captured.');
+      }
     }
     return;
   }
@@ -642,7 +933,35 @@ export async function workflowRunCommand(
           'cli.codebase_auto_registration_failed'
         );
       }
+    } else if (options.folder) {
+      // Non-git cwd + explicit --folder: register a folder project (runs in
+      // place). Without --folder the cli.ts gate already errored for
+      // unregistered non-git cwds, so this branch is only reached via the flag.
+      try {
+        const result = await registerFolder(cwd);
+        codebase = await codebaseDb.getCodebase(result.codebaseId);
+        if (!result.alreadyExisted) {
+          console.log(`Registered folder project "${result.name}" (${result.defaultCwd})`);
+          getLog().info({ name: result.name }, 'cli.folder_project_auto_registered');
+        }
+      } catch (error) {
+        const err = error as Error;
+        codebaseRegistrationError = err;
+        getLog().warn(
+          { err, errorType: err.constructor.name, cwd },
+          'cli.folder_project_auto_registration_failed'
+        );
+      }
     }
+  }
+
+  // A --folder registration failure must be fatal regardless of the workflow's
+  // worktree policy. Otherwise, for a `worktree.enabled: false` workflow (e.g.
+  // the bundled `archon-assist`, the flagship `--folder` example), wantsIsolation
+  // is false, so the later isolation fail-fast branch never fires and the run
+  // would silently proceed against the bare cwd with no registered project.
+  if (options.folder && !codebase && codebaseRegistrationError) {
+    throw buildFolderRegistrationFailureError(codebaseRegistrationError);
   }
 
   // Handle isolation (worktree creation)
@@ -714,7 +1033,27 @@ export async function workflowRunCommand(
     console.log('');
   }
 
-  if (wantsIsolation && codebase) {
+  const isFolderCodebase = codebase?.kind === 'folder';
+
+  // The codebase's stored default branch, used as the base-branch fallback when
+  // repo config sets no worktree.baseBranch (reuse validation, worktree
+  // creation, and $BASE_BRANCH resolution all derive from this one value).
+  const codebaseDefaultBranch = codebase?.default_branch?.trim() || undefined;
+
+  // Authoritative folder guards for an already-registered folder project run
+  // WITHOUT the --folder flag (the flag-based guards above only fire when the
+  // caller declared intent). Fail fast before any worktree work.
+  assertNoWorktreeOptionsForFolder(isFolderCodebase, options);
+  assertWorkflowNotWorktreePinnedForFolder(isFolderCodebase, pinnedEnabled, workflow.name);
+
+  if (isFolderCodebase) {
+    // Folder projects run in place at their root — no worktree isolation. The
+    // agent's cwd is the folder root, so it sees every child folder/repo, and
+    // per-service git (branch/commit/PR) is the agent's job via bash/gh. Stated
+    // explicitly at run start (fail-fast-honest, not a silent skip).
+    console.log('Folder project — running in place (no worktree isolation).');
+    getLog().info({ cwd: workingCwd }, 'workflow.running_without_isolation');
+  } else if (wantsIsolation && codebase) {
     // Auto-generate branch identifier from workflow name + timestamp when --branch not provided
     const branchIdentifier = options.branchName ?? `${workflowName}-${Date.now()}`;
 
@@ -745,10 +1084,16 @@ export async function workflowRunCommand(
       // Validate base branch before reuse (warning-only — non-blocking)
       try {
         const repoConfig = await loadRepoConfig(codebase.default_cwd);
-        const rawBase = repoConfig?.worktree?.baseBranch;
-        const configuredBase = rawBase
-          ? git.toBranchName(rawBase)
-          : await git.getDefaultBranch(git.toRepoPath(codebase.default_cwd));
+        const rawBase = repoConfig?.worktree?.baseBranch?.trim();
+        // Three-level fallback: repo config → codebase default → git auto-detect.
+        let configuredBase: git.BranchName;
+        if (rawBase) {
+          configuredBase = git.toBranchName(rawBase);
+        } else if (codebaseDefaultBranch) {
+          configuredBase = git.toBranchName(codebaseDefaultBranch);
+        } else {
+          configuredBase = await git.getDefaultBranch(git.toRepoPath(codebase.default_cwd));
+        }
         const isValidBase = await git.isAncestorOf(
           git.toWorktreePath(existingEnv.working_path),
           `origin/${configuredBase}`
@@ -783,7 +1128,11 @@ export async function workflowRunCommand(
         fromBranch: options.fromBranch?.trim()
           ? git.toBranchName(options.fromBranch.trim())
           : undefined,
+        baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
         codebaseId: codebase.id,
+        // owner/repo name lets resolveOwnerRepo skip the path heuristic, which
+        // throws for single-segment checkout paths like /workspace (#2022)
+        codebaseName: codebase.name,
         canonicalRepoPath: git.toRepoPath(codebase.default_cwd),
         description: `CLI workflow: ${workflowName}`,
       });
@@ -929,6 +1278,9 @@ export async function workflowRunCommand(
     cleanup('SIGINT');
   });
 
+  // One-time-per-version notice when the workflow uses unconfigured tier keywords.
+  await maybePrintTierNotice(workflow, workingCwd, cliUserId, options.quiet);
+
   // Subscribe to workflow events for progress rendering on stderr.
   // subscribeForConversation is pure in-memory registration — cannot throw in practice.
   // If that changes, this should be moved inside the try block to prevent blocking executeWorkflow.
@@ -987,8 +1339,19 @@ export async function workflowRunCommand(
   let result: Awaited<ReturnType<typeof executeWorkflow>>;
   try {
     const opts = prepared
-      ? { codebaseId: codebase?.id, source: workflowSource, userId: cliUserId, ...prepared }
-      : { codebaseId: codebase?.id, source: workflowSource, userId: cliUserId };
+      ? {
+          codebaseId: codebase?.id,
+          source: workflowSource,
+          userId: cliUserId,
+          baseBranch: codebaseDefaultBranch,
+          ...prepared,
+        }
+      : {
+          codebaseId: codebase?.id,
+          source: workflowSource,
+          userId: cliUserId,
+          baseBranch: codebaseDefaultBranch,
+        };
     result = await executeWorkflow(
       deps,
       adapter,
@@ -1236,15 +1599,19 @@ export async function workflowStatusCommand(json?: boolean, verbose?: boolean): 
  * status — so an agent can answer "did the review pass?" for a completed/failed
  * run. `--verbose` adds the per-node event summary; `--json` emits the raw run
  * (plus an `events` array when verbose).
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
  */
 export async function workflowGetCommand(
   runId: string,
   json?: boolean,
-  verbose?: boolean
+  verbose?: boolean,
+  cwd?: string
 ): Promise<number> {
   let run: WorkflowRun | null;
   try {
-    run = await workflowDb.getWorkflowRun(runId);
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    run = await workflowDb.getWorkflowRun(resolvedId);
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, runId }, 'cli.workflow_get_failed');
@@ -1289,6 +1656,20 @@ export async function workflowGetCommand(
   console.log(`  Path:   ${run.working_path ?? '(none)'}`);
   console.log(`  Status: ${run.status}`);
   console.log(`  Age:    ${formatAge(run.started_at)}`);
+  // Paused interactive-loop gate: one honest line so a human (or an agent parsing
+  // the plain output) sees whether the paused iteration emitted its completion
+  // signal (#2074). --json already carries the full metadata.approval.
+  const gateMeta = run.metadata.approval;
+  if (
+    run.status === 'paused' &&
+    isApprovalContext(gateMeta) &&
+    gateMeta.type === 'interactive_loop'
+  ) {
+    const signal = gateMeta.completionSignaled === true ? 'yes' : 'no';
+    console.log(
+      `  Gate:   awaiting approval — signal detected: ${signal} (iteration ${String(gateMeta.iteration ?? '?')})`
+    );
+  }
   const runError = typeof run.metadata.error === 'string' ? run.metadata.error : undefined;
   if (runError) {
     console.log(`  Error:  ${runError}`);
@@ -1406,6 +1787,40 @@ function printJsonWriteError(runId: string, action: string, error: unknown): voi
   );
 }
 
+/**
+ * Matches a full run id: a dashed UUID (Postgres `gen_random_uuid()`) or 32
+ * undashed hex chars (SQLite `hex(randomblob(16))`). Anything shorter is
+ * treated as a prefix.
+ */
+const FULL_RUN_ID_RE =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$/i;
+
+/**
+ * Resolve a run-id argument that may be the 8-char short id printed by
+ * `workflow runs` into the full run id. Mirrors the chat `manage_run` tool's
+ * prefix resolution (getScopedRun): the lookup is scoped to the cwd's
+ * codebase, a unique match resolves, and an ambiguous prefix errors.
+ *
+ * Full UUIDs skip resolution entirely — exact lookup is global, so full ids
+ * keep working from any directory. When `cwd` is omitted, the cwd is not a
+ * registered project, or the prefix matches nothing in this project, the
+ * argument passes through unchanged so the downstream exact lookup keeps its
+ * existing error surface (intentional fallback: it preserves behavior for
+ * runs of other projects and non-UUID ids rather than guessing).
+ */
+async function resolveRunIdArg(runId: string, cwd?: string): Promise<string> {
+  if (cwd === undefined || FULL_RUN_ID_RE.test(runId)) return runId;
+  const codebase = await codebaseDb.findCodebaseByDefaultCwd(cwd);
+  if (!codebase) return runId;
+  const matches = await workflowDb.findWorkflowRunsByIdPrefix(runId, codebase.id);
+  if (matches.length > 1) {
+    throw new Error(
+      `Run id '${runId}' matches more than one run in this project — use more characters or the full id (from 'archon workflow runs --json').`
+    );
+  }
+  return matches[0]?.id ?? runId;
+}
+
 async function resolveDiscoveryCwdForCodebase(
   runId: string,
   codebaseId: string,
@@ -1444,8 +1859,14 @@ async function resolveDiscoveryCwdForCodebase(
  * Re-executes the workflow with --resume semantics: `workflowRunCommand` locates
  * the prior failed run via findResumableRun and hands it to the executor, which
  * skips already-completed nodes (the executor no longer auto-detects on its own).
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
  */
-export async function workflowResumeCommand(runId: string, json?: boolean): Promise<void> {
+export async function workflowResumeCommand(
+  runId: string,
+  json?: boolean,
+  cwd?: string
+): Promise<void> {
   // JSON mode is a non-blocking control-plane ack: validate the run is resumable
   // and report its state, but do NOT re-execute the workflow inline (execution
   // streams workflow output to stdout, which would corrupt the JSON contract).
@@ -1453,12 +1874,13 @@ export async function workflowResumeCommand(runId: string, json?: boolean): Prom
   // run as a background task) or `run <name> --resume --detach`.
   if (json) {
     try {
-      const run = await resumeWorkflowOp(runId);
+      const resolvedId = await resolveRunIdArg(runId, cwd);
+      const run = await resumeWorkflowOp(resolvedId);
       console.log(
         JSON.stringify(
           {
             ok: true,
-            runId,
+            runId: resolvedId,
             action: 'resume',
             executed: false,
             status: run.status,
@@ -1475,10 +1897,11 @@ export async function workflowResumeCommand(runId: string, json?: boolean): Prom
     return;
   }
 
-  const run = await resumeWorkflowOp(runId);
+  const resolvedId = await resolveRunIdArg(runId, cwd);
+  const run = await resumeWorkflowOp(resolvedId);
   if (!run.working_path) {
     throw new Error(
-      `Workflow run '${runId}' has no working path recorded.\n` +
+      `Workflow run '${resolvedId}' has no working path recorded.\n` +
         'Cannot determine where to resume. The run may be too old.'
     );
   }
@@ -1490,7 +1913,7 @@ export async function workflowResumeCommand(runId: string, json?: boolean): Prom
   // found even when working_path is a worktree or workspace clone that does
   // not contain the user's local (often untracked) workflow YAML.
   const discoveryCwd = run.codebase_id
-    ? await resolveDiscoveryCwdForCodebase(runId, run.codebase_id, 'resume')
+    ? await resolveDiscoveryCwdForCodebase(resolvedId, run.codebase_id, 'resume')
     : undefined;
 
   // Re-execute via workflowRunCommand with --resume: it locates the prior failed
@@ -1505,7 +1928,7 @@ export async function workflowResumeCommand(runId: string, json?: boolean): Prom
   } catch (error) {
     const err = error as Error;
     getLog().error(
-      { err, runId, workflowName: run.workflow_name },
+      { err, runId: resolvedId, workflowName: run.workflow_name },
       'cli.workflow_resume_run_failed'
     );
     throw new Error(`Failed to resume workflow '${run.workflow_name}': ${err.message}`);
@@ -1518,16 +1941,23 @@ export async function workflowResumeCommand(runId: string, json?: boolean): Prom
  * `--json` emits a structured result instead of human text. In JSON mode the
  * command never throws — lookup/state errors are reported as `{ ok: false }` so
  * a parsing agent always gets one clean JSON line.
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
  */
-export async function workflowAbandonCommand(runId: string, json?: boolean): Promise<void> {
+export async function workflowAbandonCommand(
+  runId: string,
+  json?: boolean,
+  cwd?: string
+): Promise<void> {
   if (json) {
     try {
-      const run = await abandonWorkflow(runId);
+      const resolvedId = await resolveRunIdArg(runId, cwd);
+      const run = await abandonWorkflow(resolvedId);
       console.log(
         JSON.stringify(
           {
             ok: true,
-            runId,
+            runId: resolvedId,
             action: 'abandon',
             status: 'cancelled',
             workflowName: run.workflow_name,
@@ -1542,23 +1972,29 @@ export async function workflowAbandonCommand(runId: string, json?: boolean): Pro
     return;
   }
 
-  const run = await abandonWorkflow(runId);
-  console.log(`Abandoned workflow run: ${runId}`);
+  const resolvedId = await resolveRunIdArg(runId, cwd);
+  const run = await abandonWorkflow(resolvedId);
+  console.log(`Abandoned workflow run: ${resolvedId}`);
   console.log(`Workflow: ${run.workflow_name}`);
 }
 
 /**
  * Approve a paused workflow run by ID.
  *
- * Human mode writes the approval events (transitioning to 'failed') and then
- * auto-resumes the run inline. `--json` mode records the approval and returns a
- * structured ack WITHOUT resuming — the run is left resumable for a backgrounded
- * `resume`/`run --resume` (inline resume would stream output and break the JSON).
+ * Human mode records the approval on the still-'paused' run (the resolution
+ * lives in metadata.approval.resolved, #2075) and then auto-resumes the run
+ * inline. `--json` mode records the approval and returns a structured ack
+ * WITHOUT resuming — the run stays paused-and-staged, resumable by a
+ * backgrounded `resume`/`run --resume` (inline resume would stream output and
+ * break the JSON).
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
  */
 export async function workflowApproveCommand(
   runId: string,
   comment?: string,
-  json?: boolean
+  json?: boolean,
+  cwd?: string
 ): Promise<void> {
   // JSON mode records the approval and returns a structured ack WITHOUT the
   // inline auto-resume (resuming executes the workflow and streams output to
@@ -1566,12 +2002,13 @@ export async function workflowApproveCommand(
   // — drive it to completion with a backgrounded `resume`/`run --resume`.
   if (json) {
     try {
-      const result = await approveWorkflow(runId, comment);
+      const resolvedId = await resolveRunIdArg(runId, cwd);
+      const result = await approveWorkflow(resolvedId, comment);
       console.log(
         JSON.stringify(
           {
             ok: true,
-            runId,
+            runId: resolvedId,
             action: 'approve',
             type: result.type,
             workflowName: result.workflowName,
@@ -1587,12 +2024,13 @@ export async function workflowApproveCommand(
     return;
   }
 
-  const result = await approveWorkflow(runId, comment);
+  const resolvedId = await resolveRunIdArg(runId, cwd);
+  const result = await approveWorkflow(resolvedId, comment);
 
   // CLI auto-resumes after approval (unlike chat, which defers to next user message)
   if (!result.workingPath) {
     throw new Error(
-      `Workflow run '${runId}' has no working path recorded.\n` +
+      `Workflow run '${resolvedId}' has no working path recorded.\n` +
         'Cannot determine where to resume.'
     );
   }
@@ -1608,14 +2046,14 @@ export async function workflowApproveCommand(
     platformConversationId = originalConversation?.platform_conversation_id ?? undefined;
     if (!originalConversation) {
       getLog().info(
-        { runId, conversationId: result.conversationId },
+        { runId: resolvedId, conversationId: result.conversationId },
         'cli.workflow_approve_conversation_not_found'
       );
     }
   } catch (error) {
     const err = error as Error;
     getLog().warn(
-      { err, runId, conversationId: result.conversationId },
+      { err, runId: resolvedId, conversationId: result.conversationId },
       'cli.workflow_approve_conversation_lookup_failed'
     );
   }
@@ -1625,7 +2063,7 @@ export async function workflowApproveCommand(
     // found even when working_path is a worktree or workspace clone that does
     // not contain the user's local (often untracked) workflow YAML.
     const discoveryCwd = result.codebaseId
-      ? await resolveDiscoveryCwdForCodebase(runId, result.codebaseId, 'approve')
+      ? await resolveDiscoveryCwdForCodebase(resolvedId, result.codebaseId, 'approve')
       : undefined;
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
@@ -1637,12 +2075,12 @@ export async function workflowApproveCommand(
   } catch (error) {
     const err = error as Error;
     getLog().error(
-      { err, runId, workflowName: result.workflowName },
+      { err, runId: resolvedId, workflowName: result.workflowName },
       'cli.workflow_approve_resume_failed'
     );
     throw new Error(
       `Approved but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
-        `The approval was recorded. Run 'bun run cli workflow resume ${runId}' to retry.`
+        `The approval was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
     );
   }
 }
@@ -1651,11 +2089,14 @@ export async function workflowApproveCommand(
  * Reject a paused workflow run by ID.
  * If the workflow has an on_reject prompt, auto-resumes with the rejection feedback;
  * otherwise marks the run as cancelled.
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
  */
 export async function workflowRejectCommand(
   runId: string,
   reason?: string,
-  json?: boolean
+  json?: boolean,
+  cwd?: string
 ): Promise<void> {
   // JSON mode records the rejection and returns a structured ack WITHOUT the
   // inline auto-resume (an on_reject rework executes the workflow and streams
@@ -1663,12 +2104,13 @@ export async function workflowRejectCommand(
   // is resumable for the rework pass — drive it with a backgrounded `resume`.
   if (json) {
     try {
-      const result = await rejectWorkflow(runId, reason);
+      const resolvedId = await resolveRunIdArg(runId, cwd);
+      const result = await rejectWorkflow(resolvedId, reason);
       console.log(
         JSON.stringify(
           {
             ok: true,
-            runId,
+            runId: resolvedId,
             action: 'reject',
             cancelled: result.cancelled,
             maxAttemptsReached: result.maxAttemptsReached,
@@ -1685,7 +2127,8 @@ export async function workflowRejectCommand(
     return;
   }
 
-  const result = await rejectWorkflow(runId, reason);
+  const resolvedId = await resolveRunIdArg(runId, cwd);
+  const result = await rejectWorkflow(resolvedId, reason);
 
   if (result.cancelled) {
     const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
@@ -1696,7 +2139,7 @@ export async function workflowRejectCommand(
   // Not cancelled = has onRejectPrompt, CLI auto-resumes with rejection feedback
   if (!result.workingPath) {
     throw new Error(
-      `Workflow run '${runId}' has no working path recorded.\n` +
+      `Workflow run '${resolvedId}' has no working path recorded.\n` +
         'Cannot determine where to resume.'
     );
   }
@@ -1710,14 +2153,14 @@ export async function workflowRejectCommand(
     platformConversationId = originalConversation?.platform_conversation_id ?? undefined;
     if (!originalConversation) {
       getLog().info(
-        { runId, conversationId: result.conversationId },
+        { runId: resolvedId, conversationId: result.conversationId },
         'cli.workflow_reject_conversation_not_found'
       );
     }
   } catch (error) {
     const err = error as Error;
     getLog().warn(
-      { err, runId, conversationId: result.conversationId },
+      { err, runId: resolvedId, conversationId: result.conversationId },
       'cli.workflow_reject_conversation_lookup_failed'
     );
   }
@@ -1727,7 +2170,7 @@ export async function workflowRejectCommand(
     // found even when working_path is a worktree or workspace clone that does
     // not contain the user's local (often untracked) workflow YAML.
     const discoveryCwd = result.codebaseId
-      ? await resolveDiscoveryCwdForCodebase(runId, result.codebaseId, 'reject')
+      ? await resolveDiscoveryCwdForCodebase(resolvedId, result.codebaseId, 'reject')
       : undefined;
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
@@ -1739,12 +2182,12 @@ export async function workflowRejectCommand(
   } catch (error) {
     const err = error as Error;
     getLog().error(
-      { err, runId, workflowName: result.workflowName },
+      { err, runId: resolvedId, workflowName: result.workflowName },
       'cli.workflow_reject_resume_failed'
     );
     throw new Error(
       `Rejected but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
-        `The rejection was recorded. Run 'bun run cli workflow resume ${runId}' to retry.`
+        `The rejection was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
     );
   }
 }

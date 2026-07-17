@@ -10,6 +10,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { execFileAsync } from '@archon/git';
 import { BUNDLED_IS_BINARY, getArchonHome, createLogger, getTelemetryStatus } from '@archon/paths';
+import type { Codebase } from '@archon/core';
 
 // Env vars that indicate a Pi backend API key is configured. Keep in sync with
 // `PI_BACKENDS` in setup.ts — these are the auth signals checkPi inspects.
@@ -167,6 +168,139 @@ async function defaultLoadDatabaseDeps(): Promise<DatabaseDeps> {
   return { pool, getDatabaseType };
 }
 
+type FolderCodebase = Pick<Codebase, 'name' | 'default_cwd' | 'kind'>;
+
+export interface FolderProjectDeps {
+  findCodebaseByDefaultCwd: (cwd: string) => Promise<FolderCodebase | null>;
+  findCodebaseByPathPrefix: (cwd: string) => Promise<FolderCodebase | null>;
+  listChildRepos: (rootPath: string) => Promise<string[]>;
+}
+
+async function defaultLoadFolderProjectDeps(): Promise<FolderProjectDeps> {
+  const codebaseDb = await import('@archon/core/db/codebases');
+  const { listChildRepos } = await import('@archon/git');
+  return {
+    findCodebaseByDefaultCwd: codebaseDb.findCodebaseByDefaultCwd,
+    findCodebaseByPathPrefix: codebaseDb.findCodebaseByPathPrefix,
+    listChildRepos,
+  };
+}
+
+/**
+ * When the current directory is a registered folder project, report it and list
+ * the git repos contained under its root. Skips quietly (not a failure) for a
+ * normal git-repo cwd, an unregistered directory, or when the DB is unavailable.
+ */
+export async function checkFolderProject(
+  cwd: string = process.cwd(),
+  loadDeps: () => Promise<FolderProjectDeps> = defaultLoadFolderProjectDeps
+): Promise<CheckResult> {
+  const label = 'Folder project';
+  let deps: FolderProjectDeps;
+  try {
+    deps = await loadDeps();
+  } catch (err) {
+    getLog().debug({ err }, 'doctor.folder_project_module_load_failed');
+    return { label, status: 'skip', message: 'unavailable (module load failed)' };
+  }
+  let codebase: FolderCodebase | null;
+  try {
+    codebase =
+      (await deps.findCodebaseByDefaultCwd(cwd)) ?? (await deps.findCodebaseByPathPrefix(cwd));
+  } catch (err) {
+    getLog().debug({ err, cwd }, 'doctor.folder_project_lookup_failed');
+    return { label, status: 'skip', message: 'could not check (database unavailable)' };
+  }
+  if (codebase?.kind !== 'folder') {
+    return { label, status: 'skip', message: 'cwd is not a registered folder project' };
+  }
+  const childRepos = await deps.listChildRepos(codebase.default_cwd);
+  const shown = childRepos.slice(0, 10);
+  const remaining = childRepos.length - shown.length;
+  let reposMsg: string;
+  if (childRepos.length === 0) {
+    reposMsg = 'no contained git repos';
+  } else {
+    const moreSuffix = remaining > 0 ? `, … (+${String(remaining)} more)` : '';
+    reposMsg = `${String(childRepos.length)} contained repo(s): ${shown.join(', ')}${moreSuffix}`;
+  }
+  return {
+    label,
+    status: 'pass',
+    message: `"${codebase.name}" (runs in place) — ${reposMsg}`,
+  };
+}
+
+export interface ProviderDeps {
+  listUserProviderKeys: (
+    userId: string
+  ) => Promise<{ provider: string; kind: string; label: string | null }[]>;
+  // `platform` is the literal 'cli' — this check resolves the CLI identity only,
+  // and narrowing it keeps the real (platform-union-typed) db fn assignable here.
+  findOrCreateUserByPlatformIdentity: (
+    platform: 'cli',
+    id: string,
+    name: string
+  ) => Promise<{ id: string }>;
+}
+
+/**
+ * Report how many AI-provider credentials the current CLI user has connected,
+ * plus how to connect when none are. Skip (never fail) on any error — credential
+ * status is informational, and a missing CLI identity or DB hiccup shouldn't make
+ * `archon doctor` exit non-zero.
+ */
+export async function checkConnectedProviders(
+  env: NodeJS.ProcessEnv = process.env,
+  // Injected so tests can drive every branch without the dynamic @archon/core import.
+  loadDeps: () => Promise<ProviderDeps> = defaultLoadProviderDeps
+): Promise<CheckResult> {
+  const label = 'AI credentials';
+  const cliId = env.ARCHON_USER_ID || env.USER || env.USERNAME;
+  if (!cliId) {
+    return { label, status: 'skip', message: 'no CLI identity (set ARCHON_USER_ID or USER)' };
+  }
+  let deps: ProviderDeps;
+  try {
+    deps = await loadDeps();
+  } catch (err) {
+    return {
+      label,
+      status: 'skip',
+      message: `could not load credential module: ${(err as Error).message}`,
+    };
+  }
+  try {
+    const user = await deps.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+    const rows = await deps.listUserProviderKeys(user.id);
+    if (rows.length === 0) {
+      return {
+        label,
+        status: 'skip',
+        message: 'none connected — run: archon ai login <vendor>  or  archon ai key set <vendor>',
+      };
+    }
+    const summary = rows.map(r => `${r.provider}(${r.kind})`).join(', ');
+    return { label, status: 'pass', message: `${rows.length} connected: ${summary}` };
+  } catch (err) {
+    return {
+      label,
+      status: 'skip',
+      message: `could not read credentials: ${(err as Error).message}`,
+    };
+  }
+}
+
+async function defaultLoadProviderDeps(): Promise<ProviderDeps> {
+  // Lazy imports for the same reason as defaultLoadDatabaseDeps.
+  const { listUserProviderKeys } = await import('@archon/core');
+  const userDb = await import('@archon/core/db/users');
+  return {
+    listUserProviderKeys,
+    findOrCreateUserByPlatformIdentity: userDb.findOrCreateUserByPlatformIdentity,
+  };
+}
+
 export async function checkWorkspaceWritable(): Promise<CheckResult> {
   const label = 'Workspace';
   const home = getArchonHome();
@@ -301,6 +435,8 @@ export async function doctorCommand(
         checkGhAuth(env),
         checkPi(env),
         checkDatabase(),
+        checkFolderProject(),
+        checkConnectedProviders(env),
         checkWorkspaceWritable(),
         checkBundledDefaults(),
         checkTelemetry(),

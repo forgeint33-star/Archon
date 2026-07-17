@@ -96,6 +96,8 @@ Claude Code supports three authentication modes via `CLAUDE_USE_GLOBAL_AUTH`:
 2. **Explicit Tokens** (set to `false`): Uses tokens from env vars below
 3. **Auto-Detect** (not set): Uses tokens if present in env, otherwise global auth
 
+If both `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_API_KEY` are set, the OAuth token wins and no API key is passed to Claude. A per-user credential connected in Settings → Agents always takes precedence over these install-wide variables for that user's runs.
+
 ### Option 1: Global Auth (Recommended)
 
 ```ini
@@ -614,14 +616,21 @@ Solo users don't need any of this — the install-wide setup above is enough.
 
 ### Enabling it
 
-Per-user credentials are gated on a single secret. Set `TOKEN_ENCRYPTION_KEY` (a 64-char hex string) so Archon can encrypt stored credentials at rest (AES-256-GCM):
+The credential vault is available on every install — Archon auto-provisions a local key at
+`~/.archon/credential-key` on first use. **No setup required for a solo install.**
+
+If you're running a managed or multi-user deploy and want to control the encryption key yourself
+(e.g. to rotate it, share it across containers, or keep it in a secrets manager), set
+`TOKEN_ENCRYPTION_KEY` and the local key file is skipped entirely:
 
 ```ini
 # .env — generate with: openssl rand -hex 32
 TOKEN_ENCRYPTION_KEY=<64-char hex>
 ```
 
-Without it, the per-user surface is inert (the routes report `enabled: false`) and Archon keeps reading provider keys from the environment as above. The console's **Agents** section still renders in that state — each agent card shows install-level status (which keys the server environment already carries, plus ambient cloud-chain detection) with the connect/login/disconnect affordances hidden, so a solo install can see *what's authenticated* even though there's nothing per-user to manage.
+> **Rotating `TOKEN_ENCRYPTION_KEY`** (or deleting `~/.archon/credential-key`) invalidates all
+> stored user credentials — everyone must reconnect. `archon doctor` will report a
+> `mass_decrypt_failure` and include a re-connect hint if this happens.
 
 ### Connecting from the console
 
@@ -630,11 +639,11 @@ The console **AI Settings** page (Settings in the web UI) has four sections:
 - **Model Tiers** — map the `small` / `medium` / `large` tiers to a provider + model (and optional effort). This writes the install's `tiers:` config and works on **any** install, even without `TOKEN_ENCRYPTION_KEY` (it's non-secret config). Pi tier models show a cost/reasoning/context hint from Pi's model catalog.
 - **Model Aliases** — define `@custom` refs (e.g. `@fast`) usable in workflow `model:` fields, with the same scope toggle.
 - **Agents** — one card per agent (Claude Code, Codex, Pi, OpenCode, Copilot) with the credentials it can spend nested inside, each card showing a readiness state (ready / needs credential). Connect a credential for *your* user inside the agent that uses it. Credentials are keyed by **vendor** (`anthropic`, `openai`, `github-copilot`, `openrouter`, …), and one credential serves every agent that consumes it (an `anthropic` key powers Claude Code and Pi's anthropic backend — both cards reflect it). Every vendor accepts an **API key**; **`anthropic`**, **`openai`**, and **`github-copilot`** additionally offer **subscription login** (an OAuth flow — for `openai`/ChatGPT it is an Archon-owned PKCE flow where you paste the redirect URL or code back, [#1924](https://github.com/coleam00/Archon/issues/1924)). Legacy ids (`claude`/`codex`/`copilot`) are accepted and normalized. The **Pi** card keeps its 30+ backends behind a searchable "Add backend…" picker (with model counts from Pi's catalog) and shows ambient chains (Amazon Bedrock, Google Vertex) as status-only rows; the **OpenCode** card loads its backend catalog on demand from the embedded runtime — its connections are install-wide, not per-user.
-- **Defaults** — the default assistant and per-provider model defaults, plus a "Your default" (just-me) assistant select.
+- **Defaults** — leads with a "Chat runs on [provider][model]" combo line in both scopes (the install line edits the default assistant + `assistants.<provider>.model`; the just-me line edits your personal default assistant + chat-model pin), with the per-provider model grid below as the advanced view.
 
 ### Per-user model preferences ("Just me")
 
-When you're logged in (a web identity resolves), the **Model Tiers** and **Model Aliases** panels show a **"This install / Just me"** scope toggle, and **Defaults** gains a "Your default" select. The "Just me" scope stores your personal tiers/aliases/default assistant in Archon's database and applies them as the **highest-precedence** layer — your overrides win over the install config for runs and chats *you* start, without changing anyone else's. This needs an identity but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets); on a solo install without web auth the toggle simply doesn't appear and everything behaves exactly as before.
+When you're logged in (a web identity resolves), the **Model Tiers** and **Model Aliases** panels show a **"This install / Just me"** scope toggle, and **Defaults** gains a just-me "Chat runs on" combo (provider + model). The "Just me" scope stores your personal tiers/aliases/default assistant (and optional chat-model pin) in Archon's database and applies them as the **highest-precedence** layer — your overrides win over the install config for runs and chats *you* start, without changing anyone else's. This needs an identity but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets); on a solo install without web auth the toggle simply doesn't appear and everything behaves exactly as before.
 
 If a chat asks for the `large` tier and only a different tier is configured, Archon uses the nearest preset and posts a one-line notice telling you which tier answered and where to set `large`.
 
@@ -656,7 +665,14 @@ archon ai default claude
 # The same, but just for YOU (per-user prefs; identity from ARCHON_USER_ID/$USER)
 archon ai tier set large claude opus --scope user
 archon ai default codex --scope user
+
+# Pin YOUR chat to a specific provider + model without touching the `large`
+# tier that workflows use (provider + model are written together; omitting
+# the model clears a previous pin)
+archon ai default pi openrouter/minimax/minimax-m2 --scope user
 ```
+
+**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default. Workflow nodes are unaffected — `model: large` keeps meaning the tier.
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 

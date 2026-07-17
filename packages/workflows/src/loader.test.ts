@@ -389,10 +389,13 @@ nodes:
       expect(workflows[0].model).toBe('claude-opus-4-7[1m]');
     });
 
-    it('should parse codex options fields', async () => {
+    it('should parse codex options fields (and ignore the removed additionalDirectories field)', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
+      // additionalDirectories was a dead workflow-level field (parsed but never
+      // consumed by the DAG executor) — it has been removed. A YAML that still
+      // declares it must load fine, with the field simply ignored.
       const yaml = `name: codex-options
 description: Codex options are parsed
 provider: codex
@@ -414,7 +417,8 @@ nodes:
       expect(workflows).toHaveLength(1);
       expect(workflows[0].modelReasoningEffort).toBe('medium');
       expect(workflows[0].webSearchMode).toBe('live');
-      expect(workflows[0].additionalDirectories).toEqual(['/repo/a']);
+      // The removed field is not carried onto the workflow object.
+      expect((workflows[0] as Record<string, unknown>).additionalDirectories).toBeUndefined();
     });
 
     it('should round-trip workflow-level effort/thinking/fallbackModel/betas/sandbox', async () => {
@@ -852,6 +856,32 @@ nodes:
       expect(workflows[0].nodes[0].id).toBe('persist');
       expect(workflows[0].nodes[0].always_run).toBe(true);
       expect(workflows[0].nodes[1].always_run).toBeUndefined();
+    });
+
+    it('preserves an optional description on a node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      const yaml = `name: node-description-test
+description: Node-level description is kept, not stripped
+nodes:
+  - id: documented
+    bash: 'echo hi'
+    description: Runs the full security gate against the target repo
+  - id: undocumented
+    bash: 'echo bye'
+    depends_on: [documented]
+`;
+      await writeFile(join(workflowDir, 'node-description.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const workflows = result.workflows.map(ws => ws.workflow);
+
+      expect(workflows).toHaveLength(1);
+      expect(workflows[0].nodes[0].description).toBe(
+        'Runs the full security gate against the target repo'
+      );
+      expect(workflows[0].nodes[1].description).toBeUndefined();
     });
   });
 
@@ -2609,6 +2639,262 @@ nodes:
       // Logger should have been called with the warning event
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({ filename: expect.stringContaining('warn-test') }),
+        'interactive_loop_in_non_interactive_workflow'
+      );
+    });
+
+    it('should accept a loop with signal_completes (loads without errors)', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'signal-completes.yaml'),
+        `
+name: signal-completes
+description: Interactive loop that completes autonomously on the signal
+interactive: true
+nodes:
+  - id: validate
+    loop:
+      prompt: Validate.
+      until: VALIDATED
+      max_iterations: 5
+      interactive: true
+      gate_message: Review.
+      signal_completes: true
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('should warn (non-blocking) when signal_completes is set without interactive', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'sc-no-interactive.yaml'),
+        `
+name: sc-no-interactive
+description: signal_completes without interactive is a no-op
+nodes:
+  - id: validate
+    loop:
+      prompt: Validate.
+      until: VALIDATED
+      max_iterations: 5
+      signal_completes: true
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      // Workflow loads successfully — this is a warning, not an error
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ filename: expect.stringContaining('sc-no-interactive') }),
+        'signal_completes_without_interactive_ignored'
+      );
+    });
+
+    it('should reject loop_group with a cyclic body', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-cycle.yaml'),
+        `
+name: loop-group-cycle
+description: Cyclic loop_group body
+nodes:
+  - id: grp
+    loop_group:
+      until: DONE
+      max_iterations: 5
+      nodes:
+        - id: a
+          prompt: "a"
+          depends_on: [b]
+        - id: b
+          prompt: "b"
+          depends_on: [a]
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0].error).toContain('loop_group');
+      expect(result.errors[0].error).toContain('Cycle');
+    });
+
+    it('should reject loop_group body depends_on referencing an unknown node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-bad-dep.yaml'),
+        `
+name: loop-group-bad-dep
+description: Body depends_on to unknown node
+nodes:
+  - id: grp
+    loop_group:
+      until: DONE
+      max_iterations: 5
+      nodes:
+        - id: a
+          prompt: "a"
+        - id: b
+          prompt: "b"
+          depends_on: [missing]
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0].error).toContain('loop_group');
+      expect(result.errors[0].error).toContain('unknown node');
+    });
+
+    it('should accept a well-formed loop_group', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-ok.yaml'),
+        `
+name: loop-group-ok
+description: Valid loop_group
+nodes:
+  - id: grp
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: work
+          prompt: "do work"
+          depends_on: []
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('should accept a body prompt referencing an outer-DAG node via $nodeId.output', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-outer-ref.yaml'),
+        `
+name: loop-group-outer-ref
+description: Body prompt reads an outer node output
+nodes:
+  - id: setup
+    bash: "echo hi"
+  - id: grp
+    depends_on: [setup]
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: work
+          prompt: "Use this context: $setup.output"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('should still reject a body prompt referencing a truly unknown node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-unknown-ref.yaml'),
+        `
+name: loop-group-unknown-ref
+description: Body prompt references a node that exists nowhere
+nodes:
+  - id: setup
+    bash: "echo hi"
+  - id: grp
+    depends_on: [setup]
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: work
+          prompt: "Use this context: $nowhere.output"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0].error).toContain("unknown node '$nowhere.output'");
+    });
+
+    it('should reject a body node id that shadows an outer-DAG node id', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-shadow.yaml'),
+        `
+name: loop-group-shadow
+description: Body node id collides with outer node id
+nodes:
+  - id: setup
+    bash: "echo hi"
+  - id: grp
+    depends_on: [setup]
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: setup
+          prompt: "shadows the outer setup node"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0].error).toContain('shadows a node id in the enclosing DAG');
+    });
+
+    it('should warn when an interactive loop_group is in a non-interactive workflow', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-gate-warn.yaml'),
+        `
+name: loop-group-gate-warn
+description: Interactive loop_group without workflow-level interactive
+nodes:
+  - id: grp
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      interactive: true
+      gate_message: "Review this iteration"
+      nodes:
+        - id: work
+          prompt: "do work"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ filename: expect.stringContaining('loop-group-gate-warn') }),
         'interactive_loop_in_non_interactive_workflow'
       );
     });
