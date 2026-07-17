@@ -334,8 +334,8 @@ describe('generateDeployScript', () => {
     expect(script).toContain('/health');
   });
 
-  test('checks concurrency guards', () => {
-    expect(script).toContain('CONCURRENCY_GUARD');
+  test('checks concurrency guard wrappers via library source', () => {
+    expect(script).toContain('goviral-lib-concurrency-guard');
   });
 
   test('checks failed units', () => {
@@ -443,5 +443,65 @@ describe('production immutability', () => {
       expect(script).not.toContain('bun install');
       expect(script).not.toContain('systemctl restart');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Guard wrapper verification regression
+// ---------------------------------------------------------------------------
+
+describe('canonical guard wrapper verification', () => {
+  const guards = [
+    {
+      name: 'goviral-prompt-command-center',
+      impl_suffix: '',
+      lock_path: '/run/lock/goviral-prompt-command-center.lock',
+      trigger_args: ['run-all', '--write'],
+      version: 'GOVIRAL_CONCURRENCY_GUARD_V3',
+    },
+    {
+      name: 'goviral-brain-auto-workflow',
+      impl_suffix: '',
+      lock_path: '/run/lock/goviral-brain-auto-workflow.lock',
+      trigger_args: ['run-all', '--write'],
+      version: 'GOVIRAL_CONCURRENCY_GUARD_V3',
+    },
+  ];
+
+  test('canonical wrappers source the guard library (structural identity)', () => {
+    for (const guard of guards) {
+      const script = generateConcurrencyGuard(guard);
+      expect(script).toContain('goviral-lib-concurrency-guard.sh');
+    }
+  });
+
+  test('canonical wrappers call concurrency_guard function', () => {
+    for (const guard of guards) {
+      const script = generateConcurrencyGuard(guard);
+      expect(script).toContain(`concurrency_guard "${guard.name}"`);
+    }
+  });
+
+  test('canonical wrappers do NOT require obsolete head-5 marker strings', () => {
+    // Regression: the old verify used `head -5 | grep _GOVIRAL_GUARD_ACTIVE`
+    // but the canonical wrapper has that string on line 14, not in the first 5 lines.
+    // Verification must use structural checks (sources library, calls function),
+    // not fragile marker-string-in-first-N-lines.
+    for (const guard of guards) {
+      const script = generateConcurrencyGuard(guard);
+      const firstFiveLines = script.split('\n').slice(0, 5).join('\n');
+      // _GOVIRAL_GUARD_ACTIVE is NOT in the first 5 lines — that's fine
+      // The wrapper is still valid; verification must not depend on this
+      expect(firstFiveLines).not.toContain('_GOVIRAL_GUARD_ACTIVE');
+      // But the full script does contain it (recursive guard protection)
+      expect(script).toContain('_GOVIRAL_GUARD_ACTIVE');
+    }
+  });
+
+  test('generated deploy script verifies guard via library source, not marker', () => {
+    const deployScript = generateDeployScript();
+    // Must check the guard library reference, not an obsolete CONCURRENCY_GUARD marker
+    expect(deployScript).toContain('goviral-lib-concurrency-guard');
+    expect(deployScript).not.toContain("grep -q 'CONCURRENCY_GUARD'");
   });
 });

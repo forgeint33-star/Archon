@@ -434,13 +434,30 @@ do_verify() {
   fi
 
   # ── Concurrency guard chain ─────────────────────────────────────────────────
+  # Verify guard library installed first (wrappers depend on it)
+  if [ -f "/usr/local/bin/goviral-lib-concurrency-guard.sh" ]; then
+    pass "Guard library installed"
+  else
+    fail "Guard library missing: /usr/local/bin/goviral-lib-concurrency-guard.sh"
+  fi
+
   for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
-    # 1. Guard wrapper must exist and contain the guard-active marker
+    # 1. Guard wrapper must exist, be executable, source the library, and call concurrency_guard
     if [ -f "/usr/local/bin/${script}-guard" ]; then
-      if head -5 "/usr/local/bin/${script}-guard" | grep -q '_GOVIRAL_GUARD_ACTIVE'; then
-        pass "Guard wrapper installed: ${script}-guard"
+      if [ -x "/usr/local/bin/${script}-guard" ]; then
+        pass "Guard wrapper executable: ${script}-guard"
       else
-        fail "Guard marker missing in ${script}-guard"
+        fail "Guard wrapper not executable: ${script}-guard"
+      fi
+      if grep -q 'goviral-lib-concurrency-guard\.sh' "/usr/local/bin/${script}-guard" 2>/dev/null; then
+        pass "Guard wrapper loads library: ${script}-guard"
+      else
+        fail "Guard wrapper does not source guard library: ${script}-guard"
+      fi
+      if grep -q "concurrency_guard" "/usr/local/bin/${script}-guard" 2>/dev/null; then
+        pass "Guard wrapper calls concurrency_guard: ${script}-guard"
+      else
+        fail "Guard wrapper missing concurrency_guard call: ${script}-guard"
       fi
     else
       fail "Guard wrapper missing: /usr/local/bin/${script}-guard"
@@ -464,10 +481,6 @@ do_verify() {
       warn "Service file not found: ${script}.service"
     fi
   done
-
-  # Verify guard library installed
-  [ -f "/usr/local/bin/goviral-lib-concurrency-guard.sh" ] && \
-    pass "Guard library installed" || fail "Guard library missing"
 
   # Functional flock canary: verify the guard actually acquires and releases a lock
   log "  Running functional flock canary..."
@@ -648,12 +661,15 @@ do_rollback() {
     fail "Service failed to start after rollback"
   fi
 
-  # Verify the rollback restored the production hotfix guard
+  # Verify the rollback restored guard wrappers
   for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
-    if head -5 "/usr/local/bin/$script" 2>/dev/null | grep -q 'CONCURRENCY_GUARD\|_GOVIRAL_GUARD_ACTIVE'; then
-      pass "Production guard restored: $script"
+    if [ -f "/usr/local/bin/${script}-guard" ] && \
+       grep -q 'goviral-lib-concurrency-guard\.sh' "/usr/local/bin/${script}-guard" 2>/dev/null; then
+      pass "Guard wrapper restored: ${script}-guard"
+    elif [ -f "/usr/local/bin/$script" ]; then
+      warn "Guard wrapper not verified after rollback: ${script} (check manually)"
     else
-      warn "Guard not verified after rollback: $script (check manually)"
+      warn "Script not found after rollback: ${script}"
     fi
   done
 

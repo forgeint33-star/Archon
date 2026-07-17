@@ -415,12 +415,13 @@ verify() {
     fail "Health endpoint check failed"
   fi
 
-  # Concurrency canaries
+  # Concurrency guard wrappers
   for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
-    if head -5 "/usr/local/bin/$script" 2>/dev/null | grep -q 'CONCURRENCY_GUARD'; then
-      pass "Concurrency guard present: $script"
+    if [ -x "/usr/local/bin/\${script}-guard" ] && \
+       grep -q 'goviral-lib-concurrency-guard\\.sh' "/usr/local/bin/\${script}-guard" 2>/dev/null; then
+      pass "Guard wrapper valid: \${script}-guard"
     else
-      fail "Concurrency guard missing: $script"
+      fail "Guard wrapper missing or invalid: \${script}-guard"
     fi
   done
 
