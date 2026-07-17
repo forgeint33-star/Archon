@@ -4,6 +4,7 @@ import { ProjectRail } from './components/ProjectRail';
 import { AddProjectDialog } from './components/AddProjectDialog';
 import { ProjectPalette } from './components/ProjectPalette';
 import { KeymapHelp } from './components/KeymapHelp';
+import { BuilderRoute } from './builder/BuilderRoute';
 import { RunsPage } from './routes/RunsPage';
 import { RunDetailPage } from './routes/RunDetailPage';
 import { ChatPage } from './routes/ChatPage';
@@ -79,6 +80,7 @@ export function ConsoleApp(): ReactElement {
           <Routes>
             <Route index element={<RunsPage />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="builder" element={<BuilderRoute />} />
             <Route
               path="goviral"
               element={
