@@ -1,0 +1,12 @@
+[Unit]
+Description=Run GoViral Prompt-to-PRD Autonomous Brain Workflow every 5 minutes
+
+[Timer]
+# Staggered boot: wait 4 min to avoid simultaneous fan-out with prompt-command-center (3m30s)
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

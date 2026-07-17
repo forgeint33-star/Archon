@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+import json
+import os
+import pwd
+import subprocess
+import tempfile
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE = Path('/var/lib/goviral-archon/.archon')
+STATUS = STATE / 'goviral-control-health.json'
+ALERTS = STATE / 'goviral-control-alerts.jsonl'
+QUEUE = Path('/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json')
+LATEST_BACKUP = Path('/var/lib/goviral-archon/backups/control-plane/latest.tar.gz')
+QUARANTINE = STATE / 'quarantine/goviral-clickup-autosync.json'
+
+
+def run(args: list[str]) -> tuple[int, str]:
+    result = subprocess.run(args, capture_output=True, text=True, check=False, timeout=30)
+    return result.returncode, result.stdout.strip()
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def write_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        account = pwd.getpwnam('goviral-archon')
+        os.chown(temporary, account.pw_uid, account.pw_gid)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+checks: list[dict] = []
+severity = 'PASS'
+
+rc, archon_state = run(['/usr/bin/systemctl', 'is-active', 'goviral-archon'])
+checks.append({'name': 'archon_service', 'status': 'PASS' if rc == 0 and archon_state == 'active' else 'CRITICAL', 'detail': archon_state or 'unknown'})
+
+try:
+    with urllib.request.urlopen('http://127.0.0.1:8180/api/goviral/overview', timeout=15) as response:
+        overview = json.load(response)
+    api_ok = response.status == 200 and overview.get('doctor', {}).get('status') == 'PASS'
+except Exception as exc:
+    api_ok = False
+    overview = {'error': type(exc).__name__}
+checks.append({'name': 'control_plane_api', 'status': 'PASS' if api_ok else 'CRITICAL', 'detail': overview.get('doctor', {}).get('status', overview.get('error', 'unknown'))})
+
+rc, failed_output = run(['/usr/bin/systemctl', 'list-units', '--state=failed', '--no-legend', '--no-pager', '--plain'])
+failed_units = sorted(line.split()[0] for line in failed_output.splitlines() if line.strip().startswith('goviral-')) if rc == 0 else []
+checks.append({'name': 'failed_goviral_units', 'status': 'PASS' if not failed_units else 'CRITICAL', 'detail': failed_units})
+
+rc, listeners = run(['/usr/bin/ss', '-H', '-ltn', 'sport', '=', ':8180'])
+listener_lines = [line for line in listeners.splitlines() if line.strip()]
+public_listener = False
+for line in listener_lines:
+    fields = line.split()
+    local = fields[3] if len(fields) > 3 else ''
+    if not (local.startswith('127.0.0.1:') or local.startswith('[::1]:') or local.startswith('::1:')):
+        public_listener = True
+checks.append({'name': 'local_bind_only', 'status': 'CRITICAL' if public_listener or not listener_lines else 'PASS', 'detail': listener_lines})
+
+backup_age_hours = None
+if LATEST_BACKUP.exists():
+    target = LATEST_BACKUP.resolve()
+    backup_age_hours = round((datetime.now(timezone.utc).timestamp() - target.stat().st_mtime) / 3600, 2)
+backup_status = 'PASS'
+if backup_age_hours is None or backup_age_hours > 48:
+    backup_status = 'CRITICAL'
+elif backup_age_hours > 30:
+    backup_status = 'WARNING'
+checks.append({'name': 'backup_freshness', 'status': backup_status, 'detail': {'age_hours': backup_age_hours}})
+
+pending = None
+try:
+    queue = json.loads(QUEUE.read_text())
+    pending = len(queue.get('pending', []))
+except Exception:
+    pending = None
+approval_status = 'PASS' if pending is not None and pending <= 100 else ('WARNING' if pending is not None else 'CRITICAL')
+checks.append({'name': 'approval_queue', 'status': approval_status, 'detail': {'pending': pending}})
+
+checks.append({'name': 'clickup_autosync_quarantine', 'status': 'INFO' if QUARANTINE.is_file() else 'PASS', 'detail': 'quarantined and timer disabled' if QUARANTINE.is_file() else 'not quarantined'})
+
+if any(check['status'] == 'CRITICAL' for check in checks):
+    severity = 'CRITICAL'
+elif any(check['status'] == 'WARNING' for check in checks):
+    severity = 'WARNING'
+
+payload = {
+    'generated_at': now(),
+    'status': severity,
+    'checks': checks,
+}
+
+previous_status = None
+try:
+    previous_status = json.loads(STATUS.read_text()).get('status')
+except Exception:
+    previous_status = None
+
+write_atomic(STATUS, payload)
+
+if previous_status != severity:
+    ALERTS.parent.mkdir(parents=True, exist_ok=True)
+    event = {'timestamp': now(), 'previous_status': previous_status, 'status': severity, 'checks': checks}
+    with ALERTS.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(event, separators=(',', ':')) + '\n')
+    os.chmod(ALERTS, 0o600)
+    account = pwd.getpwnam('goviral-archon')
+    os.chown(ALERTS, account.pw_uid, account.pw_gid)
+
+if severity != 'PASS':
+    subprocess.run(['/usr/bin/logger', '-p', 'user.warning', '-t', 'goviral-control-health', f'Control Plane health={severity}'], check=False)
+
+print(f'health_status={severity}')
+print(f'failed_units={len(failed_units)}')
+print(f'pending_approvals={pending}')
+print(f'backup_age_hours={backup_age_hours}')
+print(f'public_listener={str(public_listener).lower()}')

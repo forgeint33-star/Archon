@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly GoViral upstream compatibility check
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=30m
+Unit=goviral-archon-upgrade-check.service
+
+[Install]
+WantedBy=timers.target

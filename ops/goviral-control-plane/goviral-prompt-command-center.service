@@ -1,0 +1,20 @@
+[Unit]
+Description=GoViral Prompt Command Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/lib/goviral-archon/workspaces/goviral-brain
+ExecStart=/usr/local/bin/goviral-prompt-command-center-guard run-all --write
+User=root
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+# For Type=oneshot, only TimeoutStartSec acts as the execution bound.
+# Normal runs complete in 2–4 minutes; 600s (10 min) is generous headroom.
+TimeoutStartSec=600
+
+# Lower scheduling priority for batch work (nice 10, idle I/O)
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7

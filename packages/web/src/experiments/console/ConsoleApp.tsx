@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactElement } from 'react';
+import { lazy, Suspense, useMemo, useState, type ReactElement } from 'react';
 import { Routes, Route, useNavigate } from 'react-router';
 import { ProjectRail } from './components/ProjectRail';
 import { AddProjectDialog } from './components/AddProjectDialog';
@@ -10,6 +10,12 @@ import { RunDetailPage } from './routes/RunDetailPage';
 import { ChatPage } from './routes/ChatPage';
 import { PreviewPage } from './routes/PreviewPage';
 import { SettingsPage } from './routes/SettingsPage';
+
+// React.lazy components must be PascalCase for JSX usage
+// eslint-disable-next-line @typescript-eslint/naming-convention
+const LazyGoviralControlPlanePage = lazy(() =>
+  import('./routes/GoviralControlPlanePage').then(m => ({ default: m.GoviralControlPlanePage }))
+);
 import { invalidate } from './store/cache';
 import { K } from './store/keys';
 import { useKeymap, type Binding } from './lib/keymap';
@@ -75,6 +81,20 @@ export function ConsoleApp(): ReactElement {
             <Route index element={<RunsPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="builder" element={<BuilderRoute />} />
+            <Route
+              path="goviral"
+              element={
+                <Suspense
+                  fallback={
+                    <div className="p-8 text-center text-sm text-white/50">
+                      Loading Control Plane…
+                    </div>
+                  }
+                >
+                  <LazyGoviralControlPlanePage />
+                </Suspense>
+              }
+            />
             <Route path="_preview" element={<PreviewPage />} />
             <Route path="p/:projectId" element={<RunsPage />} />
             <Route path="p/:projectId/chat" element={<ChatPage />} />

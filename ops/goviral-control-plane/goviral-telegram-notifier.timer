@@ -1,0 +1,12 @@
+[Unit]
+Description=Run GoViral Telegram notifier every 15 minutes
+
+[Timer]
+OnBootSec=6m
+OnUnitActiveSec=15m
+Persistent=true
+RandomizedDelaySec=2m
+Unit=goviral-telegram-notifier.service
+
+[Install]
+WantedBy=timers.target

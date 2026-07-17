@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""GoViral daily operations digest for Telegram.
+
+Sends a comprehensive daily summary using the Brain snapshot API (v3):
+doctor status, approval counts, agent registry with drift, Brain inventory,
+integration state (4-layer evidence), backup freshness, and incidents.
+
+Credentials: /etc/goviral/credentials/telegram-bot-token and telegram-chat-id
+"""
+import json
+import os
+import pwd
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+CRED_DIR = Path('/etc/goviral/credentials')
+TOKEN_FILE = CRED_DIR / 'telegram-bot-token'
+CHAT_FILE = CRED_DIR / 'telegram-chat-id'
+STATE_DIR = Path('/var/lib/goviral-archon/.archon/notifications')
+DIGEST_STATE = STATE_DIR / 'daily-digest-state.json'
+HEALTH_FILE = Path('/var/lib/goviral-archon/.archon/goviral-control-health.json')
+BACKUP_LATEST = Path('/var/lib/goviral-archon/backups/control-plane/latest.tar.gz')
+QUEUE_FILE = Path('/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json')
+UPGRADE_DIR = Path('/var/lib/goviral-archon/.archon/upgrade-checks')
+RESTORE_DIR = Path('/var/lib/goviral-archon/.archon/restore-drills')
+
+API_BASE = 'http://127.0.0.1:8180'
+TIMEOUT = 15
+MAX_MESSAGE_LENGTH = 4000
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def load_credentials() -> tuple[str, str] | None:
+    try:
+        token = TOKEN_FILE.read_text().strip()
+        chat_id = CHAT_FILE.read_text().strip()
+        if token and chat_id:
+            return token, chat_id
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def send_telegram(token: str, chat_id: str, text: str) -> bool:
+    truncated = text[:MAX_MESSAGE_LENGTH]
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    data = json.dumps({
+        'chat_id': chat_id,
+        'text': truncated,
+        'parse_mode': 'HTML',
+    }).encode()
+    request = urllib.request.Request(
+        url, data=data,
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            result = json.load(response)
+            return result.get('ok', False)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return False
+
+
+def load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + '\n')
+    os.chmod(path, 0o600)
+    try:
+        account = pwd.getpwnam('goviral-archon')
+        os.chown(path, account.pw_uid, account.pw_gid)
+    except (KeyError, PermissionError):
+        pass
+
+
+def api_get(endpoint: str) -> dict:
+    try:
+        url = f'{API_BASE}{endpoint}'
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+            return json.load(response)
+    except Exception:
+        return {}
+
+
+def backup_age_hours() -> float | None:
+    try:
+        target = BACKUP_LATEST.resolve()
+        age = (datetime.now(timezone.utc).timestamp() - target.stat().st_mtime) / 3600
+        return round(age, 1)
+    except OSError:
+        return None
+
+
+def latest_file_in(directory: Path) -> dict:
+    try:
+        files = sorted(directory.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            return json.loads(files[0].read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def failed_units() -> list[str]:
+    try:
+        result = subprocess.run(
+            ['/usr/bin/systemctl', 'list-units', '--state=failed', '--no-legend', '--no-pager', '--plain'],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        return [
+            line.split()[0]
+            for line in result.stdout.splitlines()
+            if line.strip().startswith('goviral-')
+        ]
+    except Exception:
+        return []
+
+
+def safe_int(data: dict, *keys: str) -> int:
+    """Extract an integer from nested dict keys, defaulting to 0."""
+    current = data
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, 0)
+        else:
+            return 0
+    return int(current) if isinstance(current, (int, float)) else 0
+
+
+def safe_str(data: dict, *keys: str, default: str = '—') -> str:
+    """Extract a string from nested dict keys with a safe default."""
+    current = data
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, default)
+        else:
+            return default
+    if isinstance(current, str):
+        return current or default
+    return str(current) if current is not None else default
+
+
+def format_ts(value: str | None) -> str:
+    """Format an ISO timestamp to a compact display form."""
+    if not value or value == '—':
+        return '—'
+    try:
+        return value[:16].replace('T', ' ')
+    except (TypeError, IndexError):
+        return '—'
+
+
+def build_section_agents(brain: dict, agents: dict) -> list[str]:
+    """Build the agent section from Brain overview + agents API."""
+    summary = brain.get('summary', {}).get('agents', {})
+    agent_summary = agents.get('summary', {})
+
+    # Use Brain snapshot as canonical source; fall back to v2 agent summary
+    has_brain = bool(summary)
+    registered = summary.get('registered', agent_summary.get('registered_count', agent_summary.get('total', 0)))
+    enabled = summary.get('enabled', agent_summary.get('enabled_count', agent_summary.get('total', 0) if not has_brain else 0))
+    disabled = max(0, registered - enabled)
+    active_now = summary.get('active_now', agent_summary.get('active_run_count', agent_summary.get('active', 0)))
+    runs_today = summary.get('runs_24h', agent_summary.get('runs_today_count', 0))
+    recent = agent_summary.get('recent_run_count', agent_summary.get('recent', 0))
+    drift = summary.get('registry_drift', agent_summary.get('drift_count', 0))
+
+    # Last run from the agents runs list
+    runs_list = agents.get('runs', agents.get('active_runs', []))
+    last_run = '—'
+    if runs_list:
+        last_modified = runs_list[0].get('modified_at') if runs_list else None
+        if last_modified:
+            last_run = format_ts(last_modified)
+
+    lines = [
+        '<b>Agents</b> (Brain registry)',
+        f'  Registered: {registered}  Enabled: {enabled}  Disabled: {disabled}',
+        f'  Active now: {active_now}  Runs today: {runs_today}  Recent: {recent}',
+        f'  Last run: {last_run}',
+    ]
+
+    if drift > 0:
+        drift_items = agents.get('registry_definition_drift', [])
+        drift_names = [d.get('agent', '?') for d in drift_items[:3]]
+        drift_detail = ', '.join(drift_names)
+        if len(drift_items) > 3:
+            drift_detail += f' (+{len(drift_items) - 3})'
+        lines.append(f'  Drift: {drift} ({drift_detail})')
+
+    return lines
+
+
+def build_section_inventory(brain: dict) -> list[str]:
+    """Build compact Brain inventory from the overview summary."""
+    s = brain.get('summary', {})
+    skills = s.get('skills', {})
+    tools = s.get('tools', {})
+    clients = s.get('clients', {})
+    projects = s.get('projects', {})
+    memory = s.get('memory', {})
+    brain_os = s.get('brain_os', {})
+
+    skill_total = (
+        skills.get('catalog', 0) +
+        skills.get('bridges', 0) +
+        skills.get('operational', 0)
+    )
+
+    return [
+        '<b>Brain Inventory</b>',
+        f'  Skills: {skill_total} ({skills.get("catalog", 0)} catalog, {skills.get("bridges", 0)} bridges, {skills.get("operational", 0)} ops)',
+        f'  Tools: {tools.get("registered", 0)} ({tools.get("active", 0)} active)  MCP: {tools.get("mcp_servers", 0)}',
+        f'  Clients: {clients.get("indexed", 0)} indexed  Projects: {projects.get("bridged", 0)}',
+        f'  Memory: {memory.get("brain_memory_entries", 0)} entries  Knowledge: {memory.get("runtime_knowledge", "—")}',
+        f'  BrainOS: phase {brain_os.get("phase", "—")} ({brain_os.get("status", "—")})',
+    ]
+
+
+def build_section_integrations(brain: dict) -> list[str]:
+    """Build integration state with 4-layer evidence per integration."""
+    s = brain.get('summary', {})
+    tg = s.get('telegram', {})
+    cu = s.get('clickup', {})
+    health = brain.get('health', 'unknown')
+
+    lines = ['<b>Integrations</b>']
+
+    # Telegram — 4 layers
+    tg_installed = True  # framework always installed (we are in the report script)
+    tg_creds = tg.get('configured', False)
+    tg_active = tg.get('notifier_active', False) or tg.get('digest_active', False)
+    tg_last = format_ts(tg.get('last_delivery'))
+    tg_state = 'operational' if (tg_creds and tg_active) else 'degraded' if tg_creds else 'not configured'
+    lines.append(f'  Telegram: {tg_state}')
+    lines.append(f'    installed=yes  creds={_yn(tg_creds)}  timer={_yn(tg_active)}  last={tg_last}')
+
+    # ClickUp — 4 layers
+    cu_installed = True  # framework always installed
+    cu_creds = cu.get('configured', False)
+    cu_state = cu.get('state', 'not_configured')
+    cu_policies = cu.get('policies', 0)
+    lines.append(f'  ClickUp: {cu_state}')
+    lines.append(f'    installed=yes  creds={_yn(cu_creds)}  policies={cu_policies}')
+
+    # Qdrant — dynamic, never hard-coded
+    qdrant = api_get('/api/goviral/integrations/qdrant') if health != 'error' else {}
+    qdrant_state = qdrant.get('state', qdrant.get('status', 'unknown'))
+    lines.append(f'  Qdrant: {qdrant_state}')
+
+    # Off-site backup — dynamic evidence
+    offsite = api_get('/api/goviral/integrations/offsite-backup') if health != 'error' else {}
+    offsite_state = offsite.get('state', offsite.get('status', 'unknown'))
+    lines.append(f'  Off-site backup: {offsite_state}')
+
+    return lines
+
+
+def _yn(value: bool) -> str:
+    return 'yes' if value else 'no'
+
+
+def build_digest() -> str:
+    """Build the daily digest message using Brain snapshot v3 API."""
+    health = load_json(HEALTH_FILE)
+    health_status = health.get('status', 'UNKNOWN')
+
+    # Primary data sources
+    brain = api_get('/api/goviral/brain/overview')
+    overview = api_get('/api/goviral/overview')
+    incidents = api_get('/api/goviral/incidents')
+    agents = api_get('/api/goviral/agents')
+
+    queue = load_json(QUEUE_FILE)
+    pending = len(queue.get('pending', []))
+    approved = len(queue.get('approved', []))
+    executed = len(queue.get('executed', []))
+
+    backup_hours = backup_age_hours()
+    failed = failed_units()
+
+    upgrade = latest_file_in(UPGRADE_DIR)
+    drill = latest_file_in(RESTORE_DIR)
+
+    doctor_status = brain.get('summary', {}).get('brain_os', {}).get('status',
+                    overview.get('doctor', {}).get('status', 'UNKNOWN'))
+    brain_health = brain.get('health', 'unknown')
+    prd_title = overview.get('latest_prd', {})
+    prd_name = prd_title.get('title', '—') if prd_title else '—'
+
+    incident_list = incidents.get('incidents', [])
+    critical_count = sum(1 for i in incident_list if i.get('severity') == 'critical')
+    high_count = sum(1 for i in incident_list if i.get('severity') == 'high')
+    warning_count = sum(1 for i in incident_list if i.get('severity') == 'warning')
+
+    drift_count = brain.get('summary', {}).get('drift_count', 0)
+
+    lines = [
+        '<b>GoViral Daily Ops Report</b>',
+        f'<i>{now()}</i>',
+        '',
+        f'<b>Health:</b> {health_status}  <b>Brain:</b> {brain_health}  <b>Doctor:</b> {doctor_status}',
+    ]
+
+    if drift_count > 0:
+        lines.append(f'<b>Drift items:</b> {drift_count}')
+
+    lines.extend([
+        '',
+        '<b>Approvals</b>',
+        f'  Pending: {pending}  Approved: {approved}  Executed: {executed}',
+        '',
+        '<b>Incidents</b>',
+        f'  Critical: {critical_count}  High: {high_count}  Warning: {warning_count}',
+    ])
+
+    if failed:
+        lines.append(f'  Failed units: {", ".join(failed[:5])}')
+
+    lines.append('')
+    lines.extend(build_section_agents(brain, agents))
+    lines.append('')
+    lines.extend(build_section_inventory(brain))
+    lines.append('')
+    lines.extend(build_section_integrations(brain))
+    lines.extend([
+        '',
+        '<b>Backup</b>',
+        f'  Latest: {f"{backup_hours}h ago" if backup_hours is not None else "none"}',
+        f'  Restore drill: {drill.get("status", "not run")}',
+        '',
+        f'<b>Upgrade:</b> {upgrade.get("status", "not run")}',
+        f'<b>Latest PRD:</b> {prd_name}',
+    ])
+
+    message = '\n'.join(lines)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        message = message[:MAX_MESSAGE_LENGTH - 20] + '\n\n<i>[truncated]</i>'
+    return message
+
+
+def main() -> None:
+    creds = load_credentials()
+    if creds is None:
+        print('daily_digest=not_configured')
+        return
+
+    token, chat_id = creds
+    digest = build_digest()
+    success = send_telegram(token, chat_id, digest)
+
+    save_json(DIGEST_STATE, {
+        'last_sent': now(),
+        'success': success,
+    })
+
+    print(f'daily_digest={"sent" if success else "failed"}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print(f'daily_digest=error detail={str(exc)[:200]}', file=sys.stderr)
+        raise SystemExit(1)

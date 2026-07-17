@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+SRC="/opt/goviral-archon-src"
+STATE="/var/lib/goviral-archon/.archon"
+ROOT="/var/lib/goviral-archon/backups/control-plane"
+LATEST="$(readlink -f "$ROOT/latest.tar.gz")"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TMP="$(mktemp -d "$ROOT/.restore-drill.${STAMP}.XXXXXX")"
+WT="$TMP/worktree"
+REPORT_DIR="$STATE/restore-drills"
+REPORT="$REPORT_DIR/${STAMP}.json"
+
+cleanup() {
+  /usr/bin/git -c "safe.directory=$SRC" -C "$SRC" \
+    worktree remove --force "$WT" >/dev/null 2>&1 || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+mkdir -p "$REPORT_DIR"
+chmod 0700 "$REPORT_DIR"
+
+test -f "$LATEST"
+test -f "$LATEST.sha256"
+/usr/bin/sha256sum -c "$LATEST.sha256" >/dev/null
+/usr/bin/tar -xzf "$LATEST" -C "$TMP"
+
+test -s "$TMP/archon.db"
+test -s "$TMP/config.yaml"
+test -s "$TMP/queue.json"
+test -s "$TMP/archon-head.txt"
+test -f "$TMP/archon-custom.patch"
+test -x "$TMP/operations-files/goviral-control-action"
+
+python3 - "$TMP/archon.db" "$TMP/queue.json" <<'PY'
+import json
+from pathlib import Path
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    result = connection.execute("PRAGMA integrity_check").fetchone()
+assert result and result[0] == "ok", result
+queue = json.loads(Path(sys.argv[2]).read_text())
+assert isinstance(queue, dict)
+for bucket in ("pending", "approved", "rejected", "executed"):
+    assert isinstance(queue.get(bucket), list), bucket
+PY
+
+HEAD="$(tr -d '\r\n' < "$TMP/archon-head.txt")"
+BASE="$(/usr/bin/git -c "safe.directory=$SRC" -C "$SRC" merge-base "$HEAD" origin/dev)"
+/usr/bin/git -c "safe.directory=$SRC" -C "$SRC" \
+  worktree add --detach "$WT" "$BASE" >/dev/null
+/usr/bin/git -c "safe.directory=$WT" -C "$WT" \
+  apply --check "$TMP/archon-custom.patch"
+
+python3 - "$REPORT" "$LATEST" "$HEAD" "$BASE" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import os
+import pwd
+import sys
+
+report = Path(sys.argv[1])
+payload = {
+    "status": "PASS",
+    "archive": sys.argv[2],
+    "archon_head": sys.argv[3],
+    "base_commit": sys.argv[4],
+    "sqlite_integrity": "ok",
+    "queue_schema": "ok",
+    "patch_apply_check": "ok",
+    "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+}
+report.write_text(json.dumps(payload, indent=2) + "\n")
+report.chmod(0o600)
+account = pwd.getpwnam("goviral-archon")
+os.chown(report, account.pw_uid, account.pw_gid)
+PY
+
+echo "restore_drill_archive=$LATEST"
+echo "restore_drill_sqlite=ok"
+echo "restore_drill_queue_schema=ok"
+echo "restore_drill_patch=ok"
+echo "restore_drill_report=$REPORT"
+echo "restore_drill_complete=true"

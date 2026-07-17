@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""GoViral Telegram notification dispatcher.
+
+Reads health status, failed units, backup freshness, approval pressure,
+canary results, and upgrade check results. Sends Telegram alerts for new
+or escalated incidents with deduplication and rate limiting.
+
+Credentials: /etc/goviral/credentials/telegram-bot-token and telegram-chat-id
+State: /var/lib/goviral-archon/.archon/notifications/
+"""
+import hashlib
+import json
+import os
+import pwd
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+CRED_DIR = Path('/etc/goviral/credentials')
+TOKEN_FILE = CRED_DIR / 'telegram-bot-token'
+CHAT_FILE = CRED_DIR / 'telegram-chat-id'
+STATE_DIR = Path('/var/lib/goviral-archon/.archon/notifications')
+DEDUP_FILE = STATE_DIR / 'sent-incidents.json'
+RATE_FILE = STATE_DIR / 'rate-state.json'
+HEALTH_FILE = Path('/var/lib/goviral-archon/.archon/goviral-control-health.json')
+AUDIT_FILE = Path('/var/lib/goviral-archon/.archon/goviral-control-audit.jsonl')
+BACKUP_LATEST = Path('/var/lib/goviral-archon/backups/control-plane/latest.tar.gz')
+UPGRADE_DIR = Path('/var/lib/goviral-archon/.archon/upgrade-checks')
+RESTORE_DIR = Path('/var/lib/goviral-archon/.archon/restore-drills')
+
+TIMEOUT = 15
+MAX_MESSAGES_PER_HOUR = 12
+MAX_MESSAGE_LENGTH = 4000
+SEVERITY_RANK = {'critical': 0, 'high': 1, 'warning': 2, 'info': 3}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def load_credentials() -> tuple[str, str] | None:
+    try:
+        token = TOKEN_FILE.read_text().strip()
+        chat_id = CHAT_FILE.read_text().strip()
+        if token and chat_id:
+            return token, chat_id
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def escape_md(text: str) -> str:
+    """Escape text for Telegram MarkdownV2."""
+    special = r'_*[]()~`>#+-=|{}.!'
+    result = []
+    for char in text:
+        if char in special:
+            result.append('\\')
+        result.append(char)
+    return ''.join(result)
+
+
+def send_telegram(token: str, chat_id: str, text: str) -> bool:
+    """Send a message via Telegram. Returns True on success."""
+    truncated = text[:MAX_MESSAGE_LENGTH]
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    data = json.dumps({
+        'chat_id': chat_id,
+        'text': truncated,
+        'parse_mode': 'HTML',
+    }).encode()
+    request = urllib.request.Request(
+        url, data=data,
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            result = json.load(response)
+            return result.get('ok', False)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return False
+
+
+def load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + '\n')
+    os.chmod(path, 0o600)
+    try:
+        account = pwd.getpwnam('goviral-archon')
+        os.chown(path, account.pw_uid, account.pw_gid)
+    except (KeyError, PermissionError):
+        pass
+
+
+def incident_hash(incident_id: str, severity: str) -> str:
+    return hashlib.sha256(f'{incident_id}:{severity}'.encode()).hexdigest()[:16]
+
+
+def check_rate_limit() -> bool:
+    """Return True if under the rate limit."""
+    state = load_json(RATE_FILE)
+    timestamps = [
+        ts for ts in state.get('timestamps', [])
+        if (datetime.now(timezone.utc).timestamp() - ts) < 3600
+    ]
+    if len(timestamps) >= MAX_MESSAGES_PER_HOUR:
+        return False
+    timestamps.append(datetime.now(timezone.utc).timestamp())
+    save_json(RATE_FILE, {'timestamps': timestamps})
+    return True
+
+
+def should_send(incident_id: str, severity: str) -> bool:
+    """Check deduplication: only send for new or escalated incidents."""
+    sent = load_json(DEDUP_FILE)
+    entries = sent.get('entries', {})
+    key = incident_id
+    existing = entries.get(key)
+
+    if existing is None:
+        return True
+
+    existing_severity = existing.get('severity', 'info')
+    return SEVERITY_RANK.get(severity, 3) < SEVERITY_RANK.get(existing_severity, 3)
+
+
+def mark_sent(incident_id: str, severity: str) -> None:
+    sent = load_json(DEDUP_FILE)
+    entries = sent.get('entries', {})
+    entries[incident_id] = {
+        'severity': severity,
+        'sent_at': now(),
+        'hash': incident_hash(incident_id, severity),
+    }
+    # Prune old entries (keep last 200)
+    if len(entries) > 200:
+        sorted_entries = sorted(entries.items(), key=lambda x: x[1].get('sent_at', ''))
+        entries = dict(sorted_entries[-200:])
+    save_json(DEDUP_FILE, {'entries': entries, 'updated_at': now()})
+
+
+def latest_file_in(directory: Path) -> Path | None:
+    """Find the most recent JSON file in a directory."""
+    try:
+        files = sorted(directory.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0] if files else None
+    except OSError:
+        return None
+
+
+def collect_incidents() -> list[dict]:
+    """Collect current incidents from health state."""
+    incidents = []
+    health = load_json(HEALTH_FILE)
+    checks = health.get('checks', [])
+
+    for check in checks:
+        name = check.get('name', 'unknown')
+        status = check.get('status', 'PASS')
+        detail = check.get('detail', '')
+
+        if status == 'CRITICAL':
+            incidents.append({
+                'id': f'health-{name}',
+                'severity': 'critical',
+                'title': f'{name} is CRITICAL',
+                'detail': str(detail)[:200],
+            })
+        elif status == 'WARNING':
+            incidents.append({
+                'id': f'health-{name}',
+                'severity': 'warning',
+                'title': f'{name} is WARNING',
+                'detail': str(detail)[:200],
+            })
+
+    # Check latest upgrade check
+    latest_upgrade = latest_file_in(UPGRADE_DIR)
+    if latest_upgrade:
+        upgrade = load_json(latest_upgrade)
+        if upgrade.get('status') in ('MERGE_CONFLICT', 'CHECKS_FAILED'):
+            incidents.append({
+                'id': 'upgrade-check',
+                'severity': 'warning',
+                'title': f'Upstream compatibility: {upgrade["status"]}',
+                'detail': upgrade.get('detail', '')[:200],
+            })
+
+    # Check latest restore drill
+    latest_drill = latest_file_in(RESTORE_DIR)
+    if latest_drill:
+        drill = load_json(latest_drill)
+        if drill.get('status') != 'PASS':
+            incidents.append({
+                'id': 'restore-drill',
+                'severity': 'high',
+                'title': f'Restore drill: {drill.get("status", "UNKNOWN")}',
+                'detail': 'Latest restore drill did not pass',
+            })
+
+    return incidents
+
+
+def format_incident_message(incident: dict) -> str:
+    """Format an incident as an HTML Telegram message."""
+    severity = incident['severity'].upper()
+    emoji = {'CRITICAL': '🔴', 'HIGH': '🟠', 'WARNING': '🟡'}.get(severity, 'ℹ️')
+    title = incident['title']
+    detail = incident.get('detail', '')
+
+    lines = [
+        f'{emoji} <b>GoViral Alert: {severity}</b>',
+        '',
+        f'<b>{title}</b>',
+    ]
+    if detail:
+        lines.append(f'<code>{detail[:300]}</code>')
+    lines.append(f'\n<i>{now()}</i>')
+    return '\n'.join(lines)
+
+
+def main() -> None:
+    creds = load_credentials()
+    if creds is None:
+        print('telegram_notifier=not_configured')
+        return
+
+    token, chat_id = creds
+    incidents = collect_incidents()
+    sent_count = 0
+    skipped_count = 0
+
+    for incident in incidents:
+        if not should_send(incident['id'], incident['severity']):
+            skipped_count += 1
+            continue
+
+        if not check_rate_limit():
+            print(f'telegram_notifier=rate_limited sent={sent_count}')
+            return
+
+        message = format_incident_message(incident)
+        if send_telegram(token, chat_id, message):
+            mark_sent(incident['id'], incident['severity'])
+            sent_count += 1
+        else:
+            print(f'telegram_send_failed={incident["id"]}', file=sys.stderr)
+
+    print(f'telegram_notifier=complete sent={sent_count} skipped={skipped_count} total={len(incidents)}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print(f'telegram_notifier=error detail={str(exc)[:200]}', file=sys.stderr)
+        raise SystemExit(1)

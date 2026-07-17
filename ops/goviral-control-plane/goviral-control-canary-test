@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BASE="http://127.0.0.1:8180"
+UNIT="goviral-control-canary.service"
+QUEUE="/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json"
+TMP="$(mktemp -d)"
+IDENTITY="closure-canary-$(date -u +%s)@local"
+
+cleanup() {
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+before="$(sha256sum "$QUEUE" | awk '{print $1}')"
+curl -fsS "$BASE/api/goviral/actions" > "$TMP/actions.json"
+
+python3 - "$TMP/actions.json" "$TMP/start.json" "$TMP/stop.json" "$UNIT" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+actions = json.loads(Path(sys.argv[1]).read_text())
+unit = sys.argv[4]
+assert actions["enabled"] is True
+assert actions["role"] == "operator"
+csrf = actions["csrf"]
+Path(sys.argv[2]).write_text(json.dumps({
+    "action": "start-unit",
+    "target": unit,
+    "confirmation": f"START {unit}",
+    "csrf": csrf,
+}))
+Path(sys.argv[3]).write_text(json.dumps({
+    "action": "stop-unit",
+    "target": unit,
+    "confirmation": f"STOP {unit}",
+    "csrf": csrf,
+}))
+PY
+
+start_status="$(curl -sS -o "$TMP/start-response.json" -w '%{http_code}' \
+  -H 'Origin: http://127.0.0.1:8180' \
+  -H "Tailscale-User-Login: $IDENTITY" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$TMP/start.json" \
+  "$BASE/api/goviral/actions")"
+
+test "$start_status" = "200"
+test "$(systemctl is-active "$UNIT")" = "active"
+
+stop_status="$(curl -sS -o "$TMP/stop-response.json" -w '%{http_code}' \
+  -H 'Origin: http://127.0.0.1:8180' \
+  -H "Tailscale-User-Login: $IDENTITY" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$TMP/stop.json" \
+  "$BASE/api/goviral/actions")"
+
+test "$stop_status" = "200"
+
+for attempt in $(seq 1 20); do
+  state="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  [ "$state" = "inactive" ] && break
+  sleep 0.25
+done
+
+test "$(systemctl is-active "$UNIT" 2>/dev/null || true)" = "inactive"
+after="$(sha256sum "$QUEUE" | awk '{print $1}')"
+test "$before" = "$after"
+
+curl -fsS "$BASE/api/goviral/actions" > "$TMP/audit.json"
+python3 - "$TMP/start-response.json" "$TMP/stop-response.json" "$TMP/audit.json" "$UNIT" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+start = json.loads(Path(sys.argv[1]).read_text())
+stop = json.loads(Path(sys.argv[2]).read_text())
+audit = json.loads(Path(sys.argv[3]).read_text())
+unit = sys.argv[4]
+assert start.get("ok") is True
+assert stop.get("ok") is True
+rows = audit.get("audit", [])
+assert any(row.get("action") == "start-unit" and row.get("target") == unit and row.get("status") == "success" for row in rows)
+assert any(row.get("action") == "stop-unit" and row.get("target") == unit and row.get("status") == "success" for row in rows)
+PY
+
+echo "positive_canary_start_status=$start_status"
+echo "positive_canary_stop_status=$stop_status"
+echo "positive_canary_audit=true"
+echo "approval_queue_unchanged=true"
+echo "positive_canary_complete=true"

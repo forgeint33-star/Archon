@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Secure ClickUp credential configuration for GoViral Control Plane.
+
+Must be run as root. Prompts for API token without echoing.
+Validates connectivity with a read-only workspace list call.
+Stores credentials as root-owned 0600 files under /etc/goviral/credentials/.
+"""
+import getpass
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CRED_DIR = Path('/etc/goviral/credentials')
+TOKEN_FILE = CRED_DIR / 'clickup-api-token'
+STATE_FILE = Path('/var/lib/goviral-archon/.archon/clickup-integration.json')
+TIMEOUT = 15
+
+
+def fail(message: str) -> None:
+    print(f'ERROR: {message}', file=sys.stderr)
+    raise SystemExit(1)
+
+
+def clickup_api(token: str, endpoint: str) -> dict:
+    url = f'https://api.clickup.com/api/v2/{endpoint}'
+    request = urllib.request.Request(url, headers={'Authorization': token})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        fail(f'ClickUp API returned HTTP {exc.code} for {endpoint}')
+    except urllib.error.URLError as exc:
+        fail(f'ClickUp API network error: {exc.reason}')
+    return {}
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail('This command must be run as root.')
+
+    print('GoViral ClickUp Configuration')
+    print('=' * 40)
+    print()
+    print('This will configure read-only ClickUp connectivity.')
+    print('The API token will be stored as a root-owned credential file.')
+    print()
+
+    token = getpass.getpass('ClickUp API token (hidden): ').strip()
+    if not token or len(token) < 10:
+        fail('Token is too short or empty.')
+
+    print('Validating token with read-only workspace list...')
+    teams = clickup_api(token, 'team')
+    team_list = teams.get('teams', [])
+    if not team_list:
+        fail('No ClickUp teams/workspaces found for this token.')
+
+    print(f'Connected to {len(team_list)} workspace(s):')
+    for team in team_list[:5]:
+        print(f'  - {team.get("name", "unknown")} (id: {team.get("id", "unknown")})')
+    print()
+
+    # Store credentials
+    CRED_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CRED_DIR, 0o700)
+    os.chown(CRED_DIR, 0, 0)
+
+    TOKEN_FILE.write_text(token + '\n')
+    os.chmod(TOKEN_FILE, 0o600)
+    os.chown(TOKEN_FILE, 0, 0)
+
+    # Update integration state
+    from datetime import datetime, timezone
+    import pwd
+    state = {
+        'configured': True,
+        'state': 'read_only_verified',
+        'detail': f'Read-only verified against {len(team_list)} workspace(s)',
+        'last_check': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'workspaces': [{'id': t.get('id'), 'name': t.get('name')} for t in team_list[:5]],
+    }
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + '\n')
+    os.chmod(STATE_FILE, 0o600)
+    account = pwd.getpwnam('goviral-archon')
+    os.chown(STATE_FILE, account.pw_uid, account.pw_gid)
+
+    print('Credentials stored:')
+    print(f'  {TOKEN_FILE} (root:root 0600)')
+    print()
+    print('Next steps:')
+    print('  1. Verify read-only access in the Control Plane UI')
+    print('  2. Run a dry-run sync to preview changes')
+    print('  3. Explicitly enable production sync only after all gates pass')
+
+
+if __name__ == '__main__':
+    main()

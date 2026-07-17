@@ -1,0 +1,19 @@
+[Unit]
+Description=GoViral operational analytics rollup
+After=network-online.target goviral-archon.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/bin/goviral-analytics-rollup
+# For Type=oneshot, only TimeoutStartSec acts as the execution bound.
+TimeoutStartSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/goviral-archon/.archon/goviral-control-health.json
+ReadOnlyPaths=/var/lib/goviral-archon/workspaces/goviral-brain
+ReadOnlyPaths=/var/lib/goviral-archon/backups/control-plane
+ReadWritePaths=/var/lib/goviral-archon/.archon/analytics

@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState, type ReactElement } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router';
-import { Settings, Workflow, ArrowLeft, PenTool, type LucideIcon } from 'lucide-react';
+import { Activity, Settings, Workflow, ArrowLeft, PenTool, type LucideIcon } from 'lucide-react';
 import { ProjectRow } from './ProjectRow';
 import { EnvVarsDialog } from './EnvVarsDialog';
 import { useEntity, invalidate } from '../store/cache';
@@ -311,6 +311,12 @@ export function ProjectRail({ onAddProject }: ProjectRailProps): ReactElement {
           label="Workflow Builder"
           title="Visual workflow builder (beta)"
           badge="beta"
+        />
+        <RailNavLink
+          to="/console/goviral"
+          icon={Activity}
+          label="GoViral Control Plane"
+          title="GoViral BrainOS and governance status"
         />
         <RailNavLink
           to="/console/settings"

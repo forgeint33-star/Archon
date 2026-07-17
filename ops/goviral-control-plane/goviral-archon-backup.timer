@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily GoViral Archon secure backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=goviral-archon-backup.service
+
+[Install]
+WantedBy=timers.target

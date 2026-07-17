@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly GoViral analytics rollup
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=1h
+Persistent=true
+RandomizedDelaySec=5m
+Unit=goviral-analytics-rollup.service
+
+[Install]
+WantedBy=timers.target
