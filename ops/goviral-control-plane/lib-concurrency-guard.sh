@@ -20,11 +20,12 @@ set -u -o pipefail
 # Allow override via environment for testing; default to production paths
 LOCK_DIR="${GOVIRAL_LOCK_DIR:-/run/lock}"
 METRICS_DIR="${GOVIRAL_METRICS_DIR:-/var/lib/goviral-archon/.archon/concurrency-metrics}"
+BIN_DIR="${GOVIRAL_BIN_DIR:-/usr/local/bin}"
 
 # concurrency_guard WORKFLOW_NAME [ARGS...]
 #
 # WORKFLOW_NAME — base name of the script (e.g. "goviral-prompt-command-center").
-#                 The implementation must exist at /usr/local/bin/${WORKFLOW_NAME}.
+#                 The implementation must exist at ${BIN_DIR}/${WORKFLOW_NAME}.
 #
 # If ARGS begin with "run-all --write", the flock guard activates.
 # Otherwise the implementation is exec'd directly (no lock).
@@ -32,7 +33,7 @@ concurrency_guard() {
   local workflow_name="$1"
   shift
 
-  local impl="/usr/local/bin/${workflow_name}"
+  local impl="${BIN_DIR}/${workflow_name}"
   local lock_file="${LOCK_DIR}/${workflow_name}.lock"
 
   mkdir -p "$METRICS_DIR" 2>/dev/null || true

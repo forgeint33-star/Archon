@@ -4,7 +4,8 @@ Description=GoViral Control Plane governed-action canary
 [Service]
 Type=simple
 DynamicUser=yes
-ExecStart=/usr/bin/sleep infinity
+ExecStart=/usr/bin/sleep 86400
+RuntimeMaxSec=86400
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

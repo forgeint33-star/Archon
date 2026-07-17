@@ -54,14 +54,14 @@ interface ConcurrencyGuard {
 const GUARDED_WORKFLOWS: ConcurrencyGuard[] = [
   {
     name: 'goviral-prompt-command-center',
-    impl_suffix: '.impl',
+    impl_suffix: '', // Guard wrapper (-guard) invokes the base-name script through lib
     lock_path: '/run/lock/goviral-prompt-command-center.lock',
     trigger_args: ['run-all', '--write'],
     version: 'GOVIRAL_CONCURRENCY_GUARD_V3',
   },
   {
     name: 'goviral-brain-auto-workflow',
-    impl_suffix: '.impl',
+    impl_suffix: '', // Guard wrapper (-guard) invokes the base-name script through lib
     lock_path: '/run/lock/goviral-brain-auto-workflow.lock',
     trigger_args: ['run-all', '--write'],
     version: 'GOVIRAL_CONCURRENCY_GUARD_V3',
@@ -74,48 +74,38 @@ const GUARDED_WORKFLOWS: ConcurrencyGuard[] = [
 
 /**
  * Generate a concurrency guard wrapper script.
- * Semantically equivalent to the verified production hotfix (GOVIRAL_CONCURRENCY_GUARD_V1)
- * but with v3 provenance tracking.
+ *
+ * Architecture (v3): wrapper -> lib-concurrency-guard.sh -> flock -> implementation
+ * - Guard wrapper is installed as /usr/local/bin/<name>-guard
+ * - Implementation stays at /usr/local/bin/<name>
+ * - systemd service ExecStart invokes the -guard wrapper
+ * - lib-concurrency-guard.sh handles flock, overlap detection, metrics
  *
  * Behavior:
  * - When called with trigger_args (e.g. "run-all --write"), uses flock to ensure
  *   at most one mutating run per leaf workflow
  * - On overlap (flock returns 200), outputs overlap_skipped=true and exits 0
  * - For any other invocation, passes through to the impl script
+ * - Recursive invocation is rejected (exit 99)
  */
 export function generateConcurrencyGuard(guard: ConcurrencyGuard): string {
-  const triggerTest = guard.trigger_args
-    .map((arg, i) => `[ "\${${i + 1}:-}" = "${arg}" ]`)
-    .join(' && ');
-
   return `#!/usr/bin/env bash
 # ${guard.version}
-# Canonical concurrency guard for ${guard.name}
-# Semantically equivalent to production hotfix GOVIRAL_CONCURRENCY_GUARD_V1
+# Concurrency-guarded wrapper for ${guard.name}.
 # Source: packages/server/src/routes/goviral-phase9-deploy.ts
 set -u -o pipefail
 
-IMPL='/usr/local/bin/${guard.name}${guard.impl_suffix}'
-LOCK='${guard.lock_path}'
-
-if ${triggerTest}; then
-  if /usr/bin/flock -n -E 200 "$LOCK" "$IMPL" "$@"; then
-    exit 0
-  else
-    rc=$?
-
-    if [ "$rc" -eq 200 ]; then
-      printf '%s\\n' \\
-        'overlap_skipped=true' \\
-        'workflow=${guard.name}'
-      exit 0
-    fi
-
-    exit "$rc"
-  fi
+# Guard against recursive self-execution
+if [ "\${_GOVIRAL_GUARD_ACTIVE:-}" = "${guard.name}" ]; then
+  echo "ERROR: recursive guard invocation detected" >&2
+  exit 99
 fi
+export _GOVIRAL_GUARD_ACTIVE="${guard.name}"
 
-exec "$IMPL" "$@"
+# Source shared guard library
+source /usr/local/bin/goviral-lib-concurrency-guard.sh
+
+concurrency_guard "${guard.name}" "$@"
 `;
 }
 

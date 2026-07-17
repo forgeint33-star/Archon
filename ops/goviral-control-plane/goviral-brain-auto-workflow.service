@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/var/lib/goviral-archon/workspaces/goviral-brain
-ExecStart=/usr/local/bin/goviral-brain-auto-workflow run-all --write
+ExecStart=/usr/local/bin/goviral-brain-auto-workflow-guard run-all --write
 User=root
 
 # ── Hardening ────────────────────────────────────────────────────────────────

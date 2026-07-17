@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/var/lib/goviral-archon/workspaces/goviral-brain
-ExecStart=/usr/local/bin/goviral-prompt-command-center run-all --write
+ExecStart=/usr/local/bin/goviral-prompt-command-center-guard run-all --write
 User=root
 
 # ── Hardening ────────────────────────────────────────────────────────────────

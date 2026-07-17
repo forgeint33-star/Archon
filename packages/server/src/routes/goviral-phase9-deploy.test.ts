@@ -37,7 +37,7 @@ function createTestApp(): InstanceType<typeof Hono> {
 describe('generateConcurrencyGuard', () => {
   const guard = generateConcurrencyGuard({
     name: 'goviral-prompt-command-center',
-    impl_suffix: '.impl',
+    impl_suffix: '',
     lock_path: '/run/lock/goviral-prompt-command-center.lock',
     trigger_args: ['run-all', '--write'],
     version: 'GOVIRAL_CONCURRENCY_GUARD_V3',
@@ -51,25 +51,17 @@ describe('generateConcurrencyGuard', () => {
     expect(guard).toContain('GOVIRAL_CONCURRENCY_GUARD_V3');
   });
 
-  test('uses flock with -n (non-blocking)', () => {
-    expect(guard).toContain('flock -n -E 200');
+  test('sources the shared guard library', () => {
+    expect(guard).toContain('source /usr/local/bin/goviral-lib-concurrency-guard.sh');
   });
 
-  test('outputs overlap_skipped=true on lock conflict', () => {
-    expect(guard).toContain('overlap_skipped=true');
+  test('calls concurrency_guard function with workflow name', () => {
+    expect(guard).toContain('concurrency_guard "goviral-prompt-command-center" "$@"');
   });
 
-  test('uses correct lock path', () => {
-    expect(guard).toContain('/run/lock/goviral-prompt-command-center.lock');
-  });
-
-  test('uses exec for non-trigger invocations', () => {
-    expect(guard).toContain('exec "$IMPL" "$@"');
-  });
-
-  test('checks trigger args', () => {
-    expect(guard).toContain('run-all');
-    expect(guard).toContain('--write');
+  test('guards against recursive invocation', () => {
+    expect(guard).toContain('_GOVIRAL_GUARD_ACTIVE');
+    expect(guard).toContain('exit 99');
   });
 
   test('has valid shell syntax', async () => {
@@ -375,14 +367,14 @@ describe('production immutability', () => {
     for (const guard of [
       {
         name: 'goviral-prompt-command-center',
-        impl_suffix: '.impl',
+        impl_suffix: '',
         lock_path: '/run/lock/goviral-prompt-command-center.lock',
         trigger_args: ['run-all', '--write'],
         version: 'GOVIRAL_CONCURRENCY_GUARD_V3',
       },
       {
         name: 'goviral-brain-auto-workflow',
-        impl_suffix: '.impl',
+        impl_suffix: '',
         lock_path: '/run/lock/goviral-brain-auto-workflow.lock',
         trigger_args: ['run-all', '--write'],
         version: 'GOVIRAL_CONCURRENCY_GUARD_V3',

@@ -210,24 +210,40 @@ do_install() {
     /usr/local/bin/goviral-lib-concurrency-guard.sh
   log "  installed goviral-lib-concurrency-guard.sh"
 
-  # For each guarded workflow: restore original from .impl if hotfix is active,
-  # then install the canonical guard wrapper
+  # For each guarded workflow:
+  #   1. If the production hotfix is active (.impl.* exists), restore the
+  #      original implementation from .impl back to the base name.
+  #   2. Install the canonical guard wrapper as -guard.
+  #
+  # After this step:
+  #   /usr/local/bin/<name>       = original implementation (unguarded)
+  #   /usr/local/bin/<name>-guard = guard wrapper (the systemd entrypoint)
+  #
+  # The guard wrapper sources lib-concurrency-guard.sh which invokes the
+  # implementation at /usr/local/bin/<name> through flock.
   for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
     impl_file="$(ls "/usr/local/bin/${script}.impl."* 2>/dev/null | head -1 || true)"
 
     if [ -n "$impl_file" ] && [ -f "$impl_file" ]; then
-      # Production hotfix is in place: restore original implementation
+      # Production hotfix is active: the base name is the hotfix guard,
+      # the .impl file is the real implementation. Restore the original.
       log "  restoring $script from hotfix .impl: $(basename "$impl_file")"
       cp -p "$impl_file" "/usr/local/bin/$script"
       chmod 0755 "/usr/local/bin/$script"
       # Keep .impl file as safety backup (do NOT delete)
     fi
 
-    # Install guard wrapper as a separate -guard file
+    # Verify the implementation exists at the base name before installing the guard
+    if [ ! -f "/usr/local/bin/$script" ]; then
+      fail "Implementation missing: /usr/local/bin/$script"
+      return 1
+    fi
+
+    # Install guard wrapper as -guard (the entrypoint that systemd invokes)
     install -o root -g root -m 0755 \
       "$OPS/${script}-guard" \
       "/usr/local/bin/${script}-guard"
-    log "  installed ${script}-guard"
+    log "  installed ${script}-guard (systemd entrypoint)"
   done
 
   # ── 5. Run concurrency canary tests ────────────────────────────────────────
@@ -404,25 +420,60 @@ do_verify() {
   # ── Web UI bundle ──────────────────────────────────────────────────────────
   [ -f "$SRC/packages/web/dist/index.html" ] && pass "Web UI bundle present" || fail "Web UI bundle missing"
 
-  # ── Concurrency canaries ───────────────────────────────────────────────────
+  # ── Concurrency guard chain ─────────────────────────────────────────────────
   for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
-    # The guard wrapper OR the original with hotfix must be present
+    # 1. Guard wrapper must exist and contain the guard-active marker
     if [ -f "/usr/local/bin/${script}-guard" ]; then
       if head -5 "/usr/local/bin/${script}-guard" | grep -q '_GOVIRAL_GUARD_ACTIVE'; then
-        pass "Canonical guard installed: ${script}-guard"
+        pass "Guard wrapper installed: ${script}-guard"
       else
         fail "Guard marker missing in ${script}-guard"
       fi
-    elif head -5 "/usr/local/bin/$script" 2>/dev/null | grep -q 'CONCURRENCY_GUARD'; then
-      pass "Legacy hotfix guard present: $script"
     else
-      fail "No concurrency guard for: $script"
+      fail "Guard wrapper missing: /usr/local/bin/${script}-guard"
+    fi
+
+    # 2. Implementation must exist at the base name (what the guard invokes)
+    if [ -f "/usr/local/bin/$script" ]; then
+      pass "Implementation present: $script"
+    else
+      fail "Implementation missing: /usr/local/bin/$script"
+    fi
+
+    # 3. The systemd service must invoke the -guard, not the base name
+    local svc_exec
+    svc_exec="$(grep '^ExecStart=' "/etc/systemd/system/${script}.service" 2>/dev/null || true)"
+    if echo "$svc_exec" | grep -q "${script}-guard"; then
+      pass "Service invokes guard: ${script}.service"
+    elif [ -n "$svc_exec" ]; then
+      fail "Service invokes wrong path: $svc_exec (should use ${script}-guard)"
+    else
+      warn "Service file not found: ${script}.service"
     fi
   done
 
   # Verify guard library installed
   [ -f "/usr/local/bin/goviral-lib-concurrency-guard.sh" ] && \
     pass "Guard library installed" || fail "Guard library missing"
+
+  # Functional flock canary: verify the guard actually acquires and releases a lock
+  log "  Running functional flock canary..."
+  for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
+    local canary_lock="${LOCK_DIR:-/run/lock}/${script}.canary.lock"
+    rm -f "$canary_lock" 2>/dev/null || true
+    if /usr/bin/flock -n -E 200 "$canary_lock" /bin/true; then
+      rm -f "$canary_lock" 2>/dev/null || true
+      # Verify second acquisition succeeds (lock was released)
+      if /usr/bin/flock -n -E 200 "$canary_lock" /bin/true; then
+        pass "Flock canary: $script (acquire/release/re-acquire)"
+      else
+        fail "Flock canary: $script re-acquire failed"
+      fi
+      rm -f "$canary_lock" 2>/dev/null || true
+    else
+      fail "Flock canary: $script initial acquire failed (rc=$?)"
+    fi
+  done
 
   # ── Timers ─────────────────────────────────────────────────────────────────
   for timer in \
@@ -448,14 +499,18 @@ do_verify() {
     log "    ${timer}: ${cal:-$boot}"
   done
 
-  # Verify finite timeouts on services
-  for svc in goviral-archon-backup goviral-control-healthcheck goviral-archon-upgrade-check goviral-analytics-rollup; do
+  # Verify finite timeouts on ALL services (no unit should run forever)
+  for svc in \
+    goviral-archon-backup goviral-control-healthcheck goviral-archon-upgrade-check \
+    goviral-analytics-rollup goviral-prompt-command-center goviral-brain-auto-workflow \
+    goviral-daily-ops-report goviral-telegram-notifier goviral-control-canary
+  do
     local rmax
     rmax="$(systemctl show "${svc}.service" --property=RuntimeMaxUSec 2>/dev/null | cut -d= -f2 || true)"
     if [ "$rmax" != "infinity" ] && [ -n "$rmax" ]; then
       pass "Finite RuntimeMaxSec: ${svc} ($rmax)"
     else
-      warn "No finite RuntimeMaxSec: ${svc}"
+      fail "No finite RuntimeMaxSec: ${svc}"
     fi
   done
 
@@ -568,6 +623,15 @@ do_rollback() {
   else
     fail "Service failed to start after rollback"
   fi
+
+  # Verify the rollback restored the production hotfix guard
+  for script in goviral-prompt-command-center goviral-brain-auto-workflow; do
+    if head -5 "/usr/local/bin/$script" 2>/dev/null | grep -q 'CONCURRENCY_GUARD\|_GOVIRAL_GUARD_ACTIVE'; then
+      pass "Production guard restored: $script"
+    else
+      warn "Guard not verified after rollback: $script (check manually)"
+    fi
+  done
 
   log "Rollback complete from: $latest_backup"
 }
