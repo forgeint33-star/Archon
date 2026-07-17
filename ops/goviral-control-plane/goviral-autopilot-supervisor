@@ -20,8 +20,13 @@ if [ -f "$QUARANTINE_LIB" ]; then
   source "$QUARANTINE_LIB"
 else
   # Fallback: inline quarantine check (defense-in-depth)
-  QUARANTINE_MARKER="${GOVIRAL_QUARANTINE_MARKER:-/run/goviral-heavy-automation-quarantined}"
-  is_heavy_quarantined() { [ -f "$QUARANTINE_MARKER" ]; }
+  QUARANTINE_MARKER_PERSISTENT="${GOVIRAL_QUARANTINE_MARKER_PERSISTENT:-/var/lib/goviral-archon/.archon/heavy-automation-quarantined}"
+  QUARANTINE_MARKER_RUNTIME="${GOVIRAL_QUARANTINE_MARKER_RUNTIME:-/run/goviral-heavy-automation-quarantined}"
+  if [ -n "${GOVIRAL_QUARANTINE_MARKER:-}" ]; then
+    QUARANTINE_MARKER_PERSISTENT="$GOVIRAL_QUARANTINE_MARKER"
+    QUARANTINE_MARKER_RUNTIME="$GOVIRAL_QUARANTINE_MARKER"
+  fi
+  is_heavy_quarantined() { [ -f "$QUARANTINE_MARKER_PERSISTENT" ] || [ -f "$QUARANTINE_MARKER_RUNTIME" ]; }
   is_quarantined_timer() {
     case "$1" in
       goviral-unified-autopilot.timer|goviral-nl-autopilot-router.timer|\

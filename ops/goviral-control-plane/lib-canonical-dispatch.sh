@@ -25,7 +25,13 @@ LOCK_DIR="${GOVIRAL_LOCK_DIR:-/run/lock}"
 METRICS_DIR="${GOVIRAL_METRICS_DIR:-/var/lib/goviral-archon/.archon/concurrency-metrics}"
 BIN_DIR="${GOVIRAL_BIN_DIR:-/usr/local/bin}"
 CAPACITY_STATE="${GOVIRAL_CAPACITY_STATE:-/run/goviral-capacity}"
-QUARANTINE_MARKER="${GOVIRAL_QUARANTINE_MARKER:-/run/goviral-heavy-automation-quarantined}"
+QUARANTINE_MARKER_PERSISTENT="${GOVIRAL_QUARANTINE_MARKER_PERSISTENT:-/var/lib/goviral-archon/.archon/heavy-automation-quarantined}"
+QUARANTINE_MARKER_RUNTIME="${GOVIRAL_QUARANTINE_MARKER_RUNTIME:-/run/goviral-heavy-automation-quarantined}"
+# Legacy env var support: single marker override for backwards compat
+if [ -n "${GOVIRAL_QUARANTINE_MARKER:-}" ]; then
+  QUARANTINE_MARKER_PERSISTENT="$GOVIRAL_QUARANTINE_MARKER"
+  QUARANTINE_MARKER_RUNTIME="$GOVIRAL_QUARANTINE_MARKER"
+fi
 
 # ── Global backpressure configuration ─────────────────────────────────────────
 MAX_HEAVY_WORKFLOWS="${GOVIRAL_MAX_HEAVY_WORKFLOWS:-2}"
@@ -41,7 +47,8 @@ HEAVY_WORKFLOWS=(
 # ── Quarantine check ─────────────────────────────────────────────────────────
 _is_quarantined_heavy() {
   local workflow="$1"
-  if [ ! -f "$QUARANTINE_MARKER" ]; then
+  # Check both persistent and runtime quarantine markers
+  if [ ! -f "$QUARANTINE_MARKER_PERSISTENT" ] && [ ! -f "$QUARANTINE_MARKER_RUNTIME" ]; then
     return 1  # Not quarantined
   fi
   for wf in "${HEAVY_WORKFLOWS[@]}"; do
@@ -208,9 +215,10 @@ canonical_dispatch() {
   if _is_quarantined_heavy "$workflow"; then
     echo "quarantined=true"
     echo "workflow=${workflow}"
-    echo "marker=${QUARANTINE_MARKER}"
+    echo "persistent_marker=${QUARANTINE_MARKER_PERSISTENT}"
+    echo "runtime_marker=${QUARANTINE_MARKER_RUNTIME}"
     echo "action=refused (heavy automation quarantined)"
-    _emit_dispatch_metric "$workflow" "quarantine_refused" "marker=$QUARANTINE_MARKER"
+    _emit_dispatch_metric "$workflow" "quarantine_refused" "persistent=$QUARANTINE_MARKER_PERSISTENT"
     return 0
   fi
 

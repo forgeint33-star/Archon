@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# goviral-quarantine — Administrative command for heavy automation quarantine.
+#
+# Subcommands:
+#   activate     Create persistent marker, disable+stop the 5 quarantined timers,
+#                remove enabled symlinks. Supervisor will respect the marker.
+#   deactivate   Remove persistent and runtime markers. Does NOT start timers.
+#   enable-timers  (Post-deactivate) Verified controlled enablement of timers.
+#   status       Print quarantine state and timer status.
+#
+# Must be run as root.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+PERSISTENT_MARKER="/var/lib/goviral-archon/.archon/heavy-automation-quarantined"
+RUNTIME_MARKER="/run/goviral-heavy-automation-quarantined"
+
+QUARANTINED_TIMERS=(
+  goviral-unified-autopilot.timer
+  goviral-nl-autopilot-router.timer
+  goviral-prompt-command-center.timer
+  goviral-brain-auto-workflow.timer
+  goviral-autopilot-supervisor.timer
+)
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: goviral-quarantine must be run as root." >&2
+  exit 1
+fi
+
+do_activate() {
+  echo "=== ACTIVATING HEAVY AUTOMATION QUARANTINE ==="
+
+  # 1. Create persistent marker
+  mkdir -p "$(dirname "$PERSISTENT_MARKER")"
+  cat > "$PERSISTENT_MARKER" <<MARKER
+# GoViral Heavy Automation Quarantine
+# Created: $(date -u +%FT%TZ)
+# Created by: $(whoami) (pid=$$)
+#
+# This file prevents the supervisor, watchdog, deploy, and dispatch
+# scripts from starting or enabling the quarantined timers.
+#
+# Remove with: goviral-quarantine deactivate
+# Then enable timers with: goviral-quarantine enable-timers
+MARKER
+  chmod 0644 "$PERSISTENT_MARKER"
+  echo "  persistent marker created: $PERSISTENT_MARKER"
+
+  # 2. Create runtime mirror
+  cat > "$RUNTIME_MARKER" <<MARKER
+# Runtime mirror of persistent quarantine marker.
+# Source of truth: $PERSISTENT_MARKER
+MARKER
+  chmod 0644 "$RUNTIME_MARKER"
+  echo "  runtime marker created: $RUNTIME_MARKER"
+
+  # 3. Disable + stop the 5 quarantined timers (removes enabled symlinks)
+  for timer in "${QUARANTINED_TIMERS[@]}"; do
+    if systemctl cat "$timer" >/dev/null 2>&1; then
+      systemctl disable --now "$timer" 2>/dev/null || true
+      echo "  disabled+stopped: $timer"
+    else
+      echo "  not installed: $timer"
+    fi
+  done
+
+  echo ""
+  echo "quarantined=true"
+  echo "persistent_marker=$PERSISTENT_MARKER"
+  echo "runtime_marker=$RUNTIME_MARKER"
+  echo ""
+  echo "Timers are disabled and stopped. Enabled symlinks removed."
+  echo "Supervisor will skip all managed timers on next cycle."
+  echo "Reboot will NOT reactivate timers (persistent marker + symlinks removed)."
+  echo ""
+  echo "To lift quarantine later:"
+  echo "  1. goviral-quarantine deactivate"
+  echo "  2. goviral-quarantine enable-timers"
+}
+
+do_deactivate() {
+  echo "=== DEACTIVATING HEAVY AUTOMATION QUARANTINE ==="
+
+  if [ -f "$PERSISTENT_MARKER" ]; then
+    rm -f "$PERSISTENT_MARKER"
+    echo "  removed persistent marker: $PERSISTENT_MARKER"
+  else
+    echo "  persistent marker not present (already deactivated)"
+  fi
+
+  if [ -f "$RUNTIME_MARKER" ]; then
+    rm -f "$RUNTIME_MARKER"
+    echo "  removed runtime marker: $RUNTIME_MARKER"
+  else
+    echo "  runtime marker not present"
+  fi
+
+  echo ""
+  echo "quarantined=false"
+  echo ""
+  echo "Quarantine lifted. Timers are NOT automatically started."
+  echo "To re-enable timers, run: goviral-quarantine enable-timers"
+}
+
+do_enable_timers() {
+  echo "=== CONTROLLED TIMER ENABLEMENT ==="
+
+  # Refuse if quarantine is still active
+  if [ -f "$PERSISTENT_MARKER" ] || [ -f "$RUNTIME_MARKER" ]; then
+    echo "ERROR: Quarantine is still active. Deactivate first:" >&2
+    echo "  goviral-quarantine deactivate" >&2
+    exit 1
+  fi
+
+  for timer in "${QUARANTINED_TIMERS[@]}"; do
+    if systemctl cat "$timer" >/dev/null 2>&1; then
+      systemctl enable --now "$timer" 2>/dev/null || true
+      local state
+      state="$(systemctl is-active "$timer" 2>/dev/null || true)"
+      echo "  enabled: $timer (active=$state)"
+    else
+      echo "  not installed: $timer"
+    fi
+  done
+
+  echo ""
+  echo "timers_enabled=true"
+  echo "quarantined=false"
+}
+
+do_status() {
+  echo "=== QUARANTINE STATUS ==="
+
+  local quarantined="false"
+  if [ -f "$PERSISTENT_MARKER" ]; then
+    echo "persistent_marker=present ($PERSISTENT_MARKER)"
+    quarantined="true"
+  else
+    echo "persistent_marker=absent"
+  fi
+
+  if [ -f "$RUNTIME_MARKER" ]; then
+    echo "runtime_marker=present ($RUNTIME_MARKER)"
+    quarantined="true"
+  else
+    echo "runtime_marker=absent"
+  fi
+
+  echo "quarantined=$quarantined"
+  echo ""
+
+  for timer in "${QUARANTINED_TIMERS[@]}"; do
+    local active enabled
+    active="$(systemctl is-active "$timer" 2>/dev/null || echo "not-found")"
+    enabled="$(systemctl is-enabled "$timer" 2>/dev/null || echo "not-found")"
+    echo "  $timer  enabled=$enabled  active=$active"
+  done
+}
+
+case "${1:-status}" in
+  activate)      do_activate ;;
+  deactivate)    do_deactivate ;;
+  enable-timers) do_enable_timers ;;
+  status)        do_status ;;
+  *)             echo "Usage: goviral-quarantine activate|deactivate|enable-timers|status" >&2; exit 1 ;;
+esac

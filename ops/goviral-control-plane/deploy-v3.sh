@@ -314,17 +314,32 @@ do_install() {
   systemctl daemon-reload
   pass "systemd daemon-reload"
 
-  # Enable safe timers
+  # Enable safe (lightweight) timers
   for timer in \
     goviral-archon-backup \
     goviral-control-healthcheck \
     goviral-archon-upgrade-check \
-    goviral-analytics-rollup \
-    goviral-prompt-command-center \
-    goviral-brain-auto-workflow
+    goviral-analytics-rollup
   do
     systemctl enable --now "${timer}.timer" 2>/dev/null && log "  enabled ${timer}.timer" || warn "Could not enable ${timer}.timer"
   done
+
+  # Heavy timers: respect quarantine marker (Phase 0.5.2)
+  local _q_persistent="/var/lib/goviral-archon/.archon/heavy-automation-quarantined"
+  local _q_runtime="/run/goviral-heavy-automation-quarantined"
+  if [ -f "$_q_persistent" ] || [ -f "$_q_runtime" ]; then
+    warn "Quarantine active — NOT enabling heavy timers (prompt-command-center, brain-auto-workflow)"
+    warn "  Persistent: $_q_persistent ($([ -f "$_q_persistent" ] && echo 'present' || echo 'absent'))"
+    warn "  Runtime: $_q_runtime ($([ -f "$_q_runtime" ] && echo 'present' || echo 'absent'))"
+    warn "  To enable later: goviral-quarantine deactivate && goviral-quarantine enable-timers"
+  else
+    for timer in \
+      goviral-prompt-command-center \
+      goviral-brain-auto-workflow
+    do
+      systemctl enable --now "${timer}.timer" 2>/dev/null && log "  enabled ${timer}.timer" || warn "Could not enable ${timer}.timer"
+    done
+  fi
 
   # Telegram timers (only if credentials exist)
   if [ -f "$CRED_DIR/telegram-bot-token" ] && [ -f "$CRED_DIR/telegram-chat-id" ]; then

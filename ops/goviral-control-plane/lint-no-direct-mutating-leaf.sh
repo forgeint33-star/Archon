@@ -33,6 +33,7 @@ ALLOWED_FILES=(
   "goviral-prompt-command-center-guard"
   "goviral-brain-auto-workflow-guard"
   "goviral-autopilot-supervisor"
+  "goviral-quarantine"
   "test-concurrency-guard.sh"
   "test-canonical-dispatch.sh"
   "test-phase05.sh"

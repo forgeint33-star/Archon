@@ -6,6 +6,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/var/lib/goviral-archon/workspaces/goviral-brain
+
+# Defense-in-depth: refuse to start when quarantined (persistent OR runtime marker)
+ExecStartPre=/bin/bash -c '[ ! -f /var/lib/goviral-archon/.archon/heavy-automation-quarantined ] && [ ! -f /run/goviral-heavy-automation-quarantined ]'
+
 ExecStart=/usr/local/bin/goviral-brain-auto-workflow-guard run-all --write
 User=root
 

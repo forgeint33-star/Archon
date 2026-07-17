@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# GoViral Control Plane v3.1 — Phase 0.5 Stabilization deployment.
+# GoViral Control Plane v3.1 — Phase 0.5.2 Stabilization deployment.
 #
 # Extends deploy-v3.sh with:
-#   - Canonical dispatch library
+#   - Canonical dispatch library + quarantine library
 #   - Orchestrator guard wrappers (unified-autopilot, nl-autopilot-router)
-#   - Hardened orchestrator systemd units
+#   - Hardened orchestrator systemd units with ExecStartPre quarantine check
 #   - Staggered timers with Persistent=false
 #   - Global backpressure enforcement
 #   - Workspace scan library
+#   - Hardened autopilot supervisor (quarantine-aware)
+#   - Quarantine admin command (goviral-quarantine)
+#   - Reboot-safe persistent quarantine marker
 #
 # Modes:
 #   --dry-run      Preflight checks only (no changes)
@@ -31,10 +34,27 @@ APPROVAL_QUEUE="/var/lib/goviral-archon/workspaces/goviral-brain/.governance/app
 MODE="${1:---dry-run}"
 ERRORS=0
 
+# Quarantine markers
+QUARANTINE_PERSISTENT="/var/lib/goviral-archon/.archon/heavy-automation-quarantined"
+QUARANTINE_RUNTIME="/run/goviral-heavy-automation-quarantined"
+
+# The five quarantined timers
+QUARANTINED_TIMERS=(
+  goviral-unified-autopilot.timer
+  goviral-nl-autopilot-router.timer
+  goviral-prompt-command-center.timer
+  goviral-brain-auto-workflow.timer
+  goviral-autopilot-supervisor.timer
+)
+
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 pass() { log "PASS: $*"; }
 fail() { log "FAIL: $*"; ERRORS=$((ERRORS + 1)); }
 warn() { log "WARN: $*"; }
+
+is_quarantined() {
+  [ -f "$QUARANTINE_PERSISTENT" ] || [ -f "$QUARANTINE_RUNTIME" ]
+}
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: This script must be run as root." >&2
@@ -45,7 +65,7 @@ fi
 # PREFLIGHT
 # ═══════════════════════════════════════════════════════════════════════════════
 preflight() {
-  log "=== PREFLIGHT (v3.1 Phase 0.5) ==="
+  log "=== PREFLIGHT (v3.1 Phase 0.5.2) ==="
 
   local branch
   branch="$(git -C "$SRC" branch --show-current 2>/dev/null || echo unknown)"
@@ -63,6 +83,7 @@ preflight() {
     lib-workspace-scan.sh \
     lib-quarantine.sh \
     goviral-autopilot-supervisor \
+    goviral-quarantine \
     goviral-prompt-command-center-guard \
     goviral-brain-auto-workflow-guard \
     goviral-unified-autopilot-guard \
@@ -79,6 +100,20 @@ preflight() {
     [ -f "$OPS/$f" ] && pass "$f present" || fail "$f missing"
   done
 
+  # Service units must have ExecStartPre quarantine check
+  for svc in \
+    goviral-prompt-command-center.service \
+    goviral-brain-auto-workflow.service \
+    goviral-unified-autopilot.service \
+    goviral-nl-autopilot-router.service
+  do
+    if grep -q "ExecStartPre=.*heavy-automation-quarantined" "$OPS/$svc" 2>/dev/null; then
+      pass "ExecStartPre quarantine check: $svc"
+    else
+      fail "Missing ExecStartPre quarantine check: $svc"
+    fi
+  done
+
   # Approval queue integrity
   if [ -f "$APPROVAL_QUEUE" ]; then
     AQ_HASH_BEFORE="$(sha256sum "$APPROVAL_QUEUE" | cut -d' ' -f1)"
@@ -88,18 +123,28 @@ preflight() {
     AQ_HASH_BEFORE=""
   fi
 
-  # Quarantine marker check
-  QUARANTINE_MARKER="/run/goviral-heavy-automation-quarantined"
-  if [ -f "$QUARANTINE_MARKER" ]; then
-    pass "Quarantine marker present: $QUARANTINE_MARKER"
+  # Quarantine marker status
+  log "--- Quarantine status ---"
+  if [ -f "$QUARANTINE_PERSISTENT" ]; then
+    pass "Persistent quarantine marker present: $QUARANTINE_PERSISTENT"
   else
-    warn "Quarantine marker NOT present — supervisor may re-enable timers during deploy"
-    warn "  Create it: touch $QUARANTINE_MARKER"
+    warn "Persistent quarantine marker NOT present"
+  fi
+  if [ -f "$QUARANTINE_RUNTIME" ]; then
+    log "  Runtime quarantine marker present: $QUARANTINE_RUNTIME"
+  else
+    log "  Runtime quarantine marker absent"
+  fi
+
+  if ! is_quarantined; then
+    warn "Quarantine is NOT active — supervisor may re-enable timers during deploy"
+    warn "  Activate with: goviral-quarantine activate"
+    warn "  Or manually: touch $QUARANTINE_PERSISTENT && touch $QUARANTINE_RUNTIME"
   fi
 
   # Supervisor timer: must be stopped or quarantine must be active
   if systemctl is-active goviral-autopilot-supervisor.timer >/dev/null 2>&1; then
-    if [ ! -f "$QUARANTINE_MARKER" ]; then
+    if ! is_quarantined; then
       fail "goviral-autopilot-supervisor.timer is active WITHOUT quarantine — it will re-enable heavy timers within 2 minutes"
     else
       warn "goviral-autopilot-supervisor.timer is active but quarantine is set (safe — supervisor will skip heavy timers)"
@@ -122,7 +167,6 @@ preflight() {
 
     case "$active_state" in
       active|activating)
-        # Try to identify who last started this timer
         local invocation_id trigger_info
         invocation_id="$(systemctl show -p InvocationID --value "${timer}.timer" 2>/dev/null || true)"
         trigger_info="$(systemctl show -p TriggeredBy --value "${timer}.timer" 2>/dev/null || true)"
@@ -130,7 +174,7 @@ preflight() {
         log "  InvocationID: ${invocation_id:-unknown}"
         log "  TriggeredBy: ${trigger_info:-unknown}"
         log "  LIKELY CAUSE: goviral-autopilot-supervisor re-enabled it"
-        log "  FIX: touch $QUARANTINE_MARKER && systemctl stop ${timer}.timer"
+        log "  FIX: goviral-quarantine activate"
         ;;
       inactive)
         pass "Timer ${timer}.timer is inactive (safe)"
@@ -139,7 +183,6 @@ preflight() {
         pass "Timer ${timer}.timer is failed (safe — not running)"
         ;;
       *)
-        # not-found or other
         if [ "$load_state" = "not-found" ]; then
           pass "Timer ${timer}.timer is not-found (not installed — safe)"
         else
@@ -147,6 +190,15 @@ preflight() {
         fi
         ;;
     esac
+  done
+
+  # Runtime mask detection
+  for timer in "${QUARANTINED_TIMERS[@]}"; do
+    local load
+    load="$(systemctl show -p LoadState --value "$timer" 2>/dev/null || echo "not-found")"
+    if [ "$load" = "masked" ]; then
+      log "  MASKED: $timer (load=masked) — will preserve mask"
+    fi
   done
 
   # Archon service should be healthy
@@ -167,10 +219,10 @@ preflight() {
 # INSTALL
 # ═══════════════════════════════════════════════════════════════════════════════
 do_install() {
-  log "=== INSTALL (v3.1 Phase 0.5) ==="
+  log "=== INSTALL (v3.1 Phase 0.5.2) ==="
 
   # ── 1. Backup ──────────────────────────────────────────────────────────────
-  log "[1/6] Backing up current state..."
+  log "[1/8] Backing up current state..."
   mkdir -p "$BACKUP_DIR/scripts" "$BACKUP_DIR/units"
 
   for f in \
@@ -180,7 +232,7 @@ do_install() {
     goviral-brain-auto-workflow goviral-brain-auto-workflow-guard \
     goviral-lib-concurrency-guard.sh goviral-lib-canonical-dispatch.sh \
     goviral-lib-workspace-scan.sh goviral-lib-quarantine.sh \
-    goviral-autopilot-supervisor
+    goviral-autopilot-supervisor goviral-quarantine
   do
     [ -f "/usr/local/bin/$f" ] && cp -p "/usr/local/bin/$f" "$BACKUP_DIR/scripts/$f"
   done
@@ -189,7 +241,8 @@ do_install() {
     goviral-unified-autopilot.service goviral-unified-autopilot.timer \
     goviral-nl-autopilot-router.service goviral-nl-autopilot-router.timer \
     goviral-prompt-command-center.service goviral-prompt-command-center.timer \
-    goviral-brain-auto-workflow.service goviral-brain-auto-workflow.timer
+    goviral-brain-auto-workflow.service goviral-brain-auto-workflow.timer \
+    goviral-autopilot-supervisor.service goviral-autopilot-supervisor.timer
   do
     [ -f "/etc/systemd/system/$unit" ] && cp -p "/etc/systemd/system/$unit" "$BACKUP_DIR/units/$unit"
   done
@@ -197,19 +250,21 @@ do_install() {
   pass "Backup complete: $BACKUP_DIR"
 
   # ── 2. Install libraries ──────────────────────────────────────────────────
-  log "[2/6] Installing libraries..."
+  log "[2/8] Installing libraries..."
   install -o root -g root -m 0644 "$OPS/lib-concurrency-guard.sh" /usr/local/bin/goviral-lib-concurrency-guard.sh
   install -o root -g root -m 0644 "$OPS/lib-canonical-dispatch.sh" /usr/local/bin/goviral-lib-canonical-dispatch.sh
   install -o root -g root -m 0644 "$OPS/lib-workspace-scan.sh" /usr/local/bin/goviral-lib-workspace-scan.sh
   install -o root -g root -m 0644 "$OPS/lib-quarantine.sh" /usr/local/bin/goviral-lib-quarantine.sh
   pass "Libraries installed"
 
-  # Install hardened supervisor (quarantine-aware)
+  # ── 3. Install supervisor + quarantine admin ──────────────────────────────
+  log "[3/8] Installing supervisor and quarantine admin..."
   install -o root -g root -m 0755 "$OPS/goviral-autopilot-supervisor" /usr/local/bin/goviral-autopilot-supervisor
-  pass "Hardened supervisor installed"
+  install -o root -g root -m 0755 "$OPS/goviral-quarantine" /usr/local/bin/goviral-quarantine
+  pass "Supervisor and quarantine admin installed"
 
-  # ── 3. Install guard wrappers ──────────────────────────────────────────────
-  log "[3/6] Installing guard wrappers..."
+  # ── 4. Install guard wrappers ──────────────────────────────────────────────
+  log "[4/8] Installing guard wrappers..."
   for script in \
     goviral-unified-autopilot-guard \
     goviral-nl-autopilot-router-guard \
@@ -232,8 +287,8 @@ do_install() {
 
   pass "Guard wrappers installed"
 
-  # ── 4. Run tests ───────────────────────────────────────────────────────────
-  log "[4/6] Running Phase 0.5 tests..."
+  # ── 5. Run tests ───────────────────────────────────────────────────────────
+  log "[5/8] Running Phase 0.5 tests..."
   if bash "$OPS/test-phase05.sh"; then
     pass "Phase 0.5 tests passed"
   else
@@ -248,8 +303,8 @@ do_install() {
     return 1
   fi
 
-  # ── 5. Install systemd units ──────────────────────────────────────────────
-  log "[5/6] Installing systemd units..."
+  # ── 6. Install systemd units ──────────────────────────────────────────────
+  log "[6/8] Installing systemd units..."
   for unit in \
     goviral-unified-autopilot.service goviral-unified-autopilot.timer \
     goviral-nl-autopilot-router.service goviral-nl-autopilot-router.timer \
@@ -263,16 +318,44 @@ do_install() {
   systemctl daemon-reload
   pass "systemd daemon-reload complete"
 
-  # ── 6. Verify (do NOT enable timers — that's a separate operator step) ───
-  log "[6/6] Post-install verification..."
+  # ── 7. Disable quarantined timers (remove enabled symlinks) ───────────────
+  log "[7/8] Disabling quarantined timers (removing enabled symlinks)..."
+  for timer in "${QUARANTINED_TIMERS[@]}"; do
+    if systemctl cat "$timer" >/dev/null 2>&1; then
+      systemctl disable --now "$timer" 2>/dev/null || true
+      log "  disabled+stopped: $timer"
+    else
+      log "  not installed (skip): $timer"
+    fi
+  done
+  pass "Quarantined timers disabled — enabled symlinks removed"
+
+  # Do NOT remove quarantine markers (persistent or runtime)
+  if is_quarantined; then
+    log "  Quarantine markers preserved (persistent + runtime)"
+  fi
+
+  # Do NOT enable heavy timers — that's a separate operator step
+
+  # ── 8. Verify ──────────────────────────────────────────────────────────────
+  log "[8/8] Post-install verification..."
   do_verify
+
+  log ""
+  log "══════════════════════════════════════════════════════════"
+  log " Installation complete. Timers are DISABLED."
+  log ""
+  log " To activate timers after verification:"
+  log "   1. goviral-quarantine deactivate"
+  log "   2. goviral-quarantine enable-timers"
+  log "══════════════════════════════════════════════════════════"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VERIFY
 # ═══════════════════════════════════════════════════════════════════════════════
 do_verify() {
-  log "=== VERIFY (v3.1 Phase 0.5) ==="
+  log "=== VERIFY (v3.1 Phase 0.5.2) ==="
 
   # Guard chain
   for script in goviral-unified-autopilot goviral-nl-autopilot-router \
@@ -301,15 +384,38 @@ do_verify() {
       else
         fail "Service missing timeout: $script"
       fi
+      if grep -q "ExecStartPre=.*heavy-automation-quarantined" "$svc" 2>/dev/null; then
+        pass "Service has ExecStartPre quarantine check: $script"
+      else
+        fail "Service missing ExecStartPre quarantine check: $script"
+      fi
     else
       fail "Service file missing: $svc"
     fi
   done
 
   # Libraries
-  for lib in goviral-lib-concurrency-guard.sh goviral-lib-canonical-dispatch.sh goviral-lib-workspace-scan.sh; do
+  for lib in goviral-lib-concurrency-guard.sh goviral-lib-canonical-dispatch.sh \
+    goviral-lib-workspace-scan.sh goviral-lib-quarantine.sh
+  do
     [ -f "/usr/local/bin/$lib" ] && pass "Library: $lib" || fail "Library missing: $lib"
   done
+
+  # Admin commands
+  [ -f "/usr/local/bin/goviral-quarantine" ] && [ -x "/usr/local/bin/goviral-quarantine" ] \
+    && pass "Quarantine admin: goviral-quarantine" \
+    || fail "Missing or not executable: goviral-quarantine"
+
+  # Supervisor
+  if [ -f "/usr/local/bin/goviral-autopilot-supervisor" ]; then
+    if grep -q "is_heavy_quarantined\|lib-quarantine" "/usr/local/bin/goviral-autopilot-supervisor" 2>/dev/null; then
+      pass "Supervisor is quarantine-aware"
+    else
+      fail "Supervisor is NOT quarantine-aware (old v1?)"
+    fi
+  else
+    fail "Supervisor missing"
+  fi
 
   # Timer properties
   for timer_name in goviral-unified-autopilot goviral-nl-autopilot-router \
@@ -348,6 +454,12 @@ do_rollback() {
   [ -d "$latest/scripts" ] && cp -p "$latest/scripts"/* /usr/local/bin/ 2>/dev/null || true
   [ -d "$latest/units" ] && cp -p "$latest/units"/* /etc/systemd/system/ 2>/dev/null || true
   systemctl daemon-reload
+
+  # Do NOT remove quarantine markers during rollback
+  if is_quarantined; then
+    log "  Quarantine markers preserved during rollback"
+  fi
+
   pass "Rollback complete"
 }
 

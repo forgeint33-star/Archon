@@ -781,10 +781,301 @@ else
   pass "approval queue check skipped (not on production host)"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 28: Persistent quarantine marker detection"
+# ═══════════════════════════════════════════════════════════════════════════════
+# The quarantine library must detect persistent marker at the canonical path.
+QTEST_DIR="$(mktemp -d)"
+QMARKER_P="$QTEST_DIR/persistent-marker"
+QMARKER_R="$QTEST_DIR/runtime-marker"
+touch "$QMARKER_P"
+# Do NOT create runtime marker — persistent alone must suffice
+
+output="$(
+  GOVIRAL_QUARANTINE_MARKER_PERSISTENT="$QMARKER_P" \
+  GOVIRAL_QUARANTINE_MARKER_RUNTIME="$QMARKER_R" \
+  bash -c 'source "'"$SCRIPT_DIR"'/lib-quarantine.sh"
+    if is_heavy_quarantined; then echo "quarantined_via_persistent=true"; fi
+  '
+)" 2>&1
+
+if echo "$output" | grep -q "quarantined_via_persistent=true"; then
+  pass "persistent marker alone activates quarantine"
+else
+  fail "persistent marker detection" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 29: Optional runtime marker detection"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Runtime marker alone must also activate quarantine.
+QTEST_DIR="$(mktemp -d)"
+QMARKER_P="$QTEST_DIR/persistent-marker"
+QMARKER_R="$QTEST_DIR/runtime-marker"
+# Only create runtime marker
+touch "$QMARKER_R"
+
+output="$(
+  GOVIRAL_QUARANTINE_MARKER_PERSISTENT="$QMARKER_P" \
+  GOVIRAL_QUARANTINE_MARKER_RUNTIME="$QMARKER_R" \
+  bash -c 'source "'"$SCRIPT_DIR"'/lib-quarantine.sh"
+    if is_heavy_quarantined; then echo "quarantined_via_runtime=true"; fi
+  '
+)" 2>&1
+
+if echo "$output" | grep -q "quarantined_via_runtime=true"; then
+  pass "runtime marker alone activates quarantine"
+else
+  fail "runtime marker detection" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 30: Reboot simulation — enabled symlinks survive but quarantine blocks"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Simulate: timers.target has enabled symlinks, but persistent marker blocks dispatch.
+rm -f "$LOCK_DIR"/*.lock
+QTEST_DIR="$(mktemp -d)"
+QMARKER_P="$QTEST_DIR/persistent-marker"
+# Persistent marker exists (survives reboot). Runtime cleared (simulates reboot).
+touch "$QMARKER_P"
+
+output="$(
+  GOVIRAL_QUARANTINE_MARKER_PERSISTENT="$QMARKER_P" \
+  GOVIRAL_QUARANTINE_MARKER_RUNTIME="$QTEST_DIR/nonexistent" \
+  dispatch_env 'canonical_dispatch goviral-prompt-command-center run-all --write'
+)" 2>&1 || true
+
+if echo "$output" | grep -q "quarantined=true"; then
+  pass "reboot simulation: persistent marker blocks dispatch even without runtime marker"
+else
+  fail "reboot simulation" "output=$output"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 31: Direct heavy service start blocked by ExecStartPre (structural)"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Verify all 4 heavy service units have ExecStartPre quarantine check
+quarantine_svc_count=0
+for svc_file in \
+  "$SCRIPT_DIR/goviral-prompt-command-center.service" \
+  "$SCRIPT_DIR/goviral-brain-auto-workflow.service" \
+  "$SCRIPT_DIR/goviral-unified-autopilot.service" \
+  "$SCRIPT_DIR/goviral-nl-autopilot-router.service"
+do
+  if grep -q "ExecStartPre=.*heavy-automation-quarantined" "$svc_file" 2>/dev/null; then
+    quarantine_svc_count=$((quarantine_svc_count + 1))
+  fi
+done
+
+if [ "$quarantine_svc_count" -eq 4 ]; then
+  pass "all 4 heavy service units have ExecStartPre quarantine check"
+else
+  fail "ExecStartPre quarantine" "only $quarantine_svc_count/4 services have the check"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 32: Marker removal does not auto-start timers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Removing the quarantine marker should NOT automatically enable or start timers.
+# This is structural: no inotify/watch process on the marker.
+# Verify: the quarantine admin command 'deactivate' only removes markers.
+if [ -f "$SCRIPT_DIR/goviral-quarantine" ]; then
+  deactivate_body="$(sed -n '/^do_deactivate/,/^}/p' "$SCRIPT_DIR/goviral-quarantine")"
+  if echo "$deactivate_body" | grep -q "systemctl enable\|systemctl start"; then
+    fail "marker removal auto-starts" "deactivate function contains systemctl enable/start"
+  else
+    pass "marker removal does NOT auto-start timers"
+  fi
+else
+  fail "marker removal" "goviral-quarantine not found"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 33: Controlled activation requires deactivated quarantine"
+# ═══════════════════════════════════════════════════════════════════════════════
+# The enable-timers subcommand must refuse when quarantine is still active.
+if [ -f "$SCRIPT_DIR/goviral-quarantine" ]; then
+  enable_body="$(sed -n '/^do_enable_timers/,/^}/p' "$SCRIPT_DIR/goviral-quarantine")"
+  if echo "$enable_body" | grep -q "Quarantine is still active"; then
+    pass "enable-timers refuses when quarantine active"
+  else
+    fail "controlled activation" "enable-timers does not check quarantine"
+  fi
+else
+  fail "controlled activation" "goviral-quarantine not found"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 34: No systemd jobs requested by supervisor while quarantined"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Re-run supervisor test but verify zero systemctl calls (not just zero enables)
+QTEST_DIR="$(mktemp -d)"
+QMARKER="$QTEST_DIR/quarantine-marker"
+touch "$QMARKER"
+
+MOCK_BIN="$QTEST_DIR/mock-bin"
+mkdir -p "$MOCK_BIN"
+cat > "$MOCK_BIN/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+echo "MOCK_SYSTEMCTL: $*" >> "${MOCK_SYSTEMCTL_LOG:-/dev/null}"
+case "$1" in
+  is-enabled) echo "disabled"; exit 1 ;;
+  is-active) echo "inactive"; exit 3 ;;
+  enable|start|restart) echo "MUTATING: $*" >> "${MOCK_SYSTEMCTL_LOG:-/dev/null}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+MOCK
+chmod +x "$MOCK_BIN/systemctl"
+cat > "$MOCK_BIN/goviral-doctor" <<'MOCK'
+#!/usr/bin/env bash
+echo "doctor=ok"
+MOCK
+chmod +x "$MOCK_BIN/goviral-doctor"
+cat > "$MOCK_BIN/goviral-workspace-guard" <<'MOCK'
+#!/usr/bin/env bash
+echo "workspace-guard=ok"
+MOCK
+chmod +x "$MOCK_BIN/goviral-workspace-guard"
+
+SUP_WORKSPACE="$QTEST_DIR/workspace"
+mkdir -p "$SUP_WORKSPACE/.governance/autopilot-supervisor"/{runs,status,dashboard,ledger,incidents,release}
+
+MOCK_LOG="$QTEST_DIR/systemctl-calls.log"
+touch "$MOCK_LOG"
+
+(
+  GOVIRAL_QUARANTINE_MARKER="$QMARKER" \
+  GOVIRAL_QUARANTINE_LIB="$SCRIPT_DIR/lib-quarantine.sh" \
+  MOCK_SYSTEMCTL_LOG="$MOCK_LOG" \
+  PATH="$MOCK_BIN:$PATH" \
+  bash -c '
+    BASE="'"$SUP_WORKSPACE"'"
+    ROOT="$BASE/.governance/autopilot-supervisor"
+    mkdir -p "$ROOT"/{runs,status,dashboard,ledger,incidents,release}
+    source "'"$SCRIPT_DIR"'/goviral-autopilot-supervisor" <<< ""
+  ' -- run-all
+) >/dev/null 2>&1 || true
+
+mutating_calls="$(grep "MUTATING:" "$MOCK_LOG" 2>/dev/null || true)"
+if [ -z "$mutating_calls" ]; then
+  pass "no mutating systemd jobs requested by supervisor while quarantined"
+else
+  fail "supervisor systemd jobs" "mutating calls: $mutating_calls"
+fi
+rm -rf "$QTEST_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 35: No raw enable --now in source (excluding quarantine-aware code)"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scan source for raw `systemctl enable --now` that is NOT inside a quarantine check.
+# Allowed files: lib-quarantine.sh (safe_enable_timer), goviral-autopilot-supervisor (gated),
+# deploy-v3.sh (gated), deploy-v3.1.sh (should have none), deploy-v2.sh (safe timers only).
+raw_enable_violations=0
+while IFS= read -r -d '' file; do
+  fname="$(basename "$file")"
+  case "$fname" in
+    # Files with quarantine-aware enable calls
+    lib-quarantine.sh|goviral-autopilot-supervisor|goviral-quarantine) continue ;;
+    # Deploy scripts (v3 is now gated, v2 only enables safe timers, v3.1 has none)
+    deploy-v2.sh|deploy-v3.sh) continue ;;
+    # Print-only references (instructions to operator, not actual calls)
+    goviral-telegram-configure) continue ;;
+    # Test files
+    test-*|*.pyc) continue ;;
+  esac
+  if grep -n "systemctl enable --now" "$file" >/dev/null 2>&1; then
+    echo "    RAW enable --now in: $file"
+    raw_enable_violations=$((raw_enable_violations + 1))
+  fi
+done < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -print0 2>/dev/null)
+
+if [ "$raw_enable_violations" -eq 0 ]; then
+  pass "no unguarded raw enable --now calls in source"
+else
+  fail "raw enable --now" "$raw_enable_violations file(s) with unguarded calls"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 36: deploy-v3.sh respects quarantine on heavy timers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Verify deploy-v3.sh has quarantine check before enabling heavy timers
+if grep -q "heavy-automation-quarantined" "$SCRIPT_DIR/deploy-v3.sh" 2>/dev/null; then
+  pass "deploy-v3.sh checks quarantine marker before heavy timer enablement"
+else
+  fail "deploy-v3.sh quarantine" "no quarantine check found"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 37: deploy-v3.1.sh runs systemctl disable for quarantined timers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Verify install step includes systemctl disable --now for quarantined timers
+if grep -q "systemctl disable --now" "$SCRIPT_DIR/deploy-v3.1.sh" 2>/dev/null; then
+  pass "deploy-v3.1.sh disables quarantined timers during install"
+else
+  fail "deploy-v3.1.sh disable" "no systemctl disable found"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 38: deploy-v3.1.sh does not enable heavy timers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# There should be no systemctl enable --now in deploy-v3.1.sh
+if grep -q "systemctl enable --now" "$SCRIPT_DIR/deploy-v3.1.sh" 2>/dev/null; then
+  fail "deploy-v3.1.sh enable" "found systemctl enable --now (should not be present)"
+else
+  pass "deploy-v3.1.sh does not enable any timers"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 39: deploy-v3.1.sh preserves quarantine markers"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Install and rollback must not remove quarantine markers
+if grep -q "Quarantine markers preserved" "$SCRIPT_DIR/deploy-v3.1.sh" 2>/dev/null; then
+  pass "deploy-v3.1.sh explicitly preserves quarantine markers"
+else
+  fail "deploy-v3.1.sh marker preservation" "no preservation comment found"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 40: Supervisor quarantines all 5 timer units"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Verify lib-quarantine.sh QUARANTINED_TIMERS includes the supervisor timer
+output="$(
+  GOVIRAL_QUARANTINE_MARKER="$TEST_DIR/nonexistent" \
+  bash -c 'source "'"$SCRIPT_DIR"'/lib-quarantine.sh"
+    if is_quarantined_timer "goviral-autopilot-supervisor.timer"; then echo "supervisor_timer_quarantined=true"; fi
+  '
+)" 2>&1
+
+if echo "$output" | grep -q "supervisor_timer_quarantined=true"; then
+  pass "supervisor timer itself is in the quarantined list"
+else
+  fail "supervisor timer quarantine" "output=$output"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "Test 41: Final approval queue immutability check"
+# ═══════════════════════════════════════════════════════════════════════════════
+APPROVAL_QUEUE_FINAL="/var/lib/goviral-archon/workspaces/goviral-brain/.governance/approval/queue.json"
+EXPECTED_HASH_FINAL="5c7bd4b7e0f2c4c7c2eac7d9db346fc22d8e726cf9d66723f93ea7d0cc7c890e"
+
+if [ -f "$APPROVAL_QUEUE_FINAL" ]; then
+  actual_hash_final="$(sha256sum "$APPROVAL_QUEUE_FINAL" | cut -d' ' -f1)"
+  if [ "$actual_hash_final" = "$EXPECTED_HASH_FINAL" ]; then
+    pass "final approval queue unchanged (SHA-256 verified)"
+  else
+    fail "final approval queue" "hash mismatch: expected=$EXPECTED_HASH_FINAL actual=$actual_hash_final"
+  fi
+else
+  pass "approval queue check skipped (not on production host)"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo "  Phase 0.5 Results: ${PASS} passed, ${FAIL} failed"
+echo "  Phase 0.5.2 Results: ${PASS} passed, ${FAIL} failed"
 echo "════════════════════════════════════════════════════════════"
 
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
