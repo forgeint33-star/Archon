@@ -6,12 +6,43 @@ import { registerGoviralPhase4Routes } from './goviral-phase4';
 import { registerGoviralPhase3Routes } from './goviral-phase3';
 import { registerGoviralPhase2Routes } from './goviral-phase2';
 import { registerGoviralClickUpRoutes } from './goviral-clickup-integration';
-import { getCachedSnapshot, getSnapshotCacheStatus } from './goviral-brain-snapshot';
+import {
+  getCachedSnapshot,
+  getSnapshotCacheStatus,
+  getSnapshotFreshness,
+} from './goviral-brain-snapshot';
 import type { OpenAPIHono } from '@hono/zod-openapi';
 import { readFile, readdir, stat } from 'fs/promises';
 import { basename, join, relative, resolve, sep } from 'path';
 
 type JsonRecord = Record<string, unknown>;
+
+// ---------------------------------------------------------------------------
+// Module manifest types
+// ---------------------------------------------------------------------------
+
+interface ModuleManifest {
+  module_id: string;
+  display_name: string;
+  owner_agent: string | null;
+  workflow: string | null;
+  implementation_path: string;
+  latest_run_pointer: string | null;
+  latest_run_id: string | null;
+  latest_run_at: string | null;
+  enabled: boolean;
+  health: 'healthy' | 'degraded' | 'unavailable' | 'unknown';
+  state: 'identified' | 'partially_identified' | 'orphaned' | 'unavailable';
+}
+
+interface ModuleDefinition {
+  id: string;
+  label: string;
+  owner_agent: string;
+  workflow: string;
+  pointer: string;
+  summary: string | null;
+}
 
 const BRAIN_ROOT =
   process.env.GOVIRAL_BRAIN_ROOT ?? '/var/lib/goviral-archon/workspaces/goviral-brain';
@@ -169,6 +200,81 @@ async function latestPrd(): Promise<JsonRecord | null> {
   };
 }
 
+const MODULE_DEFINITIONS: ModuleDefinition[] = [
+  {
+    id: 'approval_inbox',
+    label: 'Approval Inbox',
+    owner_agent: 'system',
+    workflow: 'goviral-approval-inbox',
+    pointer: join(BRAIN_ROOT, '.governance', 'approval-inbox', 'status', 'latest-run.txt'),
+    summary: join(BRAIN_ROOT, '.governance', 'approval-inbox', 'release', 'latest-summary.json'),
+  },
+  {
+    id: 'prompt_command_center',
+    label: 'Prompt Command Center',
+    owner_agent: 'system',
+    workflow: 'goviral-prompt-command-center',
+    pointer: join(BRAIN_ROOT, '.governance', 'prompt-command-center', 'status', 'latest-run.txt'),
+    summary: null,
+  },
+  {
+    id: 'brainos_master',
+    label: 'BrainOS Master',
+    owner_agent: 'system',
+    workflow: 'goviral-brainos-master',
+    pointer: join(BRAIN_ROOT, '.governance', 'brainos-master', 'status', 'latest-run.txt'),
+    summary: join(BRAIN_ROOT, '.governance', 'brainos-master', 'release', 'latest-summary.json'),
+  },
+  {
+    id: 'brain_auto_workflow',
+    label: 'Brain Auto Workflow',
+    owner_agent: 'system',
+    workflow: 'goviral-brain-auto-workflow',
+    pointer: join(BRAIN_ROOT, '.governance', 'brain-auto-workflow', 'status', 'latest-run.txt'),
+    summary: null,
+  },
+];
+
+async function buildModuleManifest(def: ModuleDefinition): Promise<ModuleManifest> {
+  const pointer = await readRunPointer(def.pointer);
+  const summaryData = def.summary ? await readJson(def.summary) : null;
+
+  let health: ModuleManifest['health'] = 'unknown';
+  let state: ModuleManifest['state'] = 'unavailable';
+
+  if (pointer.runId) {
+    state = 'identified';
+    const failedCount =
+      typeof summaryData?.failed_count === 'number' ? summaryData.failed_count : 0;
+    if (failedCount > 0) {
+      health = 'degraded';
+    } else if (summaryData) {
+      health = 'healthy';
+    } else {
+      // Has a run pointer but no summary — partially identified
+      state = 'partially_identified';
+      health = 'unknown';
+    }
+  } else {
+    state = 'unavailable';
+    health = 'unavailable';
+  }
+
+  return {
+    module_id: def.id,
+    display_name: def.label,
+    owner_agent: def.owner_agent,
+    workflow: def.workflow,
+    implementation_path: `.governance/${def.id.replace(/_/g, '-')}/`,
+    latest_run_pointer: pointer.path,
+    latest_run_id: pointer.runId,
+    latest_run_at: pointer.modifiedAt,
+    enabled: true,
+    health,
+    state,
+  };
+}
+
 export function registerGoviralRoutes(app: OpenAPIHono): void {
   registerGoviralPhase9Routes(app);
   registerGoviralPhase8Routes(app);
@@ -178,6 +284,14 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
   registerGoviralPhase3Routes(app);
   registerGoviralPhase2Routes(app);
   registerGoviralClickUpRoutes(app);
+  app.get('/api/goviral/modules', async c => {
+    const manifests = await Promise.all(MODULE_DEFINITIONS.map(def => buildModuleManifest(def)));
+    return c.json({
+      generated_at: new Date().toISOString(),
+      modules: manifests,
+    });
+  });
+
   app.get('/api/goviral/overview', async c => {
     const queuePath = join(BRAIN_ROOT, '.governance', 'approval', 'queue.json');
 
@@ -187,65 +301,20 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
     const doctorText = await readText(doctorPath);
 
     const modules = await Promise.all(
-      [
-        {
-          id: 'approval_inbox',
-          label: 'Approval Inbox',
-          pointer: join(BRAIN_ROOT, '.governance', 'approval-inbox', 'status', 'latest-run.txt'),
-          summary: join(
-            BRAIN_ROOT,
-            '.governance',
-            'approval-inbox',
-            'release',
-            'latest-summary.json'
-          ),
-        },
-        {
-          id: 'prompt_command_center',
-          label: 'Prompt Command Center',
-          pointer: join(
-            BRAIN_ROOT,
-            '.governance',
-            'prompt-command-center',
-            'status',
-            'latest-run.txt'
-          ),
-          summary: null,
-        },
-        {
-          id: 'brainos_master',
-          label: 'BrainOS Master',
-          pointer: join(BRAIN_ROOT, '.governance', 'brainos-master', 'status', 'latest-run.txt'),
-          summary: join(
-            BRAIN_ROOT,
-            '.governance',
-            'brainos-master',
-            'release',
-            'latest-summary.json'
-          ),
-        },
-        {
-          id: 'brain_auto_workflow',
-          label: 'Brain Auto Workflow',
-          pointer: join(
-            BRAIN_ROOT,
-            '.governance',
-            'brain-auto-workflow',
-            'status',
-            'latest-run.txt'
-          ),
-          summary: null,
-        },
-      ].map(async definition => {
-        const pointer = await readRunPointer(definition.pointer);
-        const summary = definition.summary === null ? null : await readJson(definition.summary);
+      MODULE_DEFINITIONS.map(async def => {
+        const manifest = await buildModuleManifest(def);
+        const summary = def.summary ? await readJson(def.summary) : null;
 
         return {
-          id: definition.id,
-          label: definition.label,
-          run_id: pointer.runId,
-          updated_at: pointer.modifiedAt,
+          id: manifest.module_id,
+          label: manifest.display_name,
+          run_id: manifest.latest_run_id,
+          updated_at: manifest.latest_run_at,
           summary: safeSummary(summary),
+          owner_agent: manifest.owner_agent,
+          workflow: manifest.workflow,
+          health: manifest.health,
+          state: manifest.state,
         };
       })
     );
@@ -262,6 +331,7 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
     // Non-blocking Brain snapshot enrichment (uses cached, never triggers refresh)
     const brainCache = getSnapshotCacheStatus();
     const brainSnapshot = getCachedSnapshot();
+    const snapshotFreshness = getSnapshotFreshness();
     const brain = brainSnapshot
       ? {
           health: brainSnapshot.health,
@@ -270,6 +340,7 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
           drift_count: brainSnapshot.drift.length,
           warning_count: brainSnapshot.warnings.length,
           cache: brainCache,
+          snapshot_freshness: snapshotFreshness,
         }
       : {
           health: null,
@@ -278,6 +349,7 @@ export function registerGoviralRoutes(app: OpenAPIHono): void {
           drift_count: null,
           warning_count: null,
           cache: brainCache,
+          snapshot_freshness: snapshotFreshness,
         };
 
     return c.json({

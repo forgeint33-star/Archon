@@ -223,6 +223,10 @@ const MAX_DIR_ENTRIES = 500;
 const REFRESH_TIMEOUT_MS = 30_000;
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+const SNAPSHOT_FRESHNESS_DELAYED_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+const SNAPSHOT_FRESHNESS_THRESHOLD_MS =
+  Number(process.env.GOVIRAL_SNAPSHOT_FRESHNESS_THRESHOLD_MS) || 10 * 60 * 1000; // 10 minutes
+
 // ---------------------------------------------------------------------------
 // Containment helpers
 // ---------------------------------------------------------------------------
@@ -1016,6 +1020,67 @@ function detectDrift(snapshot: Partial<BrainSnapshot>): DriftItem[] {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot freshness tracking
+// ---------------------------------------------------------------------------
+
+let lastSuccessAt: string | null = null;
+let lastErrorAt: string | null = null;
+let lastErrorSummary: string | null = null;
+
+export interface SnapshotFreshness {
+  generated_at: string | null;
+  source_updated_at: string | null;
+  age_seconds: number | null;
+  freshness: 'fresh' | 'delayed' | 'stale' | 'unavailable';
+  producer: string;
+  producer_status: 'active' | 'idle' | 'error' | 'unknown';
+  last_success_at: string | null;
+  last_error_at: string | null;
+  last_error_summary: string | null;
+  threshold_seconds: number;
+}
+
+export function getSnapshotFreshness(): SnapshotFreshness {
+  const now = Date.now();
+  const generatedAt = cachedSnapshot?.generated_at ?? null;
+  const ageMs = cacheTimestamp > 0 ? now - cacheTimestamp : null;
+  const ageSeconds = ageMs !== null ? Math.round(ageMs / 1000) : null;
+
+  let freshness: SnapshotFreshness['freshness'] = 'unavailable';
+  if (cachedSnapshot === null) {
+    freshness = 'unavailable';
+  } else if (ageMs !== null && ageMs < SNAPSHOT_FRESHNESS_DELAYED_THRESHOLD_MS) {
+    freshness = 'fresh';
+  } else if (ageMs !== null && ageMs < SNAPSHOT_FRESHNESS_THRESHOLD_MS) {
+    freshness = 'delayed';
+  } else {
+    freshness = 'stale';
+  }
+
+  let producerStatus: SnapshotFreshness['producer_status'] = 'unknown';
+  if (refreshInProgress) {
+    producerStatus = 'active';
+  } else if (lastErrorAt && (!lastSuccessAt || lastErrorAt > lastSuccessAt)) {
+    producerStatus = 'error';
+  } else if (lastSuccessAt) {
+    producerStatus = 'idle';
+  }
+
+  return {
+    generated_at: generatedAt,
+    source_updated_at: cachedSnapshot?.agents?.freshness ?? null,
+    age_seconds: ageSeconds,
+    freshness,
+    producer: 'goviral-brain-snapshot',
+    producer_status: producerStatus,
+    last_success_at: lastSuccessAt,
+    last_error_at: lastErrorAt,
+    last_error_summary: lastErrorSummary,
+    threshold_seconds: Math.round(SNAPSHOT_FRESHNESS_THRESHOLD_MS / 1000),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot cache
 // ---------------------------------------------------------------------------
 
@@ -1289,10 +1354,14 @@ export async function refreshBrainSnapshot(): Promise<BrainSnapshot> {
     // Update cache
     cachedSnapshot = snapshot;
     cacheTimestamp = Date.now();
+    lastSuccessAt = new Date().toISOString();
     await writeCacheFile(snapshot);
 
     return snapshot;
   } catch (error) {
+    lastErrorAt = new Date().toISOString();
+    lastErrorSummary = error instanceof Error ? error.message.slice(0, 200) : 'unknown error';
+
     // On failure, return last-good snapshot
     if (cachedSnapshot) {
       return cachedSnapshot;
@@ -1324,16 +1393,32 @@ export function getSnapshotCacheStatus(): {
   has_cached: boolean;
   cached_at: string | null;
   age_ms: number | null;
+  age_seconds: number | null;
   ttl_ms: number;
   stale: boolean;
+  freshness: 'fresh' | 'delayed' | 'stale' | 'unavailable';
 } {
   const now = Date.now();
   const age = cacheTimestamp > 0 ? now - cacheTimestamp : null;
+
+  let freshness: 'fresh' | 'delayed' | 'stale' | 'unavailable' = 'unavailable';
+  if (cachedSnapshot === null) {
+    freshness = 'unavailable';
+  } else if (age !== null && age < SNAPSHOT_FRESHNESS_DELAYED_THRESHOLD_MS) {
+    freshness = 'fresh';
+  } else if (age !== null && age < SNAPSHOT_FRESHNESS_THRESHOLD_MS) {
+    freshness = 'delayed';
+  } else {
+    freshness = 'stale';
+  }
+
   return {
     has_cached: cachedSnapshot !== null,
     cached_at: cacheTimestamp > 0 ? new Date(cacheTimestamp).toISOString() : null,
     age_ms: age,
+    age_seconds: age !== null ? Math.round(age / 1000) : null,
     ttl_ms: CACHE_TTL_MS,
     stale: age === null || age >= CACHE_TTL_MS,
+    freshness,
   };
 }
