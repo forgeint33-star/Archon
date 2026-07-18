@@ -187,6 +187,187 @@ async function telegramStatus(): Promise<TelegramStatus> {
   };
 }
 
+// ─── v3.1 Integration Status ────────────────────────────────────────────────
+
+interface TelegramStatusV31 {
+  configured: boolean;
+  enabled: boolean;
+  reachable: boolean | null;
+  last_test_at: string | null;
+  last_delivery_at: string | null;
+  last_error_summary: string | null;
+  notifier_timer_active: boolean;
+  daily_digest_timer_active: boolean;
+  credentials_present: boolean;
+  platform_adapter_active: boolean;
+  goviral_scripts_active: boolean;
+}
+
+async function queryTimerState(unitName: string): Promise<{ active: boolean; enabled: boolean }> {
+  try {
+    const child = Bun.spawn(
+      ['/usr/bin/systemctl', 'show', `${unitName}.timer`, '--property=ActiveState,UnitFileState'],
+      { stdout: 'pipe', stderr: 'pipe' }
+    );
+    const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+    if (exitCode !== 0) return { active: false, enabled: false };
+
+    const props: Record<string, string> = {};
+    for (const line of stdout.split('\n')) {
+      const sep = line.indexOf('=');
+      if (sep > 0) props[line.slice(0, sep).trim()] = line.slice(sep + 1).trim();
+    }
+    return {
+      active: props.ActiveState === 'active',
+      enabled: props.UnitFileState === 'enabled',
+    };
+  } catch {
+    return { active: false, enabled: false };
+  }
+}
+
+async function telegramStatusV31(): Promise<TelegramStatusV31> {
+  const notifierTimer = await queryTimerState('goviral-telegram-notifier');
+  const digestTimer = await queryTimerState('goviral-daily-ops-report');
+
+  const digestState = asRecord(
+    await readBoundedJson(join(NOTIFICATIONS_DIR, 'daily-digest-state.json'))
+  );
+  const lastSent = safeText(digestState.last_sent);
+  const lastSuccess = digestState.success === true;
+
+  let credentialsPresent = false;
+  try {
+    await stat('/etc/goviral/credentials/telegram-bot-token');
+    await stat('/etc/goviral/credentials/telegram-chat-id');
+    credentialsPresent = true;
+  } catch {
+    credentialsPresent = false;
+  }
+
+  const configured = credentialsPresent || notifierTimer.enabled || digestTimer.enabled;
+  const enabled = notifierTimer.active || digestTimer.active;
+
+  return {
+    configured,
+    enabled,
+    reachable: lastSuccess ? true : null,
+    last_test_at: null,
+    last_delivery_at: lastSent,
+    last_error_summary:
+      digestState.success === false
+        ? (safeText(digestState.error, 200) ?? 'delivery failed')
+        : null,
+    notifier_timer_active: notifierTimer.active,
+    daily_digest_timer_active: digestTimer.active,
+    credentials_present: credentialsPresent,
+    platform_adapter_active: enabled,
+    goviral_scripts_active: notifierTimer.enabled || digestTimer.enabled,
+  };
+}
+
+interface ClickUpStatusV31 {
+  configured: boolean;
+  stage: string;
+  writes_enabled: boolean;
+  connectivity_tested: boolean;
+  last_connectivity_test_at: string | null;
+  governance_tier_count: number;
+}
+
+async function clickupStatusV31(): Promise<ClickUpStatusV31> {
+  const state = asRecord(await readBoundedJson(CLICKUP_STATE_FILE));
+
+  // Count governance tier dirs
+  let governanceTierCount = 0;
+  try {
+    const brainRoot = '/var/lib/goviral-archon/workspaces/goviral-brain';
+    const govDir = join(brainRoot, '.governance');
+    const entries = await readdir(govDir);
+    governanceTierCount = entries.filter(d => d.startsWith('clickup-')).length;
+  } catch {
+    // governance dir may not exist
+  }
+
+  return {
+    configured: state.configured === true,
+    stage: safeText(state.state, 40) ?? 'not_configured',
+    writes_enabled: state.writes_enabled === true,
+    connectivity_tested: state.connectivity_tested === true,
+    last_connectivity_test_at: safeText(state.last_connectivity_test, 80),
+    governance_tier_count: governanceTierCount,
+  };
+}
+
+interface QdrantStatusV31 {
+  configured: boolean;
+  reachable: boolean | null;
+  healthy: boolean | null;
+  collections_count: number | null;
+  last_checked_at: string | null;
+  status: 'running' | 'stopped' | 'resource_deferred' | 'unknown';
+}
+
+async function qdrantStatusV31(): Promise<QdrantStatusV31> {
+  const state = asRecord(await readBoundedJson(QDRANT_STATE_FILE));
+  const configured = state.configured === true;
+
+  let reachable: boolean | null = null;
+  let healthy: boolean | null = null;
+  let collectionsCount: number | null = null;
+  let qdrantState: QdrantStatusV31['status'] = 'unknown';
+  let lastCheckedAt: string | null = null;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 3000);
+    const response = await fetch('http://localhost:6333/collections', {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    lastCheckedAt = new Date().toISOString();
+
+    if (response.ok) {
+      reachable = true;
+      healthy = true;
+      qdrantState = 'running';
+      try {
+        const data = (await response.json()) as { result?: { collections?: unknown[] } };
+        collectionsCount = Array.isArray(data?.result?.collections)
+          ? data.result.collections.length
+          : null;
+      } catch {
+        // JSON parse failed but endpoint was reachable
+      }
+    } else {
+      reachable = true;
+      healthy = false;
+      qdrantState = 'running';
+    }
+  } catch {
+    reachable = false;
+    lastCheckedAt = new Date().toISOString();
+
+    // Check if it was ever configured as resource_deferred
+    if (safeText(state.state, 40) === 'resource_deferred') {
+      qdrantState = 'resource_deferred';
+    } else {
+      qdrantState = 'stopped';
+    }
+  }
+
+  return {
+    configured,
+    reachable,
+    healthy,
+    collections_count: collectionsCount,
+    last_checked_at: lastCheckedAt,
+    status: qdrantState,
+  };
+}
+
 // ─── Needs Attention Today ───────────────────────────────────────────────────
 
 interface AttentionItem {
@@ -868,6 +1049,21 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
     });
   });
 
+  // v3.1: Combined integration truth
+  app.get('/api/goviral/integrations', async c => {
+    const [telegram, clickup, qdrant] = await Promise.all([
+      telegramStatusV31(),
+      clickupStatusV31(),
+      qdrantStatusV31(),
+    ]);
+    return c.json({
+      generated_at: new Date().toISOString(),
+      telegram,
+      clickup,
+      qdrant,
+    });
+  });
+
   // Phase 17: Analytics rollup
   app.get('/api/goviral/analytics', async c => {
     return c.json(await analyticsRollup());
@@ -1089,6 +1285,220 @@ export function registerGoviralPhase5Routes(app: OpenAPIHono): void {
         enable_integrations: requireRole(role, 'admin'),
         manage_tasks: requireRole(role, 'operator'),
       },
+    });
+  });
+
+  // v3.1 Phase 7: Canary task lifecycle
+  const CANARY_STATE_FILE = join(STATE_DIR, 'canary-state.json');
+  const CANARY_TIMEOUT_MS = 30_000;
+
+  app.get('/api/goviral/canary/status', async c => {
+    const data = asRecord(await readBoundedJson(CANARY_STATE_FILE));
+    return c.json({
+      generated_at: new Date().toISOString(),
+      canary: {
+        id: safeText(data.id, 80) ?? null,
+        status: safeText(data.status, 20) ?? 'none',
+        started_at: safeText(data.started_at, 80) ?? null,
+        completed_at: safeText(data.completed_at, 80) ?? null,
+        error: safeText(data.error, 200) ?? null,
+      },
+    });
+  });
+
+  app.post('/api/goviral/canary/launch', async c => {
+    c.header('Cache-Control', 'no-store');
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot launch canary` }, 403);
+    }
+
+    // Check for existing active canary
+    const existing = asRecord(await readBoundedJson(CANARY_STATE_FILE));
+    const existingStatus = safeText(existing.status, 20);
+    if (existingStatus === 'queued' || existingStatus === 'running') {
+      return c.json(
+        { ok: false, error: `canary already ${existingStatus} (id: ${safeText(existing.id, 80)})` },
+        409
+      );
+    }
+
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const rand = Math.random().toString(36).slice(2, 6);
+    const canaryId = `canary-${dateStr}-${rand}`;
+    const now = new Date().toISOString();
+
+    const canaryState = {
+      id: canaryId,
+      status: 'queued',
+      started_at: now,
+      completed_at: null,
+      error: null,
+    };
+
+    await writeAtomicJson(CANARY_STATE_FILE, canaryState);
+
+    // Append to audit
+    await appendAgentTaskAudit({
+      action: 'canary_launched',
+      canary_id: canaryId,
+      user: gate.identity,
+    });
+
+    // Run the canary (5-second no-op with 30-second timeout)
+    canaryState.status = 'running';
+    await writeAtomicJson(CANARY_STATE_FILE, canaryState);
+
+    setTimeout(async () => {
+      try {
+        const currentState = asRecord(await readBoundedJson(CANARY_STATE_FILE));
+        // Only complete if this canary is still running (not cancelled)
+        if (
+          safeText(currentState.id, 80) === canaryId &&
+          safeText(currentState.status, 20) === 'running'
+        ) {
+          await writeAtomicJson(CANARY_STATE_FILE, {
+            id: canaryId,
+            status: 'completed',
+            started_at: now,
+            completed_at: new Date().toISOString(),
+            error: null,
+          });
+          await appendAgentTaskAudit({
+            action: 'canary_completed',
+            canary_id: canaryId,
+          });
+        }
+      } catch {
+        // Best-effort completion
+      }
+    }, 5000);
+
+    // Set a timeout guard
+    setTimeout(async () => {
+      try {
+        const currentState = asRecord(await readBoundedJson(CANARY_STATE_FILE));
+        if (
+          safeText(currentState.id, 80) === canaryId &&
+          (safeText(currentState.status, 20) === 'queued' ||
+            safeText(currentState.status, 20) === 'running')
+        ) {
+          await writeAtomicJson(CANARY_STATE_FILE, {
+            id: canaryId,
+            status: 'failed',
+            started_at: now,
+            completed_at: new Date().toISOString(),
+            error: 'canary timed out',
+          });
+        }
+      } catch {
+        // Best-effort timeout
+      }
+    }, CANARY_TIMEOUT_MS);
+
+    return c.json({ ok: true, canary_id: canaryId, status: 'running' });
+  });
+
+  app.post('/api/goviral/canary/cancel', async c => {
+    c.header('Cache-Control', 'no-store');
+    const gate = roleGate(c.req.raw.headers, 'operator');
+    if (!gate.allowed) {
+      return c.json({ ok: false, error: `${gate.role} role cannot cancel canary` }, 403);
+    }
+
+    const existing = asRecord(await readBoundedJson(CANARY_STATE_FILE));
+    const existingStatus = safeText(existing.status, 20);
+    if (existingStatus !== 'queued' && existingStatus !== 'running') {
+      return c.json(
+        { ok: false, error: `no active canary to cancel (status: ${existingStatus ?? 'none'})` },
+        409
+      );
+    }
+
+    const canaryId = safeText(existing.id, 80) ?? 'unknown';
+    await writeAtomicJson(CANARY_STATE_FILE, {
+      id: canaryId,
+      status: 'cancelled',
+      started_at: safeText(existing.started_at, 80),
+      completed_at: new Date().toISOString(),
+      error: null,
+    });
+
+    await appendAgentTaskAudit({
+      action: 'canary_cancelled',
+      canary_id: canaryId,
+      user: gate.identity,
+    });
+
+    return c.json({ ok: true, canary_id: canaryId, status: 'cancelled' });
+  });
+
+  // v3.1 Phase 8: Access mode and RBAC clarity
+  app.get('/api/goviral/access', async c => {
+    const role = resolveGoviralRole(c.req.raw.headers);
+    const port = parseInt(process.env.PORT ?? '8180', 10);
+
+    // Detect access mode by checking bind address
+    let accessMode: 'loopback_private' | 'tailscale_private' | 'tunnel_private' | 'public' =
+      'public';
+    let bindAddress = '0.0.0.0';
+
+    try {
+      const child = Bun.spawn(['/usr/bin/ss', '-tlnp', `sport = :${port}`], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [stdout, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        child.exited,
+      ]);
+
+      if (exitCode === 0) {
+        const lines = stdout.split('\n');
+        for (const line of lines) {
+          if (line.includes(`:${port}`)) {
+            const match = /\s(\S+):(\d+)\s/.exec(line);
+            if (match) {
+              bindAddress = match[1];
+              if (
+                bindAddress === '127.0.0.1' ||
+                bindAddress === '::1' ||
+                bindAddress === 'localhost'
+              ) {
+                accessMode = 'loopback_private';
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // ss unavailable
+    }
+
+    // Check for Tailscale headers
+    const tailscaleUser = c.req.raw.headers.get('tailscale-user-login');
+    if (tailscaleUser && accessMode !== 'loopback_private') {
+      accessMode = 'tailscale_private';
+    }
+
+    const authEnabled = process.env.BETTER_AUTH_SECRET !== undefined;
+    const publicExposure = accessMode === 'public';
+
+    return c.json({
+      generated_at: new Date().toISOString(),
+      access_mode: accessMode,
+      bind_address: bindAddress,
+      port,
+      auth_enabled: authEnabled,
+      public_exposure: publicExposure,
+      rbac: {
+        active: true,
+        roles: ['viewer', 'operator', 'admin'],
+        current_role: role,
+        enforcement:
+          process.env.GOVIRAL_ACTIONS_ENABLED === '1' ? ('active' as const) : ('advisory' as const),
+      },
+      design_document: 'ops/goviral-control-plane/RBAC-DESIGN.md',
     });
   });
 
