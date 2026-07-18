@@ -974,10 +974,159 @@ async function agentsResponse(): Promise<AgentsResponse> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Agent reconciliation
+// ---------------------------------------------------------------------------
+
+interface ReconciliationDrift {
+  agent: string;
+  classification:
+    | 'missing_registry'
+    | 'missing_definition'
+    | 'duplicate_identity'
+    | 'disabled_definition'
+    | 'orphan_runtime'
+    | 'invalid_manifest';
+  evidence: string;
+  recommendation: string;
+  safe_action: string | null;
+}
+
+interface ReconciliationProposal {
+  agent: string;
+  action: string;
+  requires_approval: boolean;
+  justification: string;
+}
+
+interface ReconciliationResponse {
+  generated_at: string;
+  canonical_identity_key: 'agent_name';
+  registered: string[];
+  defined: string[];
+  runtime_discovered: string[];
+  drift: ReconciliationDrift[];
+  reconciliation_proposal: ReconciliationProposal[];
+  drift_count: number;
+  resolved_count: number;
+}
+
+async function agentReconciliation(): Promise<ReconciliationResponse> {
+  const snapshot = await getBrainSnapshot();
+  const agents = snapshot.agents.data.items;
+
+  const registered = agents.filter(a => a.registry_source).map(a => a.name);
+  const defined = agents.filter(a => a.definition_source).map(a => a.name);
+
+  // Runtime discovered: agents that appear in agent-bus threads
+  const runtimeDiscovered: string[] = [];
+  try {
+    const entries = await readdir(AGENT_THREADS_PATH, { withFileTypes: true });
+    const threadDirs = entries
+      .filter(e => e.isDirectory())
+      .map(e => e.name)
+      .sort()
+      .reverse()
+      .slice(0, MAX_THREAD_FILES);
+
+    for (const dir of threadDirs) {
+      const threadPath = join(AGENT_THREADS_PATH, dir, 'thread.json');
+      if (!isInsideBrain(threadPath)) continue;
+      const raw = asRecord(await readBoundedJson(threadPath));
+      const nested = asRecord(raw.thread);
+      const record = Object.keys(nested).length > 0 ? nested : raw;
+      const agentName =
+        safeText(record.agent, 100) ?? safeText(record.worker, 100) ?? safeText(record.owner, 100);
+      if (agentName && !runtimeDiscovered.includes(agentName)) {
+        runtimeDiscovered.push(agentName);
+      }
+    }
+  } catch {
+    // threads dir may not exist
+  }
+
+  const drift: ReconciliationDrift[] = [];
+  const proposals: ReconciliationProposal[] = [];
+
+  for (const agent of agents) {
+    if (agent.type === 'orchestrator' || agent.type === 'operator_persona') continue;
+
+    if (agent.consistency === 'drift_missing_registry') {
+      drift.push({
+        agent: agent.name,
+        classification: 'missing_registry',
+        evidence: `Definition file exists at .claude/agents/${agent.name}.md but no entry in registry.json`,
+        recommendation: `Add "${agent.name}" to .governance/agents/registry.json or remove the orphaned definition`,
+        safe_action: null,
+      });
+      proposals.push({
+        agent: agent.name,
+        action: `Register agent "${agent.name}" in registry.json`,
+        requires_approval: true,
+        justification: 'Agent has a definition file but is not registered — cannot be dispatched',
+      });
+    } else if (agent.consistency === 'drift_missing_definition') {
+      drift.push({
+        agent: agent.name,
+        classification: 'missing_definition',
+        evidence: `Agent "${agent.name}" is registered but has no .claude/agents/${agent.name}.md definition file`,
+        recommendation: `Create definition file at .claude/agents/${agent.name}.md`,
+        safe_action: null,
+      });
+      proposals.push({
+        agent: agent.name,
+        action: `Create definition file for "${agent.name}"`,
+        requires_approval: true,
+        justification: 'Registered agent has no definition — cannot receive prompts',
+      });
+    } else if (agent.consistency === 'drift_missing_policy') {
+      drift.push({
+        agent: agent.name,
+        classification: 'missing_definition',
+        evidence: `Agent "${agent.name}" has no policy entry in policies.json`,
+        recommendation: `Add policy entry for "${agent.name}" in .governance/agents/policies.json`,
+        safe_action: null,
+      });
+    }
+  }
+
+  // Check for runtime agents not in registry
+  for (const runtimeAgent of runtimeDiscovered) {
+    if (!registered.includes(runtimeAgent) && !defined.includes(runtimeAgent)) {
+      drift.push({
+        agent: runtimeAgent,
+        classification: 'orphan_runtime',
+        evidence: `Agent "${runtimeAgent}" appears in agent-bus threads but is not registered or defined`,
+        recommendation: `Investigate and either register "${runtimeAgent}" or clean up stale threads`,
+        safe_action: null,
+      });
+    }
+  }
+
+  const resolvedCount = agents.filter(
+    a =>
+      a.consistency === 'consistent' && a.type !== 'orchestrator' && a.type !== 'operator_persona'
+  ).length;
+
+  return {
+    generated_at: new Date().toISOString(),
+    canonical_identity_key: 'agent_name',
+    registered,
+    defined,
+    runtime_discovered: runtimeDiscovered,
+    drift,
+    reconciliation_proposal: proposals,
+    drift_count: drift.length,
+    resolved_count: resolvedCount,
+  };
+}
+
 export function registerGoviralPhase3Routes(app: OpenAPIHono): void {
   app.get('/api/goviral/incidents', async c => c.json(await incidentResponse()));
 
   app.get('/api/goviral/goals', async c => c.json(await goalsResponse()));
 
   app.get('/api/goviral/agents', async c => c.json(await agentsResponse()));
+
+  app.get('/api/goviral/agents/reconciliation', async c => c.json(await agentReconciliation()));
 }
