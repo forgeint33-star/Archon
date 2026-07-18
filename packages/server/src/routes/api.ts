@@ -171,9 +171,15 @@ import {
 } from './schemas/config.schemas';
 import {
   TIER_NAMES,
+  buildAiProfile,
   isEffortValidForProvider,
   validEffortsForProvider,
 } from '@archon/workflows/model-validation';
+import {
+  ModelContractError,
+  modelContractMetadata,
+  resolveModelContract,
+} from '@archon/workflows/model-contract';
 import {
   providerListResponseSchema,
   piModelListResponseSchema,
@@ -2039,6 +2045,47 @@ export function registerApiRoutes(
     return { ok: true, savedFiles, uploadDir };
   }
 
+  /**
+   * Validate and resolve a caller-supplied model contract at the HTTP
+   * boundary.
+   *
+   * Resolving here (rather than only inside the orchestrator) means an
+   * unsupported model or effort is rejected with a 400 naming the offending
+   * field, instead of failing asynchronously after the request has already
+   * been accepted. The orchestrator resolves it again at the point of use;
+   * the function is pure, so both resolutions agree.
+   */
+  async function resolveDispatchContract(
+    modelContract: unknown
+  ): Promise<
+    { ok: true; echo: Record<string, unknown> } | { ok: false; field: string; message: string }
+  > {
+    if (modelContract === undefined || modelContract === null) {
+      return { ok: true, echo: {} };
+    }
+    try {
+      const config = await loadConfig();
+      const providerKey = config.assistant;
+      const aiProfile = buildAiProfile(providerKey, {
+        repoTiers: config.tiers,
+        repoAliases: config.aliases,
+      });
+      const resolved = resolveModelContract(aiProfile, modelContract, {
+        fallbackProvider: providerKey,
+      });
+      return { ok: true, echo: modelContractMetadata(resolved) };
+    } catch (error) {
+      if (error instanceof ModelContractError) {
+        return { ok: false, field: error.field, message: error.message };
+      }
+      return {
+        ok: false,
+        field: 'modelContract',
+        message: (error as Error).message ?? 'invalid model contract',
+      };
+    }
+  }
+
   async function dispatchToOrchestrator(
     conversationId: string,
     message: string,
@@ -2484,6 +2531,7 @@ export function registerApiRoutes(
     }
 
     let message: string;
+    let modelContract: unknown;
     let savedFiles: AttachedFile[] = [];
     let uploadDir = '';
 
@@ -2525,7 +2573,7 @@ export function registerApiRoutes(
         getLog().info({ conversationId, fileCount: savedFiles.length }, 'message.files_uploaded');
       }
     } else {
-      let body: { message?: unknown };
+      let body: { message?: unknown; modelContract?: unknown };
       try {
         body = await c.req.json();
       } catch (parseErr: unknown) {
@@ -2537,6 +2585,7 @@ export function registerApiRoutes(
         return c.json({ error: 'message must be a non-empty string' }, 400);
       }
       message = body.message;
+      modelContract = body.modelContract;
     }
 
     // Look up conversation for message persistence
@@ -2578,8 +2627,20 @@ export function registerApiRoutes(
     // Pass savedFiles to dispatchToOrchestrator so cleanup happens inside the lock handler,
     // AFTER handleMessage completes — not in the HTTP handler's finally block where the
     // fire-and-forget lock callback may still be running and the AI has not yet read the files.
-    const extraContext: Omit<HandleMessageContext, 'isolationHints'> =
-      savedFiles.length > 0 ? { userId, attachedFiles: savedFiles } : { userId };
+    const contractResolution = await resolveDispatchContract(modelContract);
+    if (!contractResolution.ok) {
+      return c.json(
+        {
+          error: `Invalid model contract (${contractResolution.field}): ${contractResolution.message}`,
+        },
+        400
+      );
+    }
+    const extraContext: Omit<HandleMessageContext, 'isolationHints'> = {
+      userId,
+      ...(savedFiles.length > 0 ? { attachedFiles: savedFiles } : {}),
+      ...(modelContract !== undefined ? { modelContract } : {}),
+    };
     let filesToCleanup: { files: AttachedFile[]; uploadDir: string } | undefined;
     if (savedFiles.length > 0) {
       filesToCleanup = { files: savedFiles, uploadDir };
@@ -2590,7 +2651,7 @@ export function registerApiRoutes(
       extraContext,
       filesToCleanup
     );
-    return c.json(result);
+    return c.json({ ...result, ...contractResolution.echo });
   });
 
   // GET /api/stream/__dashboard__ — multiplexed dashboard SSE (all workflow events)

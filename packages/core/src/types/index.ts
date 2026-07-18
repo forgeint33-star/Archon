@@ -54,6 +54,15 @@ export interface HandleMessageContext {
    * own auth flows are wired.
    */
   readonly userId?: string;
+  /**
+   * Optional per-task model contract supplied by a governed caller.
+   *
+   * Left as `unknown` on purpose: this type is imported by adapters that
+   * must not depend on the workflows package. It is validated by
+   * `resolveModelContract` at the point of use, which rejects an unknown
+   * model, effort, profile or tool capability by name.
+   */
+  readonly modelContract?: unknown;
 }
 
 export interface CommandResult {

@@ -74,9 +74,30 @@ export const listMessagesQuerySchema = z.object({
 /** GET /api/conversations/:id/messages response. */
 export const messageListResponseSchema = z.array(messageSchema).openapi('MessageListResponse');
 
+/**
+ * Per-task model contract accepted by dispatch endpoints.
+ *
+ * Kept permissive here on purpose: `resolveModelContract` owns the real
+ * allowlists and produces field-named errors. Duplicating them in zod
+ * would create two sources of truth that can disagree.
+ */
+export const modelContractSchema = z
+  .object({
+    requestedModel: z.string().optional(),
+    effort: z.string().optional(),
+    profile: z.string().optional(),
+    fallbackChain: z.array(z.string()).optional(),
+    runId: z.string().optional(),
+    taskId: z.string().optional(),
+    allowedToolCapabilities: z.array(z.string()).optional(),
+    allowMaxEffort: z.boolean().optional(),
+    approvalReceiptId: z.string().optional(),
+  })
+  .openapi('ModelContract');
+
 /** POST /api/conversations/:id/message JSON request body. */
 export const sendMessageBodySchema = z
-  .object({ message: z.string().min(1) })
+  .object({ message: z.string().min(1), modelContract: modelContractSchema.optional() })
   .openapi('SendMessageBody');
 
 /** POST /api/conversations/:id/message multipart request body (file uploads). */
@@ -96,5 +117,17 @@ export const dispatchResponseSchema = z
   .object({
     accepted: z.boolean(),
     status: z.string(),
+    // Present only when the caller supplied a model contract. Echoing both
+    // sides lets a caller prove which model actually ran rather than
+    // trusting that its request was honoured.
+    requested_model: z.string().nullable().optional(),
+    resolved_model: z.string().nullable().optional(),
+    provider: z.string().nullable().optional(),
+    effort: z.string().optional(),
+    profile: z.string().nullable().optional(),
+    fallback_chain: z.array(z.string()).optional(),
+    run_id: z.string().nullable().optional(),
+    task_id: z.string().nullable().optional(),
+    allowed_tool_capabilities: z.array(z.string()).optional(),
   })
   .openapi('DispatchResponse');

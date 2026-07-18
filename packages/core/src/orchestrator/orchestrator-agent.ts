@@ -80,6 +80,8 @@ import {
   type ModelAliasPreset,
   type TierName,
 } from '@archon/workflows/model-validation';
+import { modelContractMetadata, resolveModelContract } from '@archon/workflows/model-contract';
+import { contractRequestOverrides } from '@archon/workflows/model-contract-runtime';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -1039,6 +1041,45 @@ function buildFullPrompt(
  * and routes everything else through the AI orchestrator which knows all projects
  * and workflows upfront.
  */
+/**
+ * Apply a governed model contract to an outgoing provider request.
+ *
+ * The contract wins over the install's own model resolution because a
+ * caller that names a model has already been through governance. The
+ * resolved values land on the same fields a YAML workflow node uses, so
+ * the provider adapter needs no knowledge of contracts at all.
+ *
+ * Returns the metadata record to log/emit, or `null` when no contract was
+ * supplied — in which case `requestOptions` is left untouched and the
+ * pre-existing resolution path stands.
+ */
+function applyModelContract(
+  aiProfile: ReturnType<typeof buildAiProfile>,
+  modelContract: unknown,
+  requestOptions: SendQueryOptions,
+  fallbackProvider: string
+): Record<string, unknown> | null {
+  if (modelContract === undefined || modelContract === null) return null;
+
+  const resolved = resolveModelContract(aiProfile, modelContract, {
+    defaultModel: requestOptions.model,
+    fallbackProvider,
+  });
+  const overrides = contractRequestOverrides(resolved);
+
+  if (overrides.model !== undefined) requestOptions.model = overrides.model;
+  if (overrides.fallbackModel !== undefined) {
+    requestOptions.fallbackModel = overrides.fallbackModel;
+  }
+  if (overrides.nodeConfig !== undefined) {
+    // Merge rather than replace: a caller may already have set node config
+    // (e.g. a preset), and the contract only owns the fields it named.
+    requestOptions.nodeConfig = { ...requestOptions.nodeConfig, ...overrides.nodeConfig };
+  }
+
+  return modelContractMetadata(resolved);
+}
+
 export async function handleMessage(
   platform: IPlatformAdapter,
   conversationId: string,
@@ -1052,6 +1093,7 @@ export async function handleMessage(
     isolationHints,
     attachedFiles,
     userId,
+    modelContract,
   } = context ?? {};
   try {
     getLog().debug({ conversationId, userId }, 'orchestrator_message_received');
@@ -1542,6 +1584,19 @@ export async function handleMessage(
     };
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
+    }
+
+    // A governed contract is applied last so it outranks the preset's
+    // effort and the install's model resolution. An invalid contract fails
+    // the turn loudly rather than silently running on the wrong model.
+    const contractMetadata = applyModelContract(
+      aiProfile,
+      modelContract,
+      requestOptions,
+      providerKey
+    );
+    if (contractMetadata !== null) {
+      getLog().info({ conversationId, ...contractMetadata }, 'orchestrator.model_contract_applied');
     }
 
     if (!conversation.title && !message.startsWith('/')) {
