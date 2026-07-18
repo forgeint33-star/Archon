@@ -59,21 +59,15 @@ describe('validateModelContract', () => {
   });
 
   test('rejects an unknown profile', () => {
-    expect(() => validateModelContract({ profile: 'ultra' })).toThrow(
-      /Unknown profile/
-    );
+    expect(() => validateModelContract({ profile: 'ultra' })).toThrow(/Unknown profile/);
   });
 
   test('rejects an unknown effort', () => {
-    expect(() => validateModelContract({ effort: 'extreme' })).toThrow(
-      /Unknown effort/
-    );
+    expect(() => validateModelContract({ effort: 'extreme' })).toThrow(/Unknown effort/);
   });
 
   test('max effort requires an explicit override', () => {
-    expect(() => validateModelContract({ effort: 'max' })).toThrow(
-      /requires an explicit override/
-    );
+    expect(() => validateModelContract({ effort: 'max' })).toThrow(/requires an explicit override/);
     const contract = validateModelContract({
       effort: 'max',
       allowMaxEffort: true,
@@ -83,9 +77,7 @@ describe('validateModelContract', () => {
 
   test('bounds the fallback chain', () => {
     const chain = Array.from({ length: MAX_FALLBACK_CHAIN + 1 }, (_, i) => `model-${i}`);
-    expect(() => validateModelContract({ fallbackChain: chain })).toThrow(
-      /at most/
-    );
+    expect(() => validateModelContract({ fallbackChain: chain })).toThrow(/at most/);
   });
 
   test('deduplicates the fallback chain', () => {
@@ -96,29 +88,73 @@ describe('validateModelContract', () => {
   });
 
   test('rejects malformed correlation ids', () => {
-    expect(() => validateModelContract({ runId: '../etc/passwd' })).toThrow(
-      ModelContractError
-    );
+    expect(() => validateModelContract({ runId: '../etc/passwd' })).toThrow(ModelContractError);
     expect(() => validateModelContract({ taskId: '' })).toThrow(ModelContractError);
   });
 
   test('rejects unknown tool capabilities', () => {
-    expect(() =>
-      validateModelContract({ allowedToolCapabilities: ['launch.rockets'] })
-    ).toThrow(/Unknown tool capability/);
+    expect(() => validateModelContract({ allowedToolCapabilities: ['launch.rockets'] })).toThrow(
+      /Unknown tool capability/
+    );
   });
 
   test('mutating capabilities require an approval receipt', () => {
     for (const capability of APPROVAL_ONLY_CAPABILITIES) {
-      expect(() =>
-        validateModelContract({ allowedToolCapabilities: [capability] })
-      ).toThrow(/requires an approvalReceiptId/);
+      expect(() => validateModelContract({ allowedToolCapabilities: [capability] })).toThrow(
+        /requires an approvalReceiptId/
+      );
     }
     const contract = validateModelContract({
       allowedToolCapabilities: ['external.write'],
       approvalReceiptId: 'appr-1',
     });
     expect(contract.allowedToolCapabilities).toEqual(['external.write']);
+  });
+
+  test('an approval receipt must be a real, non-blank id', () => {
+    for (const receipt of ['', '   ']) {
+      expect(() =>
+        validateModelContract({
+          allowedToolCapabilities: ['shell.mutate'],
+          approvalReceiptId: receipt,
+        })
+      ).toThrow(/approvalReceiptId must be a non-empty string/);
+    }
+    // A structurally invalid receipt cannot unlock a mutating capability.
+    expect(() =>
+      validateModelContract({
+        allowedToolCapabilities: ['shell.mutate'],
+        approvalReceiptId: 'has space',
+      })
+    ).toThrow(ModelContractError);
+  });
+
+  test('rejects unknown contract fields instead of dropping them', () => {
+    // Fail-open guard: a caller must never be told a directive was accepted
+    // when this build does not implement it.
+    expect(() => validateModelContract({ bogusField: 'x' })).toThrow(
+      /Unknown model contract field\(s\): bogusField/
+    );
+    // The realistic hazard: a deny-style directive that does not exist would
+    // otherwise be silently ignored, granting more than the caller intended.
+    expect(() => validateModelContract({ deniedToolCapabilities: ['shell.mutate'] })).toThrow(
+      /Unknown model contract field/
+    );
+    // A near-miss on the max-effort override must not pass unnoticed.
+    expect(() => validateModelContract({ allow_max_effort: true })).toThrow(
+      /Unknown model contract field/
+    );
+    expect(() => validateModelContract({ bogusField: 'x' })).toThrow(ModelContractError);
+  });
+
+  test('unknown-field rejection names the offending field', () => {
+    try {
+      validateModelContract({ nope: 1 });
+      throw new Error('expected rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ModelContractError);
+      expect((error as ModelContractError).field).toBe('nope');
+    }
   });
 });
 
@@ -171,16 +207,14 @@ describe('resolveModelContract', () => {
   });
 
   test('rejects an unknown alias with a clear message', () => {
-    expect(() =>
-      resolveModelContract(profile, { requestedModel: '@nope' })
-    ).toThrow(/Unknown alias/);
+    expect(() => resolveModelContract(profile, { requestedModel: '@nope' })).toThrow(
+      /Unknown alias/
+    );
   });
 
   test('profile derives effort and never reaches max', () => {
     expect(resolveModelContract(profile, { profile: 'premium' }).effort).toBe('high');
-    expect(resolveModelContract(profile, { profile: 'balanced' }).effort).toBe(
-      'medium'
-    );
+    expect(resolveModelContract(profile, { profile: 'balanced' }).effort).toBe('medium');
     expect(resolveModelContract(profile, { profile: 'fast' }).effort).toBe('low');
   });
 
@@ -204,10 +238,7 @@ describe('resolveModelContract', () => {
     });
     expect(resolved.runId).toBe('run-1');
     expect(resolved.taskId).toBe('task-1');
-    expect(resolved.allowedToolCapabilities).toEqual([
-      'filesystem.read',
-      'git.read',
-    ]);
+    expect(resolved.allowedToolCapabilities).toEqual(['filesystem.read', 'git.read']);
   });
 });
 

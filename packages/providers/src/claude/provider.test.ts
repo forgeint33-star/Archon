@@ -2007,6 +2007,11 @@ describe('API error surfaced as text (#1797)', () => {
     };
   }
 
+  // Mirrors the SDK's real SDKResultSuccess API-failure encoding (#1797).
+  // NOTE: there is deliberately no `terminal_reason: 'api_error'` here — that
+  // value is not in the SDK's TerminalReason union and is never emitted. An
+  // earlier fixture faked it, which masked a dead detection branch in the
+  // provider. `api_error_status` is the real typed signal.
   function apiErrorResult(text: string): Record<string, unknown> {
     return {
       type: 'result',
@@ -2015,7 +2020,6 @@ describe('API error surfaced as text (#1797)', () => {
       api_error_status: null,
       result: text,
       stop_reason: 'stop_sequence',
-      terminal_reason: 'api_error',
       total_cost_usd: 0,
       session_id: 'sid-api-err',
     };
@@ -2063,7 +2067,9 @@ describe('API error surfaced as text (#1797)', () => {
 
   test('api_error result without a preceding synthetic message still throws (belt-and-suspenders)', async () => {
     mockQuery.mockImplementation(async function* () {
-      yield apiErrorResult('Something went wrong upstream');
+      // Status-only signal: no synthetic message precedes it, so detection
+      // rests entirely on api_error_status.
+      yield { ...apiErrorResult('Something went wrong upstream'), api_error_status: 500 };
     });
 
     const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
@@ -2149,6 +2155,140 @@ describe('API error surfaced as text (#1797)', () => {
       expect.objectContaining({ sessionId: 'sid-stop-seq' }),
       'claude.result_success_validated'
     );
+  });
+
+  // Regression coverage for the TerminalReason/'api_error' defect: the
+  // detection branch compared terminal_reason against 'api_error', which is
+  // absent from the SDK's TerminalReason union, so it was statically dead.
+  // Detection now rests on api_error_status, the real typed signal.
+  describe('api-error detection via api_error_status (TerminalReason regression)', () => {
+    test('status-only API error throws even though no synthetic message preceded it', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { ...apiErrorResult('Upstream overloaded'), api_error_status: 529 };
+      });
+
+      const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+
+      expect(error).toBeDefined();
+      expect(error?.message).toContain('Claude API error (unknown)');
+      expect(error?.message).toContain('Upstream overloaded');
+      // Error prose must never surface as consumable output.
+      expect(chunks.filter(c => c.type === 'result')).toHaveLength(0);
+      expect(chunks.filter(c => c.type === 'assistant')).toHaveLength(0);
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ apiErrorStatus: 529 }),
+        'claude.result_api_error'
+      );
+    });
+
+    test('a real TerminalReason value is not mistaken for an API error', async () => {
+      // 'model_error' is a genuine member of the SDK union. Without a synthetic
+      // message and without api_error_status it is NOT the #1797 API-failure
+      // encoding, so the stop-sequence carve-out must still yield a success.
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          subtype: 'success',
+          is_error: true,
+          stop_reason: 'stop_sequence',
+          terminal_reason: 'model_error',
+          api_error_status: null,
+          result: 'partial but usable output',
+          session_id: 'sid-terminal-reason',
+        };
+      });
+
+      const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+
+      expect(error).toBeUndefined();
+      const result = chunks.find(c => c.type === 'result');
+      expect(result).toBeDefined();
+      expect(result).not.toHaveProperty('isError');
+    });
+
+    test('clean success carries no API-error signal and no isError', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          api_error_status: null,
+          result: 'all good',
+          session_id: 'sid-clean',
+        };
+      });
+
+      const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+
+      expect(error).toBeUndefined();
+      const result = chunks.find(c => c.type === 'result');
+      expect(result).toMatchObject({ type: 'result', sessionId: 'sid-clean' });
+      expect(result).not.toHaveProperty('isError');
+    });
+
+    test('terminal SDK failure result surfaces isError instead of throwing', async () => {
+      // SDKResultError (subtype != 'success') is a reported failure, not the
+      // ambiguous #1797 encoding — it flows through as an isError result.
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          errors: ['tool crashed'],
+          terminal_reason: 'model_error',
+          session_id: 'sid-terminal-fail',
+        };
+      });
+
+      const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+
+      expect(error).toBeUndefined();
+      const result = chunks.find(c => c.type === 'result');
+      expect(result).toMatchObject({
+        isError: true,
+        errorSubtype: 'error_during_execution',
+        errors: ['tool crashed'],
+      });
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ errorSubtype: 'error_during_execution' }),
+        'claude.result_is_error'
+      );
+    });
+
+    test('first-event timeout throws a diagnostic, non-retryable timeout error', async () => {
+      const prev = process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS;
+      process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS = '50';
+      try {
+        // A stream that never produces a first event.
+        mockQuery.mockImplementation(async function* () {
+          await new Promise(resolve => setTimeout(resolve, 5_000));
+          yield { type: 'result', subtype: 'success', is_error: false, session_id: 'never' };
+        });
+
+        const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+
+        expect(error?.message).toContain('produced no output within');
+        expect(chunks).toHaveLength(0);
+        // Timeouts are non-retryable — a single attempt only.
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+      } finally {
+        if (prev === undefined) delete process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS;
+        else process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS = prev;
+      }
+    }, 10_000);
+
+    test('cancellation via abortSignal throws a non-retryable aborted error', async () => {
+      const controller = new AbortController();
+      controller.abort();
+
+      const { error } = await collect(
+        client.sendQuery('test', '/workspace', undefined, { abortSignal: controller.signal })
+      );
+
+      expect(error?.message).toContain('Query aborted');
+      // Pre-aborted: the query must not even be attempted.
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
   });
 
   test('real-model message carrying an error code (e.g. max_output_tokens) is not suppressed', async () => {

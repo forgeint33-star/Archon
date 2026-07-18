@@ -911,14 +911,26 @@ async function* streamClaudeMessages(
       const isSuccessWithErrorFlag = resultMsg.is_error === true && resultMsg.subtype === 'success';
 
       // Disambiguate structurally: a preceding synthetic error message
-      // (primary, typed signal), or the typed terminal_reason 'api_error'
+      // (primary, typed signal), or a recorded API error status on the result
       // (secondary — catches an error result with no preceding synthetic
       // message), marks a real failure. Throw so callers fail the node/turn
       // instead of consuming error prose as successful output.
-      if (
-        isSuccessWithErrorFlag &&
-        (syntheticError !== undefined || resultMsg.terminal_reason === 'api_error')
-      ) {
+      //
+      // `api_error_status` is the SDK's only typed API-error field on the
+      // success-shaped result (SDKResultSuccess). It is null/absent on clean
+      // turns and on the #1425 stop-sequence carve-out. `terminal_reason`
+      // cannot serve as this signal: its union ('model_error', 'max_turns',
+      // 'completed', …) has no API-error member, so testing it against
+      // 'api_error' was statically dead and let a status-only API error
+      // through as successful output.
+      //
+      // Any recorded numeric status counts, not just >= 400: `is_error` is
+      // already true on this path, so under-detecting here would re-poison
+      // downstream output with error prose — the exact failure this guard exists
+      // to prevent.
+      const hasApiErrorStatus = typeof resultMsg.api_error_status === 'number';
+
+      if (isSuccessWithErrorFlag && (syntheticError !== undefined || hasApiErrorStatus)) {
         const code = syntheticError?.code ?? 'unknown';
         const text =
           syntheticError?.text ||

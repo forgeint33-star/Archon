@@ -100,6 +100,27 @@ export interface ModelContract {
   approvalReceiptId?: string;
 }
 
+/**
+ * Every field a contract may carry.
+ *
+ * Typed as `Record<keyof ModelContract, true>` so the compiler rejects both a
+ * missing entry (a new contract field silently unaccepted) and a stray one —
+ * the map cannot drift from the interface.
+ */
+const CONTRACT_FIELD_MAP: Record<keyof ModelContract, true> = {
+  requestedModel: true,
+  effort: true,
+  profile: true,
+  fallbackChain: true,
+  runId: true,
+  taskId: true,
+  allowedToolCapabilities: true,
+  allowMaxEffort: true,
+  approvalReceiptId: true,
+};
+
+export const CONTRACT_FIELDS: readonly string[] = Object.keys(CONTRACT_FIELD_MAP);
+
 /** The validated, resolved contract handed to the provider adapter. */
 export interface ResolvedModelContract {
   requestedModel: string | null;
@@ -137,7 +158,7 @@ function validateModelRef(field: string, value: unknown): string {
     throw new ModelContractError(
       field,
       `Unsupported model id '${ref}'. Expected a tier (small/medium/large), ` +
-        `an @alias, or a provider model id such as 'claude-fable-5'.`
+        "an @alias, or a provider model id such as 'claude-fable-5'."
     );
   }
   return ref;
@@ -176,16 +197,13 @@ function validateEffort(value: unknown, allowMax: boolean): ContractEffort {
   if (effort === MAX_EFFORT && !allowMax) {
     throw new ModelContractError(
       'effort',
-      `effort 'max' requires an explicit override (allowMaxEffort: true)`
+      "effort 'max' requires an explicit override (allowMaxEffort: true)"
     );
   }
   return effort as ContractEffort;
 }
 
-function validateCapabilities(
-  value: unknown,
-  approvalReceiptId: string | null
-): ToolCapability[] {
+function validateCapabilities(value: unknown, approvalReceiptId: string | null): ToolCapability[] {
   if (!Array.isArray(value)) {
     throw new ModelContractError(
       'allowedToolCapabilities',
@@ -243,6 +261,20 @@ export function validateModelContract(input: unknown): ModelContract {
   }
 
   const raw = input as Record<string, unknown>;
+
+  // Reject unknown fields rather than dropping them. Silently ignoring an
+  // unrecognized directive is fail-open for a governance contract: a caller
+  // that misspells a field (or sends one this build does not implement)
+  // would be told its constraint was accepted while it was never applied.
+  const unknownFields = Object.keys(raw).filter(key => !(key in CONTRACT_FIELD_MAP));
+  if (unknownFields.length > 0) {
+    throw new ModelContractError(
+      unknownFields[0],
+      `Unknown model contract field(s): ${unknownFields.join(', ')}. ` +
+        `Supported fields: ${CONTRACT_FIELDS.join(', ')}`
+    );
+  }
+
   const contract: ModelContract = {};
 
   if (raw.allowMaxEffort !== undefined) {
@@ -253,10 +285,7 @@ export function validateModelContract(input: unknown): ModelContract {
   }
 
   if (raw.approvalReceiptId !== undefined) {
-    contract.approvalReceiptId = validateCorrelationId(
-      'approvalReceiptId',
-      raw.approvalReceiptId
-    );
+    contract.approvalReceiptId = validateCorrelationId('approvalReceiptId', raw.approvalReceiptId);
   }
 
   if (raw.requestedModel !== undefined) {
@@ -324,7 +353,7 @@ export function resolveModelContract(
 
   if (effort === MAX_EFFORT && contract.allowMaxEffort !== true) {
     // Defence in depth: validation already rejects this path.
-    throw new ModelContractError('effort', `effort 'max' requires an explicit override`);
+    throw new ModelContractError('effort', "effort 'max' requires an explicit override");
   }
 
   const requestedModel = contract.requestedModel ?? options.defaultModel ?? null;
@@ -379,9 +408,7 @@ export function resolveModelContract(
  * Metadata safe to persist alongside a task record. Contains no
  * credentials, no prompt content and no environment values.
  */
-export function modelContractMetadata(
-  resolved: ResolvedModelContract
-): Record<string, unknown> {
+export function modelContractMetadata(resolved: ResolvedModelContract): Record<string, unknown> {
   return {
     requested_model: resolved.requestedModel,
     resolved_model: resolved.resolvedModel,
