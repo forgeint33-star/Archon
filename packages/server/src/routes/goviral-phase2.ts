@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import type { OpenAPIHono } from '@hono/zod-openapi';
 
@@ -426,8 +427,344 @@ async function runtimeResponse(): Promise<RuntimeResponse> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Approval Queue Analysis (Phase 5 — v3.1)
+// ---------------------------------------------------------------------------
+
+interface QueueAnalysisGroup {
+  fingerprint: string;
+  title_pattern: string;
+  count: number;
+  oldest_created_at: string | null;
+  newest_created_at: string | null;
+  source: string | null;
+  risk_classification: string;
+  items: { id: string; title: string; created_at: string | null }[];
+}
+
+interface QueueAnalysisValidationError {
+  item_id: string;
+  errors: string[];
+  approvable: boolean;
+}
+
+interface QueueAnalysis {
+  generated_at: string;
+  queue_hash: string;
+  total_pending: number;
+  groups: QueueAnalysisGroup[];
+  classifications: Record<string, number>;
+  validation_errors: QueueAnalysisValidationError[];
+  malformed_count: number;
+  duplicate_group_count: number;
+}
+
+function classifyRisk(title: string): string {
+  const lower = title.toLowerCase();
+  if (lower.includes('risk engine') || lower.includes('risk_engine')) return 'RISK_ENGINE_FAILED';
+  if (lower.includes('infra') || lower.includes('infrastructure')) return 'INFRA_SERVICE';
+  if (lower.includes('red') && lower.includes('action')) return 'RED_ACTION_PATTERN';
+  if (lower.includes('no service') || lower.includes('service missing')) return 'NO_SERVICE';
+  return 'UNCLASSIFIED';
+}
+
+function normalizeForFingerprint(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?[.\dZ]*/g, '') // strip timestamps
+    .replace(/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/gi, '') // strip UUIDs
+    .replace(/\b\d+\b/g, '') // strip pure numbers
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function approvalQueueAnalysis(): Promise<QueueAnalysis> {
+  let rawText = '';
+  let raw: unknown = {};
+
+  try {
+    rawText = await readFile(APPROVAL_QUEUE_PATH, 'utf8');
+    raw = JSON.parse(rawText) as unknown;
+  } catch {
+    rawText = '';
+    raw = {};
+  }
+
+  const queueHash = rawText
+    ? createHash('sha256').update(rawText).digest('hex')
+    : createHash('sha256').update('').digest('hex');
+
+  const items = extractApprovalItems(raw);
+  const pendingItems = items.filter(i => i.status === 'pending');
+
+  // Group by normalized fingerprint
+  const groupMap = new Map<string, QueueAnalysisGroup>();
+  for (const item of pendingItems) {
+    const normalized = normalizeForFingerprint(item.title);
+    const fingerprint = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+
+    let group = groupMap.get(fingerprint);
+    if (!group) {
+      group = {
+        fingerprint,
+        title_pattern: normalized || item.title.slice(0, 80),
+        count: 0,
+        oldest_created_at: null,
+        newest_created_at: null,
+        source: null,
+        risk_classification: classifyRisk(item.title),
+        items: [],
+      };
+      groupMap.set(fingerprint, group);
+    }
+
+    group.count++;
+    group.items.push({
+      id: item.id,
+      title: item.title,
+      created_at: item.created_at,
+    });
+    group.source = group.source ?? item.requested_by;
+
+    if (item.created_at) {
+      if (!group.oldest_created_at || item.created_at < group.oldest_created_at) {
+        group.oldest_created_at = item.created_at;
+      }
+      if (!group.newest_created_at || item.created_at > group.newest_created_at) {
+        group.newest_created_at = item.created_at;
+      }
+    }
+  }
+
+  const groups = Array.from(groupMap.values()).sort((a, b) => b.count - a.count);
+
+  // Classifications
+  const classifications: Record<string, number> = {};
+  for (const group of groups) {
+    classifications[group.risk_classification] =
+      (classifications[group.risk_classification] ?? 0) + group.count;
+  }
+
+  // Validation errors
+  const validationErrors: QueueAnalysisValidationError[] = [];
+  let malformedCount = 0;
+
+  for (const item of pendingItems) {
+    const errors: string[] = [];
+    if (!item.id) errors.push('missing id');
+    if (!item.title || item.title === 'Governed request') errors.push('missing or generic title');
+    if (!item.status) errors.push('missing status');
+
+    if (errors.length > 0) {
+      malformedCount++;
+      validationErrors.push({
+        item_id: item.id || `unknown-${validationErrors.length}`,
+        errors,
+        approvable: errors.length === 0,
+      });
+    }
+  }
+
+  const duplicateGroupCount = groups.filter(g => g.count > 1).length;
+
+  return {
+    generated_at: new Date().toISOString(),
+    queue_hash: queueHash,
+    total_pending: pendingItems.length,
+    groups,
+    classifications,
+    validation_errors: validationErrors,
+    malformed_count: malformedCount,
+    duplicate_group_count: duplicateGroupCount,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Service State Semantics (Phase 6 — v3.1)
+// ---------------------------------------------------------------------------
+
+type SemanticState =
+  | 'running'
+  | 'healthy_idle'
+  | 'scheduled'
+  | 'disabled'
+  | 'degraded'
+  | 'failed'
+  | 'unknown';
+
+interface SemanticService {
+  name: string;
+  description: string | null;
+  semantic_state: SemanticState;
+  unit_type: 'service' | 'timer' | 'oneshot';
+  active_now: boolean;
+  enabled: boolean;
+  timer_active: boolean;
+  scheduled: boolean;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_result: string | null;
+  health: 'healthy' | 'degraded' | 'failed' | 'unknown';
+  expected_idle: boolean;
+}
+
+interface SemanticServiceResponse {
+  generated_at: string;
+  services: SemanticService[];
+  aggregates: Record<SemanticState, number>;
+  summary: {
+    total: number;
+    healthy: number;
+    attention: number;
+    disabled: number;
+  };
+}
+
+async function semanticServiceResponse(): Promise<SemanticServiceResponse> {
+  const [serviceResult, timerResult] = await Promise.all([
+    listGoviralUnits('service'),
+    listGoviralUnits('timer'),
+  ]);
+
+  // Build a set of timer names → timer info
+  const timerMap = new Map<string, SystemdUnit>();
+  for (const timer of timerResult.units) {
+    // Timer "goviral-foo.timer" corresponds to service "goviral-foo.service"
+    const svcName = timer.name.replace(/\.timer$/, '.service');
+    timerMap.set(svcName, timer);
+  }
+
+  // Also get service execution results
+  const serviceNames = serviceResult.units.map(u => u.name);
+  const serviceProps: Record<string, Record<string, string>> = {};
+  if (serviceNames.length > 0) {
+    const showResult = await runSystemctl([
+      'show',
+      '--no-pager',
+      '--property=Id,Result,ExecMainStartTimestamp,Type',
+      ...serviceNames,
+    ]);
+    if (showResult.ok) {
+      const blocks = showResult.stdout
+        .trim()
+        .split(/\n\s*\n/)
+        .filter(b => b.trim());
+      for (const block of blocks) {
+        const props: Record<string, string> = {};
+        for (const line of block.split('\n')) {
+          const sepIdx = line.indexOf('=');
+          if (sepIdx > 0) props[line.slice(0, sepIdx).trim()] = line.slice(sepIdx + 1).trim();
+        }
+        if (props.Id) serviceProps[props.Id] = props;
+      }
+    }
+  }
+
+  const services: SemanticService[] = [];
+
+  for (const unit of serviceResult.units) {
+    const timer = timerMap.get(unit.name);
+    const timerActive = timer?.active_state === 'active';
+    const svcProps = serviceProps[unit.name] ?? {};
+    const isOneshot = svcProps.Type === 'oneshot';
+
+    const activeNow = unit.active_state === 'active' && unit.sub_state === 'running';
+    const enabled = unit.unit_file_state === 'enabled';
+
+    let semanticState: SemanticState = 'unknown';
+    let health: SemanticService['health'] = 'unknown';
+    let expectedIdle = false;
+
+    if (activeNow) {
+      semanticState = 'running';
+      health = 'healthy';
+    } else if (unit.active_state === 'failed') {
+      semanticState = 'failed';
+      health = 'failed';
+    } else if (unit.unit_file_state === 'disabled') {
+      semanticState = 'disabled';
+      health = 'unknown';
+    } else if (timerActive && !activeNow) {
+      semanticState = 'scheduled';
+      expectedIdle = true;
+      health = 'healthy';
+    } else if (unit.active_state === 'inactive' && unit.sub_state === 'dead' && timer) {
+      semanticState = 'healthy_idle';
+      expectedIdle = true;
+      health = 'healthy';
+    }
+
+    services.push({
+      name: unit.name,
+      description: unit.description,
+      semantic_state: semanticState,
+      unit_type: isOneshot ? 'oneshot' : 'service',
+      active_now: activeNow,
+      enabled,
+      timer_active: timerActive,
+      scheduled: timerActive,
+      next_run_at: timer?.next_trigger ?? null,
+      last_run_at: svcProps.ExecMainStartTimestamp || null,
+      last_result: svcProps.Result || null,
+      health,
+      expected_idle: expectedIdle,
+    });
+  }
+
+  // Include timers that don't have a matching service entry
+  for (const timer of timerResult.units) {
+    const svcName = timer.name.replace(/\.timer$/, '.service');
+    if (!serviceResult.units.find(u => u.name === svcName)) {
+      services.push({
+        name: timer.name,
+        description: timer.description,
+        semantic_state: timer.active_state === 'active' ? 'scheduled' : 'disabled',
+        unit_type: 'timer',
+        active_now: false,
+        enabled: timer.unit_file_state === 'enabled',
+        timer_active: timer.active_state === 'active',
+        scheduled: timer.active_state === 'active',
+        next_run_at: timer.next_trigger,
+        last_run_at: null,
+        last_result: null,
+        health: timer.active_state === 'active' ? 'healthy' : 'unknown',
+        expected_idle: true,
+      });
+    }
+  }
+
+  const aggregates: Record<SemanticState, number> = {
+    running: 0,
+    healthy_idle: 0,
+    scheduled: 0,
+    disabled: 0,
+    degraded: 0,
+    failed: 0,
+    unknown: 0,
+  };
+  for (const svc of services) {
+    aggregates[svc.semantic_state]++;
+  }
+
+  return {
+    generated_at: new Date().toISOString(),
+    services,
+    aggregates,
+    summary: {
+      total: services.length,
+      healthy: aggregates.running + aggregates.healthy_idle + aggregates.scheduled,
+      attention: aggregates.failed + aggregates.degraded,
+      disabled: aggregates.disabled,
+    },
+  };
+}
+
 export function registerGoviralPhase2Routes(app: OpenAPIHono): void {
   app.get('/api/goviral/approvals', async c => c.json(await approvalResponse()));
 
+  app.get('/api/goviral/approvals/analysis', async c => c.json(await approvalQueueAnalysis()));
+
   app.get('/api/goviral/runtime', async c => c.json(await runtimeResponse()));
+
+  app.get('/api/goviral/services/semantic', async c => c.json(await semanticServiceResponse()));
 }
