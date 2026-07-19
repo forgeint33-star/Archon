@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
   getAgentProvider,
   getProviderCapabilities,
@@ -57,6 +57,27 @@ function makeMockRegistration(
     ...overrides,
   };
 }
+
+// `getAgentProvider('claude')` constructs a ClaudeProvider, whose constructor
+// refuses to build under UID 0 unless IS_SANDBOX=1. Without this the registry
+// cases inherit the host UID and whatever IS_SANDBOX the shell exported, so they
+// pass as a normal user and fail as root. Pin the bypass per test and restore
+// the caller's value so nothing leaks out of this file. The guard itself is
+// covered directly in claude/provider.test.ts.
+let savedIsSandbox: string | undefined;
+
+beforeEach(() => {
+  savedIsSandbox = process.env.IS_SANDBOX;
+  process.env.IS_SANDBOX = '1';
+});
+
+afterEach(() => {
+  if (savedIsSandbox === undefined) {
+    delete process.env.IS_SANDBOX;
+  } else {
+    process.env.IS_SANDBOX = savedIsSandbox;
+  }
+});
 
 describe('registry', () => {
   beforeEach(() => {

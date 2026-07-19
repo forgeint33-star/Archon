@@ -20,6 +20,29 @@ import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
+// The ClaudeProvider constructor refuses to build under UID 0 unless IS_SANDBOX=1
+// (see the `constructor` describe below). Without this fixture every
+// `new ClaudeProvider()` in this file inherits the host UID and whatever
+// IS_SANDBOX the shell happened to export, so the suite passes as a normal user
+// and fails wholesale as root — an ambient-environment dependency, not a real
+// defect. Pin the bypass for the duration of each test and restore the caller's
+// value afterwards so nothing leaks out of this file. The guard itself stays
+// under test: the constructor cases below override IS_SANDBOX locally.
+let savedIsSandbox: string | undefined;
+
+beforeEach(() => {
+  savedIsSandbox = process.env.IS_SANDBOX;
+  process.env.IS_SANDBOX = '1';
+});
+
+afterEach(() => {
+  if (savedIsSandbox === undefined) {
+    delete process.env.IS_SANDBOX;
+  } else {
+    process.env.IS_SANDBOX = savedIsSandbox;
+  }
+});
+
 describe('shouldPassNoEnvFile', () => {
   test('returns false when cliPath is undefined (dev mode — SDK 0.2.x resolves a native binary)', () => {
     // Pre-0.2.x the SDK shipped cli.js and dev mode = JS. Since 0.2.x the
@@ -92,6 +115,18 @@ describe('ClaudeProvider', () => {
         );
       } finally {
         if (savedSandbox !== undefined) process.env.IS_SANDBOX = savedSandbox;
+        spy.mockRestore();
+      }
+    });
+
+    test('does not throw as root when IS_SANDBOX=1 (documented sandbox bypass)', () => {
+      // The bypass branch the CI/container environment relies on. Asserting it
+      // here means the suite no longer has to infer it from the ambient shell.
+      const spy = spyOn(claudeModule, 'getProcessUid').mockReturnValue(0);
+      process.env.IS_SANDBOX = '1';
+      try {
+        expect(() => new ClaudeProvider()).not.toThrow();
+      } finally {
         spy.mockRestore();
       }
     });
