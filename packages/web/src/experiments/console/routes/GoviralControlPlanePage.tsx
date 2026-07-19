@@ -10,26 +10,44 @@ import {
   fetchAgentReconciliation,
   fetchCanaryStatus,
   fetchAccessMode,
+  fetchRuntime,
   launchCanary,
   cancelCanary,
   sendTelegramTest,
-  type GoviralOverview,
-  type GoviralThread,
-  type SnapshotFreshness,
-  type ApprovalAnalysisResponse,
-  type ApprovalAnalysisItem,
-  type SemanticServicesResponse,
-  type SemanticService,
-  type SemanticState,
-  type ModulesResponse,
-  type ModuleManifest,
-  type ModuleState,
-  type IntegrationsResponse,
-  type AgentReconciliationResponse,
-  type ReconciliationDriftItem,
-  type CanaryStatusResponse,
-  type AccessModeResponse,
 } from '../skills/goviral';
+import {
+  normalizeOverview,
+  normalizeApprovalAnalysis,
+  normalizeSemanticServices,
+  normalizeModules,
+  normalizeIntegrations,
+  normalizeReconciliation,
+  normalizeCanary,
+  normalizeAccess,
+  normalizeRuntime,
+  toSectionState,
+  renderCount,
+  renderText,
+  renderRatio,
+  ABSENT,
+  SEMANTIC_STATES,
+  type Availability,
+  type SectionState,
+  type OverviewView,
+  type ApprovalAnalysisView,
+  type SemanticServicesView,
+  type SemanticServiceView,
+  type SemanticStateKey,
+  type ModulesView,
+  type ModuleView,
+  type IntegrationsView,
+  type IntegrationView,
+  type ReconciliationView,
+  type CanaryView,
+  type AccessView,
+  type RuntimeView,
+  type SnapshotFreshnessView,
+} from '../skills/goviral-normalize';
 import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react';
 
 type FilterKey = 'failures' | 'drift' | 'pending' | 'malformed' | 'running' | 'needsConfig';
@@ -38,7 +56,7 @@ type FilterKey = 'failures' | 'drift' | 'pending' | 'malformed' | 'running' | 'n
 
 function formatDate(value: string | null | undefined): string {
   if (!value) {
-    return '\u2014';
+    return ABSENT;
   }
 
   const parsed = new Date(value);
@@ -53,13 +71,13 @@ function formatDate(value: string | null | undefined): string {
   }).format(parsed);
 }
 
-function formatAge(seconds: number | null | undefined): string {
-  if (seconds == null || seconds < 0) {
-    return 'unknown';
+function formatAge(seconds: number | null): string {
+  if (seconds === null || seconds < 0) {
+    return ABSENT;
   }
 
   if (seconds < 60) {
-    return `${Math.round(seconds)}s ago`;
+    return `${String(Math.round(seconds))}s ago`;
   }
 
   if (seconds < 3600) {
@@ -73,7 +91,14 @@ function formatAge(seconds: number | null | undefined): string {
   return m > 0 ? `${String(h)}h ${String(m)}m ago` : `${String(h)}h ago`;
 }
 
-function statusTone(status: string): string {
+const NEUTRAL_TONE = 'border-white/15 bg-white/5 text-white/60';
+
+/** `status` is nullable by design — an unknown status must not be styled as a measured one. */
+function statusTone(status: string | null): string {
+  if (status === null) {
+    return NEUTRAL_TONE;
+  }
+
   const normalized = status.toLowerCase();
 
   if (
@@ -92,10 +117,11 @@ function statusTone(status: string): string {
 
   if (
     normalized === 'failed' ||
+    normalized === 'fail' ||
     normalized === 'rejected' ||
     normalized === 'error' ||
     normalized === 'stale' ||
-    normalized === 'risk_engine_failed' ||
+    normalized === 'degraded' ||
     normalized === 'orphaned'
   ) {
     return 'border-red-500/30 bg-red-500/10 text-red-300';
@@ -104,17 +130,20 @@ function statusTone(status: string): string {
   if (
     normalized === 'unavailable' ||
     normalized === 'unknown' ||
+    normalized === 'none' ||
     normalized === 'idle' ||
+    normalized === 'disabled' ||
+    normalized === 'not configured' ||
     normalized === 'cancelled'
   ) {
-    return 'border-white/15 bg-white/5 text-white/60';
+    return NEUTRAL_TONE;
   }
 
   return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
 }
 
-function freshnessTone(freshness: SnapshotFreshness): string {
-  switch (freshness) {
+function freshnessTone(level: SnapshotFreshnessView['level']): string {
+  switch (level) {
     case 'fresh':
       return 'text-emerald-400';
     case 'delayed':
@@ -123,11 +152,13 @@ function freshnessTone(freshness: SnapshotFreshness): string {
       return 'text-red-400';
     case 'unavailable':
       return 'text-white/40';
+    case null:
+      return 'text-white/40';
   }
 }
 
-function freshnessDot(freshness: SnapshotFreshness): string {
-  switch (freshness) {
+function freshnessDot(level: SnapshotFreshnessView['level']): string {
+  switch (level) {
     case 'fresh':
       return 'bg-emerald-400';
     case 'delayed':
@@ -136,45 +167,42 @@ function freshnessDot(freshness: SnapshotFreshness): string {
       return 'bg-red-400';
     case 'unavailable':
       return 'bg-white/30';
+    case null:
+      return 'bg-white/30';
   }
 }
 
-function moduleStateTone(state: ModuleState): string {
-  switch (state) {
-    case 'identified':
-      return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
-    case 'partially_identified':
-      return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
-    case 'orphaned':
-      return 'border-red-500/30 bg-red-500/10 text-red-300';
-    case 'unavailable':
-      return 'border-white/15 bg-white/5 text-white/60';
-  }
-}
-
-function semanticStateTone(state: SemanticState): string {
+function semanticStateTone(state: SemanticStateKey): string {
   switch (state) {
     case 'running':
       return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
-    case 'idle':
-      return 'border-white/15 bg-white/5 text-white/60';
+    case 'healthy_idle':
+      return 'border-emerald-500/20 bg-emerald-500/5 text-emerald-300/80';
     case 'scheduled':
+      return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
+    case 'degraded':
       return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
     case 'failed':
       return 'border-red-500/30 bg-red-500/10 text-red-300';
+    case 'disabled':
+      return NEUTRAL_TONE;
     case 'unknown':
-      return 'border-white/15 bg-white/5 text-white/60';
+      return NEUTRAL_TONE;
   }
+}
+
+function labelState(state: string): string {
+  return state.replace(/_/g, ' ');
 }
 
 // ─── Shared UI components ───────────────────────────────────────────────────
 
-function StatusPill({ status }: { status: string }): ReactElement {
+function StatusPill({ status }: { status: string | null }): ReactElement {
   return (
     <span
       className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${statusTone(status)}`}
     >
-      {status || 'unknown'}
+      {status === null ? ABSENT : labelState(status)}
     </span>
   );
 }
@@ -204,6 +232,80 @@ function Panel({
   );
 }
 
+/**
+ * Renders the real reason a section is degraded. `ready` renders nothing — the
+ * absence of a banner is itself the signal that the data is complete.
+ */
+function AvailabilityNote({ availability }: { availability: Availability }): ReactElement | null {
+  if (availability.kind === 'ready') {
+    return null;
+  }
+
+  const isUnavailable = availability.kind === 'unavailable';
+
+  return (
+    <div
+      className={`mb-3 rounded-lg border px-3 py-2 text-xs ${
+        isUnavailable
+          ? 'border-red-500/30 bg-red-500/10 text-red-200'
+          : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+      }`}
+    >
+      <span className="font-medium">
+        {isUnavailable ? 'Data unavailable' : 'Partial data'}
+        {': '}
+      </span>
+      {availability.reason}
+    </div>
+  );
+}
+
+/**
+ * Wraps a section so loading, request error, and a degraded-but-returned payload
+ * are three visibly different things rather than all collapsing to empty state.
+ */
+function Section<T extends { availability: Availability }>({
+  title,
+  subtitle,
+  badge,
+  state,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  badge?: ReactNode;
+  state: SectionState<T>;
+  children: (value: T) => ReactNode;
+}): ReactElement {
+  if (state.status === 'loading') {
+    return (
+      <Panel title={title} subtitle={subtitle}>
+        <div className="rounded-lg border border-dashed border-white/10 px-4 py-6 text-center text-sm text-white/40">
+          Loading…
+        </div>
+      </Panel>
+    );
+  }
+
+  if (state.status === 'error') {
+    return (
+      <Panel title={title} subtitle={subtitle}>
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-4 text-sm text-red-200">
+          <p className="font-medium">Could not load this section.</p>
+          <p className="mt-1 text-xs text-red-200/80">{state.message}</p>
+        </div>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title={title} subtitle={subtitle} badge={badge}>
+      <AvailabilityNote availability={state.value.availability} />
+      {children(state.value)}
+    </Panel>
+  );
+}
+
 function Metric({
   label,
   value,
@@ -211,15 +313,19 @@ function Metric({
   subtitle,
 }: {
   label: string;
-  value: string | number;
-  detail: string;
+  value: string;
+  detail?: string;
   subtitle?: string;
 }): ReactElement {
+  const isAbsent = value === ABSENT;
+
   return (
     <div className="rounded-xl border border-white/10 bg-white/[0.025] p-4">
       <p className="text-xs font-medium uppercase tracking-wide text-white/45">{label}</p>
-      <p className="mt-2 text-2xl font-semibold text-white">{value}</p>
-      <p className="mt-1 truncate text-xs text-white/45">{detail}</p>
+      <p className={`mt-2 text-2xl font-semibold ${isAbsent ? 'text-white/30' : 'text-white'}`}>
+        {value}
+      </p>
+      {detail ? <p className="mt-1 truncate text-xs text-white/45">{detail}</p> : null}
       {subtitle ? <p className="mt-0.5 truncate text-xs text-white/35">{subtitle}</p> : null}
     </div>
   );
@@ -318,7 +424,7 @@ function ConfirmDialog({
             onClick={onConfirm}
             className="rounded-md border border-fuchsia-500/30 bg-fuchsia-500/15 px-3 py-2 text-sm font-medium text-fuchsia-200 disabled:opacity-35"
           >
-            {busy ? 'Running\u2026' : 'Confirm'}
+            {busy ? 'Running…' : 'Confirm'}
           </button>
         </div>
       </div>
@@ -344,7 +450,8 @@ function FilterBar({
 }: {
   active: Set<FilterKey>;
   onToggle: (key: FilterKey) => void;
-  counts: Record<FilterKey, number>;
+  /** A `null` count is unknown, and renders no badge rather than a zero. */
+  counts: Record<FilterKey, number | null>;
 }): ReactElement {
   return (
     <div className="flex flex-wrap gap-2">
@@ -365,7 +472,7 @@ function FilterBar({
             }`}
           >
             {FILTER_LABELS[key]}
-            {count > 0 ? (
+            {count !== null && count > 0 ? (
               <span className="ml-1.5 rounded-full bg-white/10 px-1.5 py-0.5 text-[10px]">
                 {count}
               </span>
@@ -377,163 +484,79 @@ function FilterBar({
   );
 }
 
-// ─── Integration Status Panel ───────────────────────────────────────────────
+// ─── Integration Status ─────────────────────────────────────────────────────
 
-function IntegrationStatusPanel({
-  data,
-  onTelegramTest,
+function IntegrationCard({
+  integration,
+  action,
 }: {
-  data: IntegrationsResponse | null;
-  onTelegramTest: () => void;
+  integration: IntegrationView;
+  action?: ReactNode;
 }): ReactElement {
-  if (!data) {
-    return (
-      <Panel title="Integration Status" subtitle="Telegram, ClickUp, Qdrant">
-        <EmptyState text="Loading integrations..." />
-      </Panel>
-    );
-  }
-
   return (
-    <Panel title="Integration Status" subtitle="External service connections">
-      <div className="grid gap-3 sm:grid-cols-3">
-        <ExpandableRow
-          details={{
-            credentials_present: String(data.telegram.credentials_present),
-            notifier_timer: data.telegram.notifier_timer,
-            last_delivery: data.telegram.last_delivery,
-            last_check: data.telegram.last_check,
-          }}
-        >
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-sm font-medium text-white/85">Telegram</p>
-            <StatusPill status={data.telegram.state} />
-          </div>
-          <p className="mt-1 text-xs text-white/40">
-            {data.telegram.configured ? 'Configured' : 'Not configured'}
-          </p>
-          {data.telegram.last_delivery ? (
-            <p className="mt-0.5 text-xs text-white/30">
-              Last delivery: {formatDate(data.telegram.last_delivery)}
-            </p>
-          ) : null}
-          <div className="mt-2">
-            <button
-              type="button"
-              onClick={(e): void => {
-                e.stopPropagation();
-                onTelegramTest();
-              }}
-              disabled={!data.telegram.configured}
-              className="rounded-md border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-1 text-xs font-medium text-fuchsia-200 disabled:opacity-35"
-            >
-              Test
-            </button>
-          </div>
-        </ExpandableRow>
-
-        <ExpandableRow
-          details={{
-            stage: data.clickup.stage,
-            writes_enabled: String(data.clickup.writes_enabled),
-            last_check: data.clickup.last_check,
-          }}
-        >
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-sm font-medium text-white/85">ClickUp</p>
-            <StatusPill status={data.clickup.state} />
-          </div>
-          <p className="mt-1 text-xs text-white/40">
-            {data.clickup.configured ? 'Configured' : 'Not configured'}
-            {data.clickup.stage ? ` \u00b7 ${data.clickup.stage}` : ''}
-          </p>
-          {data.clickup.writes_enabled ? (
-            <p className="mt-0.5 text-xs text-amber-300/60">Writes enabled</p>
-          ) : null}
-        </ExpandableRow>
-
-        <ExpandableRow
-          details={{
-            reachable: String(data.qdrant.reachable),
-            collections_count: data.qdrant.collections_count,
-            last_check: data.qdrant.last_check,
-          }}
-        >
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-sm font-medium text-white/85">Qdrant</p>
-            <StatusPill status={data.qdrant.state} />
-          </div>
-          <p className="mt-1 text-xs text-white/40">
-            {data.qdrant.configured ? 'Configured' : 'Not configured'}
-            {data.qdrant.reachable ? ' \u00b7 reachable' : ''}
-          </p>
-          {data.qdrant.collections_count != null ? (
-            <p className="mt-0.5 text-xs text-white/30">
-              {data.qdrant.collections_count} collection(s)
-            </p>
-          ) : null}
-        </ExpandableRow>
+    <ExpandableRow details={Object.fromEntries(integration.details.map(d => [d.label, d.value]))}>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm font-medium text-white/85">{integration.name}</p>
+        <StatusPill status={integration.state} />
       </div>
-    </Panel>
+      <p className="mt-1 text-xs text-white/40">
+        {integration.configured === null
+          ? 'Configuration state not reported'
+          : integration.configured
+            ? 'Configured'
+            : 'Not configured'}
+      </p>
+      {integration.lastActivityAt ? (
+        <p className="mt-0.5 text-xs text-white/30">
+          Last activity: {formatDate(integration.lastActivityAt)}
+        </p>
+      ) : null}
+      {integration.lastCheckedAt ? (
+        <p className="mt-0.5 text-xs text-white/30">
+          Last checked: {formatDate(integration.lastCheckedAt)}
+        </p>
+      ) : null}
+      {integration.lastErrorSummary ? (
+        <p className="mt-0.5 text-xs text-red-300/70">{integration.lastErrorSummary}</p>
+      ) : null}
+      {action ? <div className="mt-2">{action}</div> : null}
+    </ExpandableRow>
   );
 }
 
-// ─── Registry Drift Panel ───────────────────────────────────────────────────
+// ─── Registry Drift ─────────────────────────────────────────────────────────
 
-function RegistryDriftPanel({ data }: { data: AgentReconciliationResponse | null }): ReactElement {
-  if (!data) {
+function DriftBody({ data }: { data: ReconciliationView }): ReactElement {
+  if (data.drift.length === 0) {
     return (
-      <Panel title="Registry Drift" subtitle="Agent reconciliation analysis">
-        <EmptyState text="Loading drift analysis..." />
-      </Panel>
-    );
-  }
-
-  if (data.drift_items.length === 0) {
-    return (
-      <Panel
-        title="Registry Drift"
-        subtitle="Agent reconciliation analysis"
-        badge={<StatusPill status="pass" />}
-      >
-        <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-6 text-center text-sm text-emerald-300">
-          No drift detected. Registry and definitions are consistent.
-        </div>
-      </Panel>
+      <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-6 text-center text-sm text-emerald-300">
+        No drift detected. Registry and definitions are consistent.
+      </div>
     );
   }
 
   return (
-    <Panel
-      title="Registry Drift"
-      subtitle={`${String(data.summary.total_drift)} drift item(s) detected`}
-    >
+    <>
       <div className="space-y-2">
-        {data.drift_items.map(
-          (item: ReconciliationDriftItem): ReactElement => (
-            <ExpandableRow
-              key={`${item.agent}-${item.classification}`}
-              details={{
-                classification: item.classification,
-                issue: item.issue,
-                recommendation: item.recommendation,
-                ...(item.technical_details
-                  ? Object.fromEntries(
-                      Object.entries(item.technical_details).map(([k, v]) => [k, String(v)])
-                    )
-                  : {}),
-              }}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-white/85">{item.agent}</p>
-                  <p className="mt-1 text-xs text-white/45">{item.recommendation}</p>
-                </div>
-                <StatusPill status={item.classification} />
+        {data.drift.map(item => (
+          <ExpandableRow
+            key={`${item.agent}-${item.classification ?? 'unclassified'}`}
+            details={{
+              classification: item.classification,
+              evidence: item.evidence,
+              recommendation: item.recommendation,
+              safe_action: item.safeAction,
+            }}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-white/85">{item.agent}</p>
+                <p className="mt-1 text-xs text-white/45">{renderText(item.recommendation)}</p>
               </div>
-            </ExpandableRow>
-          )
-        )}
+              <StatusPill status={item.classification} />
+            </div>
+          </ExpandableRow>
+        ))}
       </div>
 
       {data.proposals.length > 0 ? (
@@ -544,249 +567,207 @@ function RegistryDriftPanel({ data }: { data: AgentReconciliationResponse | null
           <div className="space-y-2">
             {data.proposals.map(p => (
               <div
-                key={`${p.agent}-${p.action}`}
+                key={`${p.agent}-${p.action ?? 'noop'}`}
                 className="rounded-lg border border-white/10 bg-black/10 px-3 py-2"
               >
                 <p className="text-sm text-white/80">
-                  <span className="font-medium">{p.agent}</span> \u2014 {p.action}
+                  <span className="font-medium">{p.agent}</span>
+                  {' — '}
+                  {renderText(p.action)}
                 </p>
-                <p className="mt-1 text-xs text-white/40">{p.rationale}</p>
+                <p className="mt-1 text-xs text-white/40">{renderText(p.justification)}</p>
+                {p.requiresApproval === true ? (
+                  <p className="mt-1 text-xs text-amber-300/70">Requires approval</p>
+                ) : null}
               </div>
             ))}
           </div>
         </div>
       ) : null}
-    </Panel>
+    </>
   );
 }
 
-// ─── Canary Task Panel ──────────────────────────────────────────────────────
+// ─── Semantic Services ──────────────────────────────────────────────────────
 
-function CanaryPanel({
-  data,
-  onLaunch,
-  onCancel,
-}: {
-  data: CanaryStatusResponse | null;
-  onLaunch: () => void;
-  onCancel: () => void;
-}): ReactElement {
-  if (!data) {
-    return (
-      <Panel title="Canary Task">
-        <EmptyState text="Loading canary status..." />
-      </Panel>
-    );
-  }
-
-  const isRunning = data.status === 'running';
-
-  return (
-    <Panel title="Canary Task" badge={<StatusPill status={data.status} />}>
-      <div className="space-y-3">
-        {data.task_id ? (
-          <p className="font-mono text-xs text-white/35">Task: {data.task_id}</p>
-        ) : null}
-
-        <div className="grid gap-2 text-xs text-white/45">
-          {data.started_at ? <p>Started: {formatDate(data.started_at)}</p> : null}
-          {data.completed_at ? <p>Completed: {formatDate(data.completed_at)}</p> : null}
-          {data.cancelled_at ? <p>Cancelled: {formatDate(data.cancelled_at)}</p> : null}
-          {data.result_summary ? <p>Result: {data.result_summary}</p> : null}
-        </div>
-
-        <div className="flex gap-2">
-          {isRunning ? (
-            <button
-              type="button"
-              onClick={(e): void => {
-                e.stopPropagation();
-                onCancel();
-              }}
-              className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200"
-            >
-              Cancel Canary
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={(e): void => {
-                e.stopPropagation();
-                onLaunch();
-              }}
-              className="rounded-md border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-1.5 text-xs font-medium text-fuchsia-200"
-            >
-              Launch Canary
-            </button>
-          )}
-        </div>
-      </div>
-    </Panel>
-  );
-}
-
-// ─── Access Mode Panel ──────────────────────────────────────────────────────
-
-function AccessModePanel({ data }: { data: AccessModeResponse | null }): ReactElement {
-  if (!data) {
-    return (
-      <Panel title="Access Mode">
-        <EmptyState text="Loading access info..." />
-      </Panel>
-    );
-  }
-
-  return (
-    <Panel title="Access Mode" badge={<StatusPill status={data.access_mode} />}>
-      <div className="space-y-2 text-sm">
-        <p className="text-white/60">{data.access_mode_description}</p>
-        <div className="grid gap-1 text-xs text-white/45">
-          <p>Auth enabled: {data.auth_enabled ? 'Yes' : 'No'}</p>
-          <p>Public exposure: {data.public_exposure ? 'Yes' : 'No'}</p>
-          <p>RBAC role: {data.rbac_role}</p>
-        </div>
-      </div>
-    </Panel>
-  );
-}
-
-// ─── Semantic Services Panel ────────────────────────────────────────────────
-
-function SemanticServicesPanel({
+function SemanticServicesBody({
   data,
   highlight,
 }: {
-  data: SemanticServicesResponse | null;
+  data: SemanticServicesView;
   highlight: Set<FilterKey>;
 }): ReactElement {
-  if (!data) {
-    return (
-      <Panel title="Services & Timers" subtitle="Loading semantic state...">
-        <EmptyState text="Loading services..." />
-      </Panel>
-    );
-  }
-
-  const agg = data.aggregates;
   const showFailedOnly = highlight.has('failures');
   const showRunningOnly = highlight.has('running');
 
-  // Sort: failed first, then running, then scheduled, then idle, then unknown
-  const sortedServices = [...data.services].sort((a, b) => {
-    const order: Record<SemanticState, number> = {
-      failed: 0,
-      running: 1,
-      scheduled: 2,
-      idle: 3,
-      unknown: 4,
-    };
-    return (order[a.semantic_state] ?? 5) - (order[b.semantic_state] ?? 5);
-  });
+  const order: Record<SemanticStateKey, number> = {
+    failed: 0,
+    degraded: 1,
+    running: 2,
+    scheduled: 3,
+    healthy_idle: 4,
+    disabled: 5,
+    unknown: 6,
+  };
 
-  const filteredServices = sortedServices.filter((svc: SemanticService): boolean => {
-    if (showFailedOnly && svc.semantic_state !== 'failed') return false;
-    if (showRunningOnly && svc.semantic_state !== 'running') return false;
+  const sorted = [...data.services].sort((a, b) => order[a.semanticState] - order[b.semanticState]);
+
+  const filtered = sorted.filter((svc): boolean => {
+    if (showFailedOnly && svc.semanticState !== 'failed') return false;
+    if (showRunningOnly && svc.semanticState !== 'running') return false;
     return true;
   });
 
-  // Group by semantic state
-  const groups = new Map<SemanticState, SemanticService[]>();
-  for (const svc of filteredServices) {
-    const existing = groups.get(svc.semantic_state) ?? [];
+  const groups = new Map<SemanticStateKey, SemanticServiceView[]>();
+  for (const svc of filtered) {
+    const existing = groups.get(svc.semanticState) ?? [];
     existing.push(svc);
-    groups.set(svc.semantic_state, existing);
+    groups.set(svc.semanticState, existing);
   }
 
   return (
-    <Panel title="Services & Timers" subtitle="Semantic service state groups">
-      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
-        <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 text-center">
-          <p className="text-xl font-semibold text-emerald-300">{agg.running}</p>
-          <p className="text-xs text-emerald-300/60">Running</p>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-center">
-          <p className="text-xl font-semibold text-white/60">{agg.idle}</p>
-          <p className="text-xs text-white/35">Idle</p>
-        </div>
-        <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-center">
-          <p className="text-xl font-semibold text-amber-200">{agg.scheduled}</p>
-          <p className="text-xs text-amber-200/60">Scheduled</p>
-        </div>
-        <div className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-center">
-          <p className="text-xl font-semibold text-red-300">{agg.failed}</p>
-          <p className="text-xs text-red-300/60">Failed</p>
-        </div>
-        <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-center">
-          <p className="text-xl font-semibold text-white/60">{agg.total}</p>
-          <p className="text-xs text-white/35">Total</p>
-        </div>
+    <>
+      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <Metric label="Total" value={renderCount(data.total)} />
+        <Metric label="Healthy" value={renderCount(data.healthy)} />
+        <Metric label="Attention" value={renderCount(data.attention)} />
+        <Metric label="Disabled" value={renderCount(data.disabled)} />
+      </div>
+
+      <div className="mb-4 flex flex-wrap gap-2">
+        {SEMANTIC_STATES.map(state => (
+          <span
+            key={state}
+            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${semanticStateTone(state)}`}
+          >
+            {labelState(state)}
+            <span className="font-semibold">{renderCount(data.aggregates[state])}</span>
+          </span>
+        ))}
       </div>
 
       <div className="space-y-4">
         {Array.from(groups.entries()).map(([state, services]) => (
           <div key={state}>
             <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/40">
-              {state} ({services.length})
+              {labelState(state)} ({services.length})
             </p>
             <div className="space-y-2">
-              {services.map(
-                (svc: SemanticService): ReactElement => (
-                  <ExpandableRow
-                    key={svc.name}
-                    details={{
-                      active_state: svc.active_state,
-                      sub_state: svc.sub_state,
-                      unit_file_state: svc.unit_file_state,
-                      next_run_at: svc.next_run_at,
-                      timer_backed: String(svc.timer_backed),
-                    }}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="truncate font-mono text-xs text-white/85">{svc.name}</p>
-                        <p className="mt-1 truncate text-xs text-white/40">
-                          {svc.description ?? '\u2014'}
+              {services.map(svc => (
+                <ExpandableRow
+                  key={svc.name}
+                  details={{
+                    unit_type: svc.unitType,
+                    health: svc.health,
+                    active_now: svc.activeNow,
+                    enabled: svc.enabled,
+                    scheduled: svc.scheduled,
+                    next_run_at: svc.nextRunAt,
+                    last_run_at: svc.lastRunAt,
+                    last_result: svc.lastResult,
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate font-mono text-xs text-white/85">{svc.name}</p>
+                      <p className="mt-1 truncate text-xs text-white/40">
+                        {renderText(svc.description)}
+                      </p>
+                      {svc.nextRunAt ? (
+                        <p className="mt-0.5 text-xs text-white/30">
+                          Next run: {formatDate(svc.nextRunAt)}
                         </p>
-                        {svc.timer_backed && svc.next_run_at ? (
-                          <p className="mt-0.5 text-xs text-white/30">
-                            Next run: {formatDate(svc.next_run_at)}
-                          </p>
-                        ) : null}
-                      </div>
-                      <span
-                        className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${semanticStateTone(svc.semantic_state)}`}
-                      >
-                        {svc.semantic_state}
-                      </span>
+                      ) : null}
                     </div>
-                  </ExpandableRow>
-                )
-              )}
+                    <span
+                      className={`inline-flex flex-shrink-0 rounded-full border px-2 py-0.5 text-xs font-medium ${semanticStateTone(svc.semanticState)}`}
+                    >
+                      {labelState(svc.semanticState)}
+                    </span>
+                  </div>
+                </ExpandableRow>
+              ))}
             </div>
           </div>
         ))}
       </div>
 
-      {filteredServices.length === 0 ? (
-        <EmptyState text="No services match the current filter." />
+      {filtered.length === 0 ? (
+        <EmptyState
+          text={
+            data.services.length === 0
+              ? 'No services were reported.'
+              : 'No services match the current filter.'
+          }
+        />
       ) : null}
-    </Panel>
+    </>
+  );
+}
+
+// ─── Runtime (systemd availability truth) ───────────────────────────────────
+
+function RuntimeBody({ data }: { data: RuntimeView }): ReactElement {
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+        <Metric label="Services" value={renderCount(data.servicesTotal)} />
+        <Metric label="Services active" value={renderCount(data.servicesActive)} />
+        <Metric label="Timers" value={renderCount(data.timersTotal)} />
+        <Metric label="Timers active" value={renderCount(data.timersActive)} />
+        <Metric label="Failed units" value={renderCount(data.failedUnits)} />
+      </div>
+
+      {data.timers.length > 0 ? (
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/40">
+            Timers ({data.timers.length})
+          </p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {data.timers.slice(0, 20).map(unit => (
+              <ExpandableRow
+                key={unit.name}
+                details={{
+                  active_state: unit.activeState,
+                  sub_state: unit.subState,
+                  unit_file_state: unit.unitFileState,
+                  next_trigger: unit.nextTrigger,
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <p className="truncate font-mono text-xs text-white/80">{unit.name}</p>
+                  <StatusPill status={unit.activeState} />
+                </div>
+              </ExpandableRow>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 
 // ─── Main Page Component ────────────────────────────────────────────────────
 
 export function GoviralControlPlanePage(): ReactElement {
-  const [overview, setOverview] = useState<GoviralOverview | null>(null);
-  const [approvalAnalysis, setApprovalAnalysis] = useState<ApprovalAnalysisResponse | null>(null);
-  const [semanticServices, setSemanticServices] = useState<SemanticServicesResponse | null>(null);
-  const [modules, setModules] = useState<ModulesResponse | null>(null);
-  const [integrations, setIntegrations] = useState<IntegrationsResponse | null>(null);
-  const [reconciliation, setReconciliation] = useState<AgentReconciliationResponse | null>(null);
-  const [canary, setCanary] = useState<CanaryStatusResponse | null>(null);
-  const [accessMode, setAccessMode] = useState<AccessModeResponse | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
+  const [overview, setOverview] = useState<SectionState<OverviewView>>({ status: 'loading' });
+  const [approvals, setApprovals] = useState<SectionState<ApprovalAnalysisView>>({
+    status: 'loading',
+  });
+  const [services, setServices] = useState<SectionState<SemanticServicesView>>({
+    status: 'loading',
+  });
+  const [modules, setModules] = useState<SectionState<ModulesView>>({ status: 'loading' });
+  const [integrations, setIntegrations] = useState<SectionState<IntegrationsView>>({
+    status: 'loading',
+  });
+  const [reconciliation, setReconciliation] = useState<SectionState<ReconciliationView>>({
+    status: 'loading',
+  });
+  const [canary, setCanary] = useState<SectionState<CanaryView>>({ status: 'loading' });
+  const [access, setAccess] = useState<SectionState<AccessView>>({ status: 'loading' });
+  const [runtime, setRuntime] = useState<SectionState<RuntimeView>>({ status: 'loading' });
+
   const [activeFilters, setActiveFilters] = useState<Set<FilterKey>>(new Set());
   const [confirmAction, setConfirmAction] = useState<{
     title: string;
@@ -794,6 +775,7 @@ export function GoviralControlPlanePage(): ReactElement {
     action: () => Promise<void>;
   } | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const canaryTimerRef = useRef<number | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
@@ -806,6 +788,7 @@ export function GoviralControlPlanePage(): ReactElement {
       reconciliationResult,
       canaryResult,
       accessResult,
+      runtimeResult,
     ] = await Promise.allSettled([
       fetchGoviralOverview(),
       fetchApprovalAnalysis(),
@@ -815,36 +798,18 @@ export function GoviralControlPlanePage(): ReactElement {
       fetchAgentReconciliation(),
       fetchCanaryStatus(),
       fetchAccessMode(),
+      fetchRuntime(),
     ]);
 
-    const errors: string[] = [];
-
-    if (overviewResult.status === 'fulfilled') setOverview(overviewResult.value);
-    else errors.push('overview');
-
-    if (approvalResult.status === 'fulfilled') setApprovalAnalysis(approvalResult.value);
-    else errors.push('approvals');
-
-    if (servicesResult.status === 'fulfilled') setSemanticServices(servicesResult.value);
-    else errors.push('services');
-
-    if (modulesResult.status === 'fulfilled') setModules(modulesResult.value);
-    else errors.push('modules');
-
-    if (integrationsResult.status === 'fulfilled') setIntegrations(integrationsResult.value);
-    else errors.push('integrations');
-
-    if (reconciliationResult.status === 'fulfilled') setReconciliation(reconciliationResult.value);
-    else errors.push('reconciliation');
-
-    if (canaryResult.status === 'fulfilled') setCanary(canaryResult.value);
-    else errors.push('canary');
-
-    if (accessResult.status === 'fulfilled') setAccessMode(accessResult.value);
-    else errors.push('access');
-
-    setError(errors.length > 0 ? `Unable to refresh: ${errors.join(', ')}` : null);
-    setLoading(false);
+    setOverview(toSectionState(overviewResult, normalizeOverview));
+    setApprovals(toSectionState(approvalResult, normalizeApprovalAnalysis));
+    setServices(toSectionState(servicesResult, normalizeSemanticServices));
+    setModules(toSectionState(modulesResult, normalizeModules));
+    setIntegrations(toSectionState(integrationsResult, normalizeIntegrations));
+    setReconciliation(toSectionState(reconciliationResult, normalizeReconciliation));
+    setCanary(toSectionState(canaryResult, normalizeCanary));
+    setAccess(toSectionState(accessResult, normalizeAccess));
+    setRuntime(toSectionState(runtimeResult, normalizeRuntime));
   }, []);
 
   // Main 30-second refresh
@@ -860,14 +825,19 @@ export function GoviralControlPlanePage(): ReactElement {
     };
   }, [load]);
 
-  // Canary 5-second refresh when running
+  const canaryRunning = canary.status === 'loaded' && canary.value.isRunning;
+
+  // Canary 5-second refresh while a canary is actually running
   useEffect((): (() => void) => {
-    if (canary?.status === 'running') {
+    if (canaryRunning) {
       canaryTimerRef.current = window.setInterval((): void => {
         void fetchCanaryStatus()
-          .then(setCanary)
-          .catch(() => {
-            /* ignore */
+          .then((raw): void => {
+            setCanary({ status: 'loaded', value: normalizeCanary(raw) });
+          })
+          .catch((): void => {
+            // The 30s full refresh reports any persistent failure; a single
+            // missed fast poll must not clear the panel.
           });
       }, 5_000);
     } else if (canaryTimerRef.current) {
@@ -878,9 +848,10 @@ export function GoviralControlPlanePage(): ReactElement {
     return (): void => {
       if (canaryTimerRef.current) {
         window.clearInterval(canaryTimerRef.current);
+        canaryTimerRef.current = null;
       }
     };
-  }, [canary?.status]);
+  }, [canaryRunning]);
 
   const toggleFilter = useCallback((key: FilterKey): void => {
     setActiveFilters(prev => {
@@ -897,43 +868,70 @@ export function GoviralControlPlanePage(): ReactElement {
   const handleConfirmAction = useCallback(async (): Promise<void> => {
     if (!confirmAction) return;
     setActionBusy(true);
+    setActionError(null);
     try {
       await confirmAction.action();
       await load();
-    } catch {
-      // error handled by caller
+    } catch (e) {
+      const err = e as Error;
+      setActionError(err.message || 'The action failed with no detail.');
     } finally {
       setActionBusy(false);
       setConfirmAction(null);
     }
   }, [confirmAction, load]);
 
-  // Derived values
-  const freshness = overview?.brain?.snapshot_freshness;
-  const pendingApprovals = approvalAnalysis?.counts.pending ?? overview?.approvals.pending ?? 0;
-  const semanticAgg = semanticServices?.aggregates;
-  const healthyServices = semanticAgg ? semanticAgg.running : 0;
-  const totalServices = semanticAgg ? semanticAgg.total : 0;
-  const failedServices = semanticAgg ? semanticAgg.failed : 0;
+  // ─── Derived, null-preserving ─────────────────────────────────────────────
 
-  const generatedAt = overview?.generated_at ?? approvalAnalysis?.generated_at ?? null;
+  const overviewValue = overview.status === 'loaded' ? overview.value : null;
+  const approvalsValue = approvals.status === 'loaded' ? approvals.value : null;
+  const servicesValue = services.status === 'loaded' ? services.value : null;
+  const integrationsValue = integrations.status === 'loaded' ? integrations.value : null;
+  const reconciliationValue = reconciliation.status === 'loaded' ? reconciliation.value : null;
+  const canaryValue = canary.status === 'loaded' ? canary.value : null;
 
-  // Filter counts
-  const filterCounts: Record<FilterKey, number> = {
-    failures:
-      (semanticAgg?.failed ?? 0) +
-      (approvalAnalysis?.items.filter(i => i.risk_classification === 'RISK_ENGINE_FAILED').length ??
-        0),
-    drift: reconciliation?.summary.total_drift ?? 0,
+  const freshness = overviewValue?.freshness ?? null;
+
+  // Prefer the analysis endpoint's live pending count; fall back to the overview's
+  // snapshot only when the analysis genuinely reported one. Neither present stays null.
+  const pendingApprovals = approvalsValue?.totalPending ?? overviewValue?.approvals.pending ?? null;
+
+  const generatedAt = overviewValue?.generatedAt ?? approvalsValue?.generatedAt ?? null;
+
+  const failuresCount =
+    servicesValue === null
+      ? null
+      : (servicesValue.aggregates.failed ?? 0) + (servicesValue.aggregates.degraded ?? 0);
+
+  const needsConfigCount =
+    integrationsValue === null
+      ? null
+      : [
+          integrationsValue.telegram?.configured,
+          integrationsValue.clickup?.configured,
+          integrationsValue.qdrant?.configured,
+        ].filter(configured => configured === false).length;
+
+  const filterCounts: Record<FilterKey, number | null> = {
+    failures: failuresCount,
+    drift: reconciliationValue?.driftCount ?? null,
     pending: pendingApprovals,
-    malformed: approvalAnalysis?.counts.malformed ?? 0,
-    running: canary?.status === 'running' ? 1 : 0,
-    needsConfig: [
-      integrations?.telegram.configured === false,
-      integrations?.clickup.configured === false,
-      integrations?.qdrant.configured === false,
-    ].filter(Boolean).length,
+    malformed: approvalsValue?.malformedCount ?? null,
+    running: canaryValue === null ? null : canaryValue.isRunning ? 1 : 0,
+    needsConfig: needsConfigCount,
   };
+
+  const anyError = [
+    overview,
+    approvals,
+    services,
+    modules,
+    integrations,
+    reconciliation,
+    canary,
+    access,
+    runtime,
+  ].filter(state => state.status === 'error').length;
 
   return (
     <div className="h-full overflow-y-auto">
@@ -960,38 +958,49 @@ export function GoviralControlPlanePage(): ReactElement {
               {freshness ? (
                 <span className="flex items-center gap-1.5">
                   <span
-                    className={`inline-block h-2 w-2 rounded-full ${freshnessDot(freshness.freshness)}`}
+                    className={`inline-block h-2 w-2 rounded-full ${freshnessDot(freshness.level)}`}
                   />
-                  <span className={`text-xs ${freshnessTone(freshness.freshness)}`}>
-                    {freshness.age_seconds != null
-                      ? formatAge(freshness.age_seconds)
-                      : freshness.freshness}
+                  <span className={`text-xs ${freshnessTone(freshness.level)}`}>
+                    {freshness.ageSeconds !== null
+                      ? formatAge(freshness.ageSeconds)
+                      : renderText(freshness.level)}
                   </span>
                 </span>
               ) : null}
             </div>
+            {freshness?.sourceUpdatedAt ? (
+              <p className="mt-0.5 text-white/30">
+                Source updated: {formatDate(freshness.sourceUpdatedAt)}
+              </p>
+            ) : null}
+            {freshness?.producer ? (
+              <p className="mt-0.5 text-white/30">
+                Producer: {freshness.producer}
+                {freshness.producerStatus ? ` (${freshness.producerStatus})` : ''}
+              </p>
+            ) : null}
           </div>
         </header>
 
-        {/* ── Stale data warning ─────────────────────────────────────── */}
-        {freshness && (freshness.freshness === 'stale' || freshness.freshness === 'unavailable') ? (
+        {/* ── Snapshot staleness ─────────────────────────────────────── */}
+        {freshness && (freshness.level === 'stale' || freshness.level === 'unavailable') ? (
           <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-            Brain snapshot is {freshness.freshness}
-            {freshness.last_error_summary ? ` \u2014 ${freshness.last_error_summary}` : ''}.
-            {freshness.producer_status ? ` Producer: ${freshness.producer_status}.` : ''} Data shown
+            Brain snapshot is {freshness.level}
+            {freshness.lastErrorSummary ? ` — ${freshness.lastErrorSummary}` : ''}.
+            {freshness.producerStatus ? ` Producer: ${freshness.producerStatus}.` : ''} Data shown
             may be outdated.
           </div>
         ) : null}
 
-        {error ? (
+        {anyError > 0 ? (
           <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-            {error}
+            {anyError} section(s) failed to load. Each affected panel shows its own error below.
           </div>
         ) : null}
 
-        {loading && !overview ? (
-          <div className="rounded-xl border border-white/10 p-8 text-center text-sm text-white/50">
-            Loading GoViral operational state\u2026
+        {actionError ? (
+          <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+            Action failed: {actionError}
           </div>
         ) : null}
 
@@ -1002,286 +1011,412 @@ export function GoviralControlPlanePage(): ReactElement {
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <Metric
             label="Brain Doctor"
-            value={overview?.doctor.status ?? 'UNKNOWN'}
-            detail="Canonical brain health"
+            value={
+              overview.status === 'loaded'
+                ? renderText(overviewValue?.doctorStatus ?? null)
+                : ABSENT
+            }
+            detail={
+              overview.status === 'loading'
+                ? 'Loading…'
+                : overview.status === 'error'
+                  ? 'Could not load'
+                  : (overviewValue?.doctorSource ?? 'Canonical brain health')
+            }
+            subtitle={
+              overviewValue?.doctorModifiedAt
+                ? `Checked ${formatDate(overviewValue.doctorModifiedAt)}`
+                : undefined
+            }
           />
           <Metric
             label="Pending approvals"
-            value={pendingApprovals}
-            detail={`${approvalAnalysis?.counts.executed ?? overview?.approvals.executed ?? 0} executed`}
+            value={renderCount(pendingApprovals)}
+            detail={
+              approvalsValue?.queueHash
+                ? `Queue ${approvalsValue.queueHash.slice(0, 8)}`
+                : 'Awaiting decision'
+            }
+            subtitle={
+              approvalsValue?.duplicateGroupCount !== null &&
+              approvalsValue?.duplicateGroupCount !== undefined
+                ? `${String(approvalsValue.duplicateGroupCount)} duplicate group(s)`
+                : undefined
+            }
           />
           <Metric
             label="Services"
-            value={`${String(healthyServices)}/${String(totalServices)}`}
-            detail={`${String(failedServices)} failed`}
+            value={renderRatio(servicesValue?.healthy ?? null, servicesValue?.total ?? null)}
+            detail={`${renderCount(servicesValue?.attention ?? null)} needing attention`}
             subtitle={
-              semanticAgg
-                ? `${String(semanticAgg.running)} running, ${String(semanticAgg.idle)} idle, ${String(semanticAgg.failed)} failed`
+              servicesValue
+                ? `${renderCount(servicesValue.aggregates.scheduled)} scheduled, ${renderCount(
+                    servicesValue.aggregates.disabled
+                  )} disabled`
                 : undefined
             }
           />
           <Metric
             label="Latest PRD"
-            value={overview?.latest_prd?.title ?? '\u2014'}
-            detail={`${String(overview?.recent_threads.length ?? 0)} recent agent threads`}
+            value={renderText(overviewValue?.latestPrdTitle ?? null)}
+            detail={
+              overviewValue
+                ? `${String(overviewValue.threads.length)} recent agent threads`
+                : 'Recent agent threads'
+            }
+            subtitle={
+              overviewValue?.latestPrdModifiedAt
+                ? formatDate(overviewValue.latestPrdModifiedAt)
+                : undefined
+            }
           />
         </div>
 
         {/* ── Approval Queue + Agent Runs ─────────────────────────────── */}
         <div className="grid gap-5 xl:grid-cols-2">
-          {/* Approval Queue */}
-          <Panel
+          <Section
             title="Approval Queue"
-            subtitle={`Source refreshed ${formatDate(approvalAnalysis?.generated_at)}`}
-            badge={
-              approvalAnalysis &&
-              (approvalAnalysis.duplicate_groups.length > 0 ||
-                approvalAnalysis.counts.malformed > 0) ? (
-                <span className="flex gap-1.5">
-                  {approvalAnalysis.duplicate_groups.length > 0 ? (
-                    <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-200">
-                      {approvalAnalysis.duplicate_groups.length} duplicate group(s)
-                    </span>
-                  ) : null}
-                  {approvalAnalysis.counts.malformed > 0 ? (
-                    <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-xs font-medium text-red-300">
-                      {approvalAnalysis.counts.malformed} malformed
-                    </span>
-                  ) : null}
-                </span>
-              ) : undefined
+            subtitle={
+              approvalsValue?.generatedAt
+                ? `Source refreshed ${formatDate(approvalsValue.generatedAt)}`
+                : 'Governed approval queue analysis'
             }
+            state={approvals}
           >
-            <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Metric
-                label="Pending"
-                value={approvalAnalysis?.counts.pending ?? 0}
-                detail="Awaiting decision"
-              />
-              <Metric
-                label="Approved"
-                value={approvalAnalysis?.counts.approved ?? 0}
-                detail="Approved requests"
-              />
-              <Metric
-                label="Rejected"
-                value={approvalAnalysis?.counts.rejected ?? 0}
-                detail="Rejected requests"
-              />
-              <Metric
-                label="Executed"
-                value={approvalAnalysis?.counts.executed ?? 0}
-                detail="Governed executions"
-              />
-            </div>
+            {(data): ReactNode => (
+              <>
+                <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                  <Metric label="Pending" value={renderCount(data.totalPending)} />
+                  <Metric label="Malformed" value={renderCount(data.malformedCount)} />
+                  <Metric label="Duplicate groups" value={renderCount(data.duplicateGroupCount)} />
+                </div>
 
-            {approvalAnalysis && approvalAnalysis.items.length > 0 ? (
-              <div className="space-y-2">
-                {approvalAnalysis.items
-                  .filter((item: ApprovalAnalysisItem): boolean => {
-                    if (activeFilters.has('malformed') && !item.malformed) return false;
-                    if (activeFilters.has('pending') && item.status !== 'pending') return false;
-                    return true;
-                  })
-                  .map(
-                    (item: ApprovalAnalysisItem): ReactElement => (
-                      <ExpandableRow
-                        key={`${item.status}-${item.id}`}
-                        details={{
-                          id: item.id,
-                          risk_classification: item.risk_classification,
-                          malformed: item.malformed ? 'Yes' : undefined,
-                          malformed_reason: item.malformed_reason,
-                          requested_by: item.requested_by,
-                          created_at: item.created_at,
-                        }}
+                {data.classifications.length > 0 ? (
+                  <div className="mb-4 flex flex-wrap gap-2">
+                    {data.classifications.map(c => (
+                      <span
+                        key={c.label}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${statusTone(c.label)}`}
                       >
-                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                              <p className="truncate text-sm font-medium text-white/85">
-                                {item.title}
-                              </p>
-                              {item.malformed ? (
-                                <span
-                                  className="flex-shrink-0 text-red-400"
-                                  title={item.malformed_reason ?? 'Malformed approval item'}
-                                >
-                                  &#9888;
-                                </span>
-                              ) : null}
-                            </div>
-                            <p className="mt-1 text-xs text-white/40">
-                              {item.requested_by ?? 'unknown source'} \u00b7{' '}
-                              {formatDate(item.created_at)}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            {item.risk_classification ? (
-                              <StatusPill status={item.risk_classification} />
-                            ) : null}
-                            <StatusPill status={item.status} />
-                          </div>
-                        </div>
-                      </ExpandableRow>
-                    )
-                  )}
-              </div>
-            ) : (
-              <EmptyState text="No bounded approval item metadata available." />
-            )}
-          </Panel>
+                        {labelState(c.label)}
+                        <span className="font-semibold">{c.count}</span>
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
 
-          {/* Agent Runs */}
-          <Panel
+                {data.groups.length > 0 ? (
+                  <div className="space-y-2">
+                    {data.groups
+                      .filter((group): boolean => {
+                        if (
+                          activeFilters.has('pending') &&
+                          group.riskClassification === null &&
+                          group.count === null
+                        ) {
+                          return false;
+                        }
+                        return true;
+                      })
+                      .map(group => (
+                        <ExpandableRow
+                          key={group.fingerprint ?? group.titlePattern ?? 'group'}
+                          details={{
+                            fingerprint: group.fingerprint,
+                            count: group.count,
+                            source: group.source,
+                            risk_classification: group.riskClassification,
+                            oldest_created_at: group.oldestCreatedAt,
+                            newest_created_at: group.newestCreatedAt,
+                          }}
+                        >
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-medium text-white/85">
+                                {renderText(group.titlePattern)}
+                              </p>
+                              <p className="mt-1 text-xs text-white/40">
+                                {renderText(group.source)}
+                                {' · '}
+                                {formatDate(group.newestCreatedAt)}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <StatusPill status={group.riskClassification} />
+                              <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-xs text-white/60">
+                                ×{renderCount(group.count)}
+                              </span>
+                            </div>
+                          </div>
+                        </ExpandableRow>
+                      ))}
+                  </div>
+                ) : (
+                  <EmptyState
+                    text={
+                      data.totalPending === 0
+                        ? 'The approval queue is empty.'
+                        : 'No grouped approval metadata was returned.'
+                    }
+                  />
+                )}
+
+                {data.validationErrors.length > 0 ? (
+                  <div className="mt-4 border-t border-white/10 pt-4">
+                    <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/40">
+                      Validation errors
+                    </p>
+                    <div className="space-y-2">
+                      {data.validationErrors.map(err => (
+                        <div
+                          key={err.itemId ?? 'unknown'}
+                          className="rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs text-red-200"
+                        >
+                          <p className="font-medium">{renderText(err.itemId)}</p>
+                          <p className="mt-1 text-red-200/70">{err.errors.join(', ')}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            )}
+          </Section>
+
+          {/* Agent Runs + modules */}
+          <Section
             title="Agent Runs"
             subtitle="Recent governed Agent Bus threads and runtime modules"
+            state={overview}
           >
-            <div className="space-y-2">
-              {(overview?.recent_threads ?? []).map(
-                (thread: GoviralThread, index: number): ReactElement => {
-                  const threadId = String(thread.id ?? `thread-${String(index + 1)}`);
-
-                  return (
+            {(data): ReactNode => (
+              <>
+                <div className="space-y-2">
+                  {data.threads.map((thread, index) => (
                     <ExpandableRow
-                      key={threadId}
+                      key={thread.id ?? `thread-${String(index)}`}
                       details={{
-                        id: thread.id != null ? String(thread.id) : undefined,
-                        lane: thread.lane != null ? String(thread.lane) : undefined,
-                        lead_agent:
-                          thread.lead_agent != null ? String(thread.lead_agent) : undefined,
-                        agent_type:
-                          thread.agent_type != null ? String(thread.agent_type) : undefined,
+                        id: thread.id,
+                        lane: thread.lane,
+                        lead_agent: thread.leadAgent,
+                        agent_type: thread.agentType,
+                        created_at: thread.createdAt,
                       }}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div className="min-w-0">
-                          <p className="truncate text-sm font-medium text-white/85">{threadId}</p>
+                          <p className="truncate text-sm font-medium text-white/85">
+                            {renderText(thread.id)}
+                          </p>
                           <p className="mt-1 text-xs text-white/40">
-                            {thread.lead_agent != null ? String(thread.lead_agent) : 'agent bus'}{' '}
-                            \u00b7 {thread.lane != null ? String(thread.lane) : '\u2014'}
+                            {renderText(thread.leadAgent)}
+                            {' · '}
+                            {renderText(thread.lane)}
                           </p>
                         </div>
-                        <StatusPill
-                          status={thread.status != null ? String(thread.status) : 'unknown'}
-                        />
+                        <StatusPill status={thread.status} />
                       </div>
                     </ExpandableRow>
-                  );
-                }
-              )}
+                  ))}
 
-              {(overview?.recent_threads.length ?? 0) === 0 ? (
-                <EmptyState text="No recent Agent Bus threads." />
-              ) : null}
-            </div>
+                  {data.threads.length === 0 ? (
+                    <EmptyState text="No recent Agent Bus threads." />
+                  ) : null}
+                </div>
 
-            <div className="mt-5 border-t border-white/10 pt-5">
-              <p className="mb-3 text-xs font-medium uppercase tracking-wide text-white/40">
-                Runtime modules
-              </p>
+                <div className="mt-5 border-t border-white/10 pt-5">
+                  <p className="mb-3 text-xs font-medium uppercase tracking-wide text-white/40">
+                    Runtime modules
+                  </p>
+                  <ModulesGrid state={modules} />
+                </div>
+              </>
+            )}
+          </Section>
+        </div>
 
-              <div className="grid gap-2 sm:grid-cols-2">
-                {(modules?.modules ?? []).map(
-                  (module: ModuleManifest): ReactElement => (
-                    <ExpandableRow
-                      key={module.id}
-                      details={{
-                        id: module.id,
-                        state: module.state,
-                        owner_agent: module.owner_agent,
-                        run_id: module.run_id,
-                        updated_at: module.updated_at,
+        {/* ── Semantic Services ──────────────────────────────────────── */}
+        <Section
+          title="Services & Timers"
+          subtitle="Semantic service state groups"
+          state={services}
+        >
+          {(data): ReactNode => <SemanticServicesBody data={data} highlight={activeFilters} />}
+        </Section>
+
+        {/* ── Runtime availability (systemd) ─────────────────────────── */}
+        <Section
+          title="Runtime Units"
+          subtitle="Direct systemd view — reports its own availability"
+          state={runtime}
+        >
+          {(data): ReactNode => <RuntimeBody data={data} />}
+        </Section>
+
+        {/* ── Integrations ───────────────────────────────────────────── */}
+        <Section
+          title="Integration Status"
+          subtitle="External service connections"
+          state={integrations}
+        >
+          {(data): ReactNode => (
+            <div className="grid gap-3 sm:grid-cols-3">
+              {data.telegram ? (
+                <IntegrationCard
+                  integration={data.telegram}
+                  action={
+                    <button
+                      type="button"
+                      onClick={(e): void => {
+                        e.stopPropagation();
+                        setConfirmAction({
+                          title: 'Telegram Test',
+                          description:
+                            'This will send a test message to the configured Telegram channel to verify connectivity.',
+                          action: async (): Promise<void> => {
+                            const result = await sendTelegramTest();
+                            if (result.ok === false) {
+                              throw new Error(result.error ?? 'Telegram test failed.');
+                            }
+                          },
+                        });
                       }}
+                      disabled={data.telegram.configured !== true}
+                      className="rounded-md border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-1 text-xs font-medium text-fuchsia-200 disabled:opacity-35"
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="truncate text-sm font-medium text-white/85">{module.label}</p>
-                        <span
-                          className={`inline-flex rounded-full border px-2 py-0.5 text-xs font-medium ${moduleStateTone(module.state)}`}
-                        >
-                          {module.state.replace(/_/g, ' ')}
-                        </span>
-                      </div>
-                      {module.owner_agent ? (
-                        <p className="mt-1 text-xs text-white/45">Owner: {module.owner_agent}</p>
-                      ) : null}
-                      <p className="mt-1 truncate text-xs text-white/40">
-                        {module.run_id ?? 'No run evidence'}
-                      </p>
-                    </ExpandableRow>
-                  )
-                )}
+                      Test
+                    </button>
+                  }
+                />
+              ) : null}
+              {data.clickup ? <IntegrationCard integration={data.clickup} /> : null}
+              {data.qdrant ? <IntegrationCard integration={data.qdrant} /> : null}
+            </div>
+          )}
+        </Section>
 
-                {(modules?.modules.length ?? 0) === 0 ? (
-                  <EmptyState text="No runtime modules discovered." />
+        {/* ── Canary + Access Mode ───────────────────────────────────── */}
+        <div className="grid gap-5 xl:grid-cols-2">
+          <Section
+            title="Canary Task"
+            state={canary}
+            badge={canaryValue ? <StatusPill status={canaryValue.status} /> : undefined}
+          >
+            {(data): ReactNode => (
+              <div className="space-y-3">
+                {data.id ? (
+                  <p className="font-mono text-xs text-white/35">Task: {data.id}</p>
+                ) : null}
+
+                <div className="grid gap-2 text-xs text-white/45">
+                  {data.startedAt ? <p>Started: {formatDate(data.startedAt)}</p> : null}
+                  {data.completedAt ? <p>Completed: {formatDate(data.completedAt)}</p> : null}
+                  {data.error ? <p className="text-red-300/80">Error: {data.error}</p> : null}
+                  {data.status === 'none' ? <p>No canary has been run.</p> : null}
+                </div>
+
+                <div className="flex gap-2">
+                  {data.isRunning ? (
+                    <button
+                      type="button"
+                      onClick={(): void => {
+                        setConfirmAction({
+                          title: 'Canary Cancel',
+                          description: 'This will cancel the currently running canary task.',
+                          action: async (): Promise<void> => {
+                            const result = await cancelCanary();
+                            if (result.ok === false) {
+                              throw new Error(result.error ?? 'Canary cancel failed.');
+                            }
+                          },
+                        });
+                      }}
+                      className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200"
+                    >
+                      Cancel Canary
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={(): void => {
+                        setConfirmAction({
+                          title: 'Canary Launch',
+                          description:
+                            'This will launch a canary task to validate the current runtime environment.',
+                          action: async (): Promise<void> => {
+                            const result = await launchCanary();
+                            if (result.ok === false) {
+                              throw new Error(result.error ?? 'Canary launch failed.');
+                            }
+                          },
+                        });
+                      }}
+                      className="rounded-md border border-fuchsia-500/30 bg-fuchsia-500/10 px-3 py-1.5 text-xs font-medium text-fuchsia-200"
+                    >
+                      Launch Canary
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </Section>
+
+          <Section
+            title="Access Mode"
+            state={access}
+            badge={
+              access.status === 'loaded' ? (
+                <StatusPill status={access.value.accessMode} />
+              ) : undefined
+            }
+          >
+            {(data): ReactNode => (
+              <div className="space-y-2 text-sm">
+                <div className="grid gap-1 text-xs text-white/45">
+                  <p>
+                    Bind: {renderText(data.bindAddress)}
+                    {data.port !== null ? `:${String(data.port)}` : ''}
+                  </p>
+                  <p>
+                    Auth enabled:{' '}
+                    {data.authEnabled === null ? ABSENT : data.authEnabled ? 'Yes' : 'No'}
+                  </p>
+                  <p>
+                    Public exposure:{' '}
+                    {data.publicExposure === null ? ABSENT : data.publicExposure ? 'Yes' : 'No'}
+                  </p>
+                  <p>RBAC role: {renderText(data.rbacRole)}</p>
+                  <p>RBAC enforcement: {renderText(data.rbacEnforcement)}</p>
+                </div>
+                {data.designDocument ? (
+                  <p className="text-xs text-white/30">{data.designDocument}</p>
                 ) : null}
               </div>
-            </div>
-
-            {/* Registry Drift (inline in Agents section) */}
-            {reconciliation && reconciliation.drift_items.length > 0 ? (
-              <div className="mt-5 border-t border-white/10 pt-5">
-                <RegistryDriftPanel data={reconciliation} />
-              </div>
-            ) : null}
-          </Panel>
+            )}
+          </Section>
         </div>
 
-        {/* ── Semantic Services Panel ────────────────────────────────── */}
-        <SemanticServicesPanel data={semanticServices} highlight={activeFilters} />
-
-        {/* ── Integration Status Panel ───────────────────────────────── */}
-        <IntegrationStatusPanel
-          data={integrations}
-          onTelegramTest={(): void => {
-            setConfirmAction({
-              title: 'Telegram Test',
-              description:
-                'This will send a test message to the configured Telegram channel to verify connectivity.',
-              action: async (): Promise<void> => {
-                await sendTelegramTest();
-              },
-            });
-          }}
-        />
-
-        {/* ── Canary + Access Mode (small cards) ─────────────────────── */}
-        <div className="grid gap-5 xl:grid-cols-2">
-          <CanaryPanel
-            data={canary}
-            onLaunch={(): void => {
-              setConfirmAction({
-                title: 'Canary Launch',
-                description:
-                  'This will launch a canary task to validate the current runtime environment.',
-                action: async (): Promise<void> => {
-                  const result = await launchCanary();
-                  if (!result.ok && result.error) {
-                    throw new Error(result.error);
-                  }
-                },
-              });
-            }}
-            onCancel={(): void => {
-              setConfirmAction({
-                title: 'Canary Cancel',
-                description: 'This will cancel the currently running canary task.',
-                action: async (): Promise<void> => {
-                  const result = await cancelCanary();
-                  if (!result.ok && result.error) {
-                    throw new Error(result.error);
-                  }
-                },
-              });
-            }}
-          />
-          <AccessModePanel data={accessMode} />
-        </div>
-
-        {/* ── Registry Drift standalone (when not inline in agents) ──── */}
-        {reconciliation?.drift_items.length === 0 ? (
-          <RegistryDriftPanel data={reconciliation} />
-        ) : null}
+        {/* ── Registry Drift ─────────────────────────────────────────── */}
+        <Section
+          title="Registry Drift"
+          subtitle="Agent reconciliation analysis"
+          state={reconciliation}
+          badge={
+            reconciliationValue ? (
+              <StatusPill
+                status={
+                  reconciliationValue.driftCount === null
+                    ? null
+                    : reconciliationValue.driftCount === 0
+                      ? 'pass'
+                      : `${String(reconciliationValue.driftCount)} drift`
+                }
+              />
+            ) : undefined
+          }
+        >
+          {(data): ReactNode => <DriftBody data={data} />}
+        </Section>
 
         {/* ── Legacy panels ──────────────────────────────────────────── */}
         <GoviralOperationsPanels />
@@ -1304,5 +1439,66 @@ export function GoviralControlPlanePage(): ReactElement {
         />
       ) : null}
     </div>
+  );
+}
+
+// ─── Modules grid (its own section state) ───────────────────────────────────
+
+function ModulesGrid({ state }: { state: SectionState<ModulesView> }): ReactElement {
+  if (state.status === 'loading') {
+    return <EmptyState text="Loading modules…" />;
+  }
+
+  if (state.status === 'error') {
+    return (
+      <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+        Could not load modules: {state.message}
+      </div>
+    );
+  }
+
+  const { value } = state;
+
+  return (
+    <>
+      <AvailabilityNote availability={value.availability} />
+      <div className="grid gap-2 sm:grid-cols-2">
+        {value.modules.map(
+          (module: ModuleView): ReactElement => (
+            <ExpandableRow
+              key={module.id}
+              details={{
+                id: module.id,
+                state: module.state,
+                health: module.health,
+                owner_agent: module.ownerAgent,
+                workflow: module.workflow,
+                run_id: module.runId,
+                run_at: module.runAt,
+                enabled: module.enabled,
+              }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <p className="truncate text-sm font-medium text-white/85">
+                  {renderText(module.label ?? module.id)}
+                </p>
+                <StatusPill status={module.state} />
+              </div>
+              {module.ownerAgent ? (
+                <p className="mt-1 text-xs text-white/45">Owner: {module.ownerAgent}</p>
+              ) : null}
+              <p className="mt-1 truncate text-xs text-white/40">
+                {module.runId === null ? 'No run evidence' : module.runId}
+              </p>
+              {module.runAt ? (
+                <p className="mt-0.5 truncate text-xs text-white/30">{formatDate(module.runAt)}</p>
+              ) : null}
+            </ExpandableRow>
+          )
+        )}
+
+        {value.modules.length === 0 ? <EmptyState text="No runtime modules discovered." /> : null}
+      </div>
+    </>
   );
 }

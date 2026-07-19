@@ -30,6 +30,13 @@ interface SystemdUnit {
 
 interface RuntimeData {
   services: SystemdUnit[];
+  /**
+   * `/api/goviral/runtime` reports its own availability. When systemd cannot be
+   * read it still returns HTTP 200 with an empty `services` array, so ignoring
+   * these two fields renders a failed probe as a healthy "no services" list.
+   */
+  available?: boolean;
+  error?: string | null;
 }
 
 interface AgentRun {
@@ -508,6 +515,13 @@ export function GoviralCommandCenter(): ReactElement {
               <p className="mb-3 text-xs font-medium uppercase tracking-wide text-white/40">
                 Service actions
               </p>
+              {runtime?.available === false ? (
+                <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  <span className="font-medium">Runtime data incomplete: </span>
+                  {runtime.error ?? 'systemd reported the unit data as unavailable'}. The list below
+                  may be missing units — an empty list here is not evidence that none exist.
+                </div>
+              ) : null}
               <div className="max-h-[300px] space-y-2 overflow-y-auto pr-1">
                 {(runtime?.services ?? []).slice(0, 40).map((unit): ReactElement => {
                   const disabled = !operatorEnabled || protectedUnit(unit.name);

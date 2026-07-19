@@ -828,7 +828,9 @@ function AgentTaskPanel({
             </div>
           )
         )}
-        {(data?.tasks.length ?? 0) === 0 ? <EmptyState text="No agent tasks created yet." /> : null}
+        {data && (data.tasks?.length ?? 0) === 0 ? (
+          <EmptyState text="No agent tasks created yet." />
+        ) : null}
       </div>
     </Panel>
   );

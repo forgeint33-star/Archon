@@ -303,7 +303,11 @@ export function GoviralOperationsPanels(): ReactElement {
         <div className="grid gap-5 xl:grid-cols-2">
           <Panel
             title="Incidents & Alerts"
-            subtitle={`Doctor: ${incidents?.doctor.status ?? 'unknown'} · ${incidents?.failed_units.length ?? 0} failed unit(s)`}
+            subtitle={
+              incidents
+                ? `Doctor: ${incidents.doctor?.status ?? '—'} · ${incidents.failed_units?.length ?? 0} failed unit(s)`
+                : 'Loading incident checks…'
+            }
           >
             {incidents ? (
               <>
@@ -352,7 +356,11 @@ export function GoviralOperationsPanels(): ReactElement {
 
           <Panel
             title="Goals & Deliverables"
-            subtitle={`${goals?.summary.documents ?? 0} bounded planning document(s)`}
+            subtitle={
+              goals
+                ? `${goals.summary?.documents ?? '—'} bounded planning document(s)`
+                : 'Loading planning documents…'
+            }
           >
             {goals && goals.documents.length > 0 ? (
               <>
