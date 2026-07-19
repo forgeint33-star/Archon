@@ -5,6 +5,17 @@
  * writing phantom records (e.g., testuser/testrepo) to the real SQLite DB.
  */
 import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+// A repo path that must NOT exist, for the ensureRepoReady "directory missing"
+// branch. The literal '/nonexistent' is unsafe: on some hosts it is a real
+// root-owned 0700 directory (the conventional home of the `nobody` account and
+// of systemd DynamicUser services), so for any non-root user access() fails with
+// EACCES rather than ENOENT — and ensureRepoReady deliberately rethrows on any
+// code that is not ENOENT. That turned these cases into a check of the host's
+// filesystem layout instead of the clone path. Never created.
+const ABSENT_REPO_PATH = join(tmpdir(), 'archon-absent-github-adapter', 'path');
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = {
@@ -985,14 +996,14 @@ describe('GitHubAdapter', () => {
     test('clones repository when directory does not exist', async () => {
       mockCloneRepository.mockResolvedValue({ ok: true, value: undefined });
 
-      await callEnsureRepoReady('owner', 'repo', 'main', '/nonexistent/path', false);
+      await callEnsureRepoReady('owner', 'repo', 'main', ABSENT_REPO_PATH, false);
 
       expect(mockCloneRepository).toHaveBeenCalledTimes(1);
       const [url, path] = mockCloneRepository.mock.calls[0];
       expect(url).toBe('https://github.com/owner/repo.git');
-      expect(path).toBe('/nonexistent/path');
+      expect(path).toBe(ABSENT_REPO_PATH);
       // 3rd arg is { token } when GITHUB_TOKEN is set, undefined otherwise
-      expect(mockAddSafeDirectory).toHaveBeenCalledWith('/nonexistent/path');
+      expect(mockAddSafeDirectory).toHaveBeenCalledWith(ABSENT_REPO_PATH);
     });
 
     test('syncs repository when directory exists and shouldSync is true', async () => {
@@ -1037,7 +1048,7 @@ describe('GitHubAdapter', () => {
       });
 
       await expect(
-        callEnsureRepoReady('owner', 'repo', 'main', '/nonexistent/path', false)
+        callEnsureRepoReady('owner', 'repo', 'main', ABSENT_REPO_PATH, false)
       ).rejects.toThrow('not found or is private');
     });
 
@@ -1048,7 +1059,7 @@ describe('GitHubAdapter', () => {
       });
 
       await expect(
-        callEnsureRepoReady('owner', 'repo', 'main', '/nonexistent/path', false)
+        callEnsureRepoReady('owner', 'repo', 'main', ABSENT_REPO_PATH, false)
       ).rejects.toThrow('Authentication failed');
     });
 

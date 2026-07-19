@@ -19,6 +19,16 @@ const mockLogger = {
 // Hoisted telemetry mock — declared before the mock.module factory runs so the
 // completion-telemetry tests can assert on it.
 const mockCaptureWorkflowCompleted = mock(() => {});
+
+// Root for paths that must NOT exist. The literal '/nonexistent' is unsafe:
+// on some hosts it is a real root-owned 0700 directory (it is the conventional
+// home of the `nobody` account and of systemd DynamicUser services), so for any
+// non-root user a lookup beneath it fails with EACCES instead of ENOENT. Script
+// and command discovery treat those two differently, so the "not found" branches
+// under test silently stop being exercised. Anchoring to tmpdir() keeps the path
+// absent without depending on host layout. Never created.
+const ABSENT_ROOT = join(tmpdir(), 'archon-absent-dag-executor');
+
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getCommandFolderSearchPaths: (folder?: string) => {
@@ -27,11 +37,11 @@ mock.module('@archon/paths', () => ({
     return paths;
   },
   getWorkflowFolderSearchPaths: () => ['.archon/workflows'],
-  getDefaultCommandsPath: () => '/nonexistent/defaults',
-  getDefaultWorkflowsPath: () => '/nonexistent/defaults/workflows',
-  getHomeWorkflowsPath: () => '/nonexistent/home/workflows',
-  getLegacyHomeWorkflowsPath: () => '/nonexistent/home/.archon/workflows',
-  getArchonHome: () => '/nonexistent/home',
+  getDefaultCommandsPath: () => join(ABSENT_ROOT, 'defaults'),
+  getDefaultWorkflowsPath: () => join(ABSENT_ROOT, 'defaults', 'workflows'),
+  getHomeWorkflowsPath: () => join(ABSENT_ROOT, 'home', 'workflows'),
+  getLegacyHomeWorkflowsPath: () => join(ABSENT_ROOT, 'home', '.archon', 'workflows'),
+  getArchonHome: () => join(ABSENT_ROOT, 'home'),
   // Telemetry is fire-and-forget; mock as a no-op so terminal sites can call it.
   // Hoisted so tests can assert outcome / exit_reason at each terminal site.
   captureWorkflowCompleted: mockCaptureWorkflowCompleted,
