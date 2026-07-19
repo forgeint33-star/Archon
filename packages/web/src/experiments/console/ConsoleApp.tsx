@@ -10,6 +10,7 @@ import { RunDetailPage } from './routes/RunDetailPage';
 import { ChatPage } from './routes/ChatPage';
 import { PreviewPage } from './routes/PreviewPage';
 import { SettingsPage } from './routes/SettingsPage';
+import { NavPreviewPage } from './navigation/NavPreviewPage';
 
 // React.lazy components must be PascalCase for JSX usage
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -96,6 +97,10 @@ export function ConsoleApp(): ReactElement {
               }
             />
             <Route path="_preview" element={<PreviewPage />} />
+            {/* Unlinked harness for the navigation bridge. The `_` prefix marks
+                it as a preview surface; the live console navigation is
+                unchanged. See navigation/NavPreviewPage.tsx. */}
+            <Route path="_nav-preview" element={<NavPreviewPage />} />
             <Route path="p/:projectId" element={<RunsPage />} />
             <Route path="p/:projectId/chat" element={<ChatPage />} />
             <Route path="p/:projectId/r/:runId" element={<RunDetailPage />} />
