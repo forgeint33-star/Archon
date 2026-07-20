@@ -11,6 +11,15 @@ import { ChatPage } from './routes/ChatPage';
 import { PreviewPage } from './routes/PreviewPage';
 import { SettingsPage } from './routes/SettingsPage';
 import { NavPreviewPage } from './navigation/NavPreviewPage';
+import { NavigationBridge, SKIP_LINK_COPY } from './navigation/NavigationBridge';
+
+/**
+ * The bridge preview harness ships only in dev builds, or when a build
+ * explicitly opts in for browser testing. `import.meta.env.DEV` is statically
+ * false in a production bundle, so the route and its component are dropped.
+ */
+const NAV_PREVIEW_ENABLED: boolean =
+  import.meta.env.DEV || import.meta.env.VITE_ENABLE_NAV_PREVIEW === 'true';
 
 // React.lazy components must be PascalCase for JSX usage
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -71,13 +80,27 @@ export function ConsoleApp(): ReactElement {
 
   return (
     <div className="console-root flex h-screen w-screen flex-col bg-surface text-text-primary">
+      {/* Must be the first focusable element in the document, so it lives here
+          rather than inside the navigation bridge (which mounts after the
+          project rail and would therefore never receive the first Tab). */}
+      <a
+        href="#nav-bridge-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-surface-elevated focus:px-3 focus:py-2 focus:text-text-primary"
+      >
+        {SKIP_LINK_COPY.en}
+      </a>
       <div className="flex min-h-0 flex-1">
         <ProjectRail
           onAddProject={() => {
             setAddOpen(true);
           }}
         />
-        <main className="flex min-w-0 flex-1 flex-col">
+        {/* Agency Command Center navigation. Kept as its own column beside the
+            project rail: the rail switches Archon projects, the bridge reaches
+            Agency screens, and the bridge carries its own terminal Archon
+            section so no Agency group ever contains an Archon screen. */}
+        <NavigationBridge />
+        <main id="nav-bridge-content" className="flex min-w-0 flex-1 flex-col">
           <Routes>
             <Route index element={<RunsPage />} />
             <Route path="settings" element={<SettingsPage />} />
@@ -97,10 +120,14 @@ export function ConsoleApp(): ReactElement {
               }
             />
             <Route path="_preview" element={<PreviewPage />} />
-            {/* Unlinked harness for the navigation bridge. The `_` prefix marks
-                it as a preview surface; the live console navigation is
-                unchanged. See navigation/NavPreviewPage.tsx. */}
-            <Route path="_nav-preview" element={<NavPreviewPage />} />
+            {/* The navigation-bridge harness is named by the Command Center
+                manifest as `excluded_non_production`. It is registered only in
+                dev/test builds — a production bundle has no such route, so it
+                cannot be reached on a released install. The bridge itself is
+                mounted for real in the rail below. */}
+            {NAV_PREVIEW_ENABLED ? (
+              <Route path="_nav-preview" element={<NavPreviewPage />} />
+            ) : null}
             <Route path="p/:projectId" element={<RunsPage />} />
             <Route path="p/:projectId/chat" element={<ChatPage />} />
             <Route path="p/:projectId/r/:runId" element={<RunDetailPage />} />

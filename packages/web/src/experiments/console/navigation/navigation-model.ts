@@ -11,6 +11,7 @@ import {
   NAVIGATION,
   ARCHON_DESTINATIONS,
   allDestinations,
+  destinationLabels,
   findGroupOf,
   type ArchonDestination,
   type Destination,
@@ -51,7 +52,10 @@ export function itemState(destination: Destination, availability: Availability):
     return { kind: 'offline', reason };
   }
 
-  return { kind: 'ready', href: destinationUrl(destination.binding.route) };
+  return {
+    kind: 'ready',
+    href: destinationUrl(destination.binding.route, undefined, destination.binding.query),
+  };
 }
 
 export function isActionable(state: ItemState): boolean {
@@ -172,7 +176,10 @@ export function searchDestinations(
 
   for (const group of NAVIGATION) {
     for (const destination of group.destinations) {
+      const labels = destinationLabels(destination);
       const scores = [
+        scoreLabel(labels.en, trimmed),
+        scoreLabel(labels.el, trimmed),
         scoreLabel(destination.labels.en, trimmed),
         scoreLabel(destination.labels.el, trimmed),
         scoreLabel(group.labels.en, trimmed),
@@ -184,7 +191,7 @@ export function searchDestinations(
       hits.push({
         destinationId: destination.id,
         groupId: group.id,
-        label: destination.labels[locale],
+        label: labels[locale],
         groupLabel: group.labels[locale],
         state: itemState(destination, availability),
         score: Math.min(...scores),
@@ -266,7 +273,7 @@ export function breadcrumbsFor(
     { label: 'Command Center' },
     { label: group.labels[locale] },
     {
-      label: destination.labels[locale],
+      label: destinationLabels(destination)[locale],
       ...(state.kind === 'ready' ? { href: state.href } : {}),
     },
   ];

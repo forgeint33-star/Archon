@@ -57,7 +57,9 @@ const mappedDestination = (): Destination => {
 };
 
 const unmappedDestination = (): Destination => {
-  const d = findDestination('quarantine');
+  // Quarantine is published in manifest 1.0.0; the failed/disabled integration
+  // filter is the one destination the Command Center still does not offer.
+  const d = findDestination('integrations-failed');
   if (!d) throw new Error('fixture missing');
   return d;
 };
@@ -75,7 +77,7 @@ describe('links are feature-flagged on the health probe', () => {
     const destination = mappedDestination();
     expect(itemState(destination, AVAILABLE)).toEqual({
       kind: 'ready',
-      href: 'http://127.0.0.1:8181/clients',
+      href: 'http://127.0.0.1:8280/clients',
     });
     expect(itemState(destination, PROBING).kind).toBe('probing');
     expect(itemState(destination, OFFLINE).kind).toBe('offline');
@@ -108,7 +110,7 @@ describe('links are feature-flagged on the health probe', () => {
 
   test('exactly the mapped destinations become actionable when it is available', () => {
     const actionable = allDestinations().filter(d => isActionable(itemState(d, AVAILABLE)));
-    expect(actionable).toHaveLength(14);
+    expect(actionable).toHaveLength(33);
   });
 });
 
@@ -126,6 +128,33 @@ describe('destination URLs', () => {
     expect(destinationUrl('/', 'http://cc.example/')).toBe('http://cc.example/');
   });
 
+  test('a validated filter becomes a query string, not a fabricated path', () => {
+    expect(
+      destinationUrl('/integrations', 'http://cc.example', { name: 'state', value: 'connected' })
+    ).toBe('http://cc.example/integrations?state=connected');
+    expect(
+      destinationUrl('/integrations', 'http://cc.example', {
+        name: 'state',
+        value: 'login-required',
+      })
+    ).toBe('http://cc.example/integrations?state=login-required');
+  });
+
+  test('filter values are URL-encoded', () => {
+    expect(
+      destinationUrl('/integrations', 'http://cc.example', { name: 'state', value: 'a b&c' })
+    ).toBe('http://cc.example/integrations?state=a%20b%26c');
+  });
+
+  test('the filtered destinations resolve to the query URL end-to-end', () => {
+    const connected = findDestination('integrations-connected');
+    const state = itemState(connected!, AVAILABLE);
+    expect(state).toEqual({
+      kind: 'ready',
+      href: 'http://127.0.0.1:8280/integrations?state=connected',
+    });
+  });
+
   test('health URL targets the IMPLEMENTED endpoint', () => {
     expect(healthUrl('http://cc.example')).toBe('http://cc.example/api/v1/health');
     // /api/v1/health/runtime is specified but unimplemented; must not be probed.
@@ -138,24 +167,43 @@ describe('destination URLs', () => {
 describe('probe classification', () => {
   const at = '2026-07-19T20:00:00.000Z';
 
-  test('2xx is available', () => {
-    expect(classifyProbe({ ok: true, status: 200 }, at)).toEqual({
+  test('2xx WITH ready=true is available', () => {
+    expect(classifyProbe({ ok: true, status: 200, ready: true }, at)).toEqual({
       kind: 'available',
       checkedAt: at,
     });
-    expect(classifyProbe({ ok: true, status: 204 }, at).kind).toBe('available');
+  });
+
+  test('2xx WITHOUT ready=true is NOT available — liveness is not readiness', () => {
+    const missing = classifyProbe({ ok: true, status: 200 }, at);
+    expect(missing.kind).toBe('unavailable');
+    if (missing.kind === 'unavailable') {
+      expect(missing.reason).toContain('no `ready` field');
+    }
+
+    const notReady = classifyProbe({ ok: true, status: 200, ready: false }, at);
+    expect(notReady.kind).toBe('unavailable');
+    if (notReady.kind === 'unavailable') {
+      expect(notReady.reason).toContain('ready=false');
+    }
+  });
+
+  test('a truthy-but-not-true ready value is refused', () => {
+    for (const ready of ['true', 1, {}, []]) {
+      expect(classifyProbe({ ok: true, status: 200, ready }, at).kind).toBe('unavailable');
+    }
   });
 
   test('non-2xx is unavailable and names the status', () => {
-    const state = classifyProbe({ ok: true, status: 503 }, at);
+    const state = classifyProbe({ ok: true, status: 503, ready: true }, at);
     expect(state.kind).toBe('unavailable');
     if (state.kind === 'unavailable') {
-      expect(state.reason).toBe('Health check returned HTTP 503');
+      expect(state.reason).toBe('Readiness check returned HTTP 503');
     }
   });
 
   test('a 3xx redirect is NOT treated as healthy', () => {
-    expect(classifyProbe({ ok: true, status: 302 }, at).kind).toBe('unavailable');
+    expect(classifyProbe({ ok: true, status: 302, ready: true }, at).kind).toBe('unavailable');
   });
 
   test('a transport failure preserves the underlying error', () => {
@@ -167,7 +215,10 @@ describe('probe classification', () => {
   });
 
   test('every outcome records when it was checked', () => {
-    expect(classifyProbe({ ok: true, status: 200 }, at)).toHaveProperty('checkedAt', at);
+    expect(classifyProbe({ ok: true, status: 200, ready: true }, at)).toHaveProperty(
+      'checkedAt',
+      at
+    );
     expect(classifyProbe({ ok: false, error: 'x' }, at)).toHaveProperty('checkedAt', at);
   });
 });
@@ -192,12 +243,28 @@ describe('probeCommandCenter', () => {
     }
   };
 
-  test('a 200 makes the Command Center available', async () => {
+  test('a 200 with ready:true makes the Command Center available', async () => {
     const state = await withFetch(
-      () => Promise.resolve(new Response('ok', { status: 200 })),
+      () => Promise.resolve(Response.json({ ready: true })),
       () => probeCommandCenter('http://cc.example')
     );
     expect(state.kind).toBe('available');
+  });
+
+  test('a 200 with ready:false keeps links disabled', async () => {
+    const state = await withFetch(
+      () => Promise.resolve(Response.json({ ready: false, problems: ['schema'] })),
+      () => probeCommandCenter('http://cc.example')
+    );
+    expect(state.kind).toBe('unavailable');
+  });
+
+  test('a 200 with an unparseable body fails closed', async () => {
+    const state = await withFetch(
+      () => Promise.resolve(new Response('not json', { status: 200 })),
+      () => probeCommandCenter('http://cc.example')
+    );
+    expect(state.kind).toBe('unavailable');
   });
 
   test('a 500 is unavailable, carrying the status', async () => {
@@ -240,16 +307,16 @@ describe('probeCommandCenter', () => {
     }
   });
 
-  test('it probes the health path on the configured base URL', async () => {
+  test('it probes the READINESS path on the configured base URL', async () => {
     let seen = '';
     await withFetch(
       input => {
         seen = String(input);
-        return Promise.resolve(new Response('ok', { status: 200 }));
+        return Promise.resolve(Response.json({ ready: true }));
       },
       () => probeCommandCenter('http://cc.example')
     );
-    expect(seen).toBe('http://cc.example/api/v1/health');
+    expect(seen).toBe('http://cc.example/api/v1/ready');
   });
 
   test('it never sends Archon credentials to the other origin', async () => {
@@ -257,7 +324,7 @@ describe('probeCommandCenter', () => {
     await withFetch(
       (_input, init) => {
         credentials = init?.credentials;
-        return Promise.resolve(new Response('ok', { status: 200 }));
+        return Promise.resolve(Response.json({ ready: true }));
       },
       () => probeCommandCenter('http://cc.example')
     );
@@ -299,15 +366,19 @@ describe('group badges report coverage, never a health metric', () => {
     }
   });
 
-  test('overall coverage is 14 of 34', () => {
-    expect(coverage()).toEqual({ mapped: 14, unmapped: 20, total: 34 });
+  test('overall coverage is 33 of 34 after reconciliation', () => {
+    expect(coverage()).toEqual({ mapped: 33, unmapped: 1, total: 34 });
   });
 
-  test('a fully unmapped group reports zero mapped, not a missing badge', () => {
+  test('a fully mapped group reports no gap', () => {
     const aiWorkforce = NAVIGATION.find(g => g.id === 'ai-workforce');
     expect(aiWorkforce).toBeDefined();
-    // Live Runs is the single mapped item here.
-    expect(groupBadge(aiWorkforce!)).toEqual({ mapped: 1, unmapped: 4, total: 5 });
+    expect(groupBadge(aiWorkforce!)).toEqual({ mapped: 5, unmapped: 0, total: 5 });
+  });
+
+  test('the only group with a gap is integrations', () => {
+    const withGap = NAVIGATION.filter(g => groupBadge(g).unmapped > 0).map(g => g.id);
+    expect(withGap).toEqual(['integrations']);
   });
 });
 
@@ -376,10 +447,16 @@ describe('search', () => {
   });
 
   test('unmapped destinations remain searchable — hiding them would misrepresent the product', () => {
-    const hits = searchDestinations('quarantine', 'en', AVAILABLE);
-    const hit = hits.find(h => h.destinationId === 'quarantine');
+    const hits = searchDestinations('Failed', 'en', AVAILABLE);
+    const hit = hits.find(h => h.destinationId === 'integrations-failed');
     expect(hit).toBeDefined();
     expect(hit?.state.kind).toBe('unmapped');
+  });
+
+  test('a newly published destination is now actionable, not unmapped', () => {
+    const hits = searchDestinations('quarantine', 'en', AVAILABLE);
+    const hit = hits.find(h => h.destinationId === 'quarantine');
+    expect(hit?.state.kind).toBe('ready');
   });
 
   test('search carries item state so the palette cannot offer a dead row', () => {
@@ -433,10 +510,10 @@ describe('breadcrumbs', () => {
 
   test('the leaf links only when the destination is actionable', () => {
     expect(breadcrumbsFor('clients', 'en', AVAILABLE)[2]?.href).toBe(
-      'http://127.0.0.1:8181/clients'
+      'http://127.0.0.1:8280/clients'
     );
     expect(breadcrumbsFor('clients', 'en', OFFLINE)[2]?.href).toBeUndefined();
-    expect(breadcrumbsFor('quarantine', 'en', AVAILABLE)[2]?.href).toBeUndefined();
+    expect(breadcrumbsFor('integrations-failed', 'en', AVAILABLE)[2]?.href).toBeUndefined();
   });
 
   test('an unknown destination degrades to the root crumb instead of throwing', () => {

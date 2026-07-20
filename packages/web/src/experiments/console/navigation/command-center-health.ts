@@ -8,20 +8,24 @@
  */
 
 /**
- * Single configurable base URL. `127.0.0.1:8181` is the only value the Command
- * Center repo defines (apps/command-center/web/vite.config.ts:9); it has no
- * .env.example, docker-compose or systemd unit, so the deployed value must be
- * confirmed before activation.
+ * Single configurable base URL, non-secret. The default is the value published
+ * in the verified release handoff (2026-07-20): the Command Center is served by
+ * `goviral-command-center.service` on this address, and it allow-lists exactly
+ * the Archon origin `http://127.0.0.1:8180` for CORS. No credential or secret
+ * is read here or sent with the probe.
  */
 export const COMMAND_CENTER_BASE_URL: string =
-  (import.meta.env.VITE_COMMAND_CENTER_URL as string | undefined) ?? 'http://127.0.0.1:8181';
+  (import.meta.env.VITE_COMMAND_CENTER_URL as string | undefined) ?? 'http://127.0.0.1:8280';
+
+/** Canonical health endpoint from the handoff. */
+export const HEALTH_PATH = '/api/v1/health';
 
 /**
- * Implemented at apps/command-center/api/goviral_cc/app.py:45,278.
- * Note `/api/v1/health/runtime` is specified at PRD:655 but NOT implemented,
- * so it is deliberately not probed.
+ * Readiness endpoint. `/health` reports the process is up; `/ready` reports it
+ * can actually serve (schema version, problems). Links are gated on readiness,
+ * not mere liveness, so a booting Command Center is never linked to.
  */
-export const HEALTH_PATH = '/api/v1/health';
+export const READY_PATH = '/api/v1/ready';
 
 export type Availability =
   | { kind: 'probing' }
@@ -40,22 +44,38 @@ export function healthUrl(baseUrl: string = COMMAND_CENTER_BASE_URL): string {
   return `${baseUrl.replace(/\/+$/, '')}${HEALTH_PATH}`;
 }
 
+export function readyUrl(baseUrl: string = COMMAND_CENTER_BASE_URL): string {
+  return `${baseUrl.replace(/\/+$/, '')}${READY_PATH}`;
+}
+
 /**
- * Builds the absolute destination URL for an approved route. Kept pure and
- * separate from rendering so the contract test can assert URL shape without a
- * DOM, and so a trailing slash on the base can never produce `//clients`.
+ * Builds the absolute destination URL for a published route, optionally
+ * narrowed by a validated query filter. Kept pure and separate from rendering
+ * so the contract test can assert URL shape without a DOM, and so a trailing
+ * slash on the base can never produce `//clients`.
  */
-export function destinationUrl(route: string, baseUrl: string = COMMAND_CENTER_BASE_URL): string {
+export function destinationUrl(
+  route: string,
+  baseUrl: string = COMMAND_CENTER_BASE_URL,
+  query?: { name: string; value: string }
+): string {
   const base = baseUrl.replace(/\/+$/, '');
-  return route === '/' ? `${base}/` : `${base}${route}`;
+  const path = route === '/' ? `${base}/` : `${base}${route}`;
+  if (!query) return path;
+  return `${path}?${encodeURIComponent(query.name)}=${encodeURIComponent(query.value)}`;
 }
 
 /**
  * Classifies a probe outcome. Split from the fetch so every branch is testable
  * without network access.
+ *
+ * A 2xx alone is NOT sufficient: the Command Center reports liveness and
+ * readiness separately, and linking to a process that is up but cannot serve
+ * would be exactly the kind of optimistic claim this bridge exists to avoid.
+ * `ready` must be explicitly true.
  */
 export function classifyProbe(
-  outcome: { ok: true; status: number } | { ok: false; error: string },
+  outcome: { ok: true; status: number; ready?: unknown } | { ok: false; error: string },
   checkedAt: string
 ): Availability {
   if (!outcome.ok) {
@@ -65,7 +85,18 @@ export function classifyProbe(
   if (outcome.status < 200 || outcome.status >= 300) {
     return {
       kind: 'unavailable',
-      reason: `Health check returned HTTP ${String(outcome.status)}`,
+      reason: `Readiness check returned HTTP ${String(outcome.status)}`,
+      checkedAt,
+    };
+  }
+
+  if (outcome.ready !== true) {
+    return {
+      kind: 'unavailable',
+      reason:
+        outcome.ready === undefined
+          ? 'Readiness check returned no `ready` field'
+          : `Command Center reports ready=${JSON.stringify(outcome.ready)}`,
       checkedAt,
     };
   }
@@ -112,13 +143,29 @@ export async function probeCommandCenter(
   }, timeoutMs);
 
   try {
-    const res = await fetch(healthUrl(baseUrl), {
+    const res = await fetch(readyUrl(baseUrl), {
       signal: controller.signal,
-      // The Command Center is a different origin; this probe reads liveness
+      // The Command Center is a different origin; this probe reads readiness
       // only and must never carry Archon credentials to it.
       credentials: 'omit',
     });
-    return classifyProbe({ ok: true, status: res.status }, checkedAt);
+
+    // A non-2xx body is not worth parsing, and a malformed 2xx body must fail
+    // closed rather than be treated as ready.
+    let ready: unknown;
+    if (res.ok) {
+      try {
+        const body: unknown = await res.json();
+        ready =
+          typeof body === 'object' && body !== null
+            ? (body as Record<string, unknown>).ready
+            : undefined;
+      } catch {
+        ready = undefined;
+      }
+    }
+
+    return classifyProbe({ ok: true, status: res.status, ready }, checkedAt);
   } catch (e) {
     const err = e as Error;
     return classifyProbe({ ok: false, error: describeFetchFailure(err, timeoutMs) }, checkedAt);

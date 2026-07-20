@@ -15,6 +15,8 @@ import { ChevronRight, CircleSlash, Loader2, Menu, Star, WifiOff, X } from 'luci
 import {
   NAVIGATION,
   ARCHON_DESTINATIONS,
+  destinationCapability,
+  destinationLabels,
   type Destination,
   type Locale,
   type NavigationGroup,
@@ -83,6 +85,16 @@ const COPY = {
   },
 } as const;
 
+/**
+ * A skip link must be the FIRST focusable element on the page. The bridge is
+ * mounted after the project rail, so the link lives in the console shell rather
+ * than here — this component only owns the wording.
+ */
+export const SKIP_LINK_COPY: Readonly<Record<Locale, string>> = {
+  en: COPY.en.skip,
+  el: COPY.el.skip,
+};
+
 // ─── Item ───────────────────────────────────────────────────────────────────
 
 const ITEM_BASE =
@@ -119,7 +131,10 @@ function NavItem({
   onToggleFavourite: (id: string) => void;
 }): ReactElement {
   const copy = COPY[locale];
-  const text = destination.labels[locale];
+  // The manifest's own wording wins over the local fallback, so Archon never
+  // shows a private translation that has drifted from the Command Center.
+  const text = destinationLabels(destination)[locale];
+  const capability = destinationCapability(destination);
 
   // The reason an item is not actionable is attached to the control itself, so
   // it is reachable by keyboard and screen reader rather than hover-only.
@@ -168,6 +183,10 @@ function NavItem({
           onActivate(destination.id);
         }}
         aria-current={active ? 'page' : undefined}
+        // Surfaced from the manifest so the capability the Command Center will
+        // enforce is visible here rather than implied.
+        data-capability={capability ?? undefined}
+        title={capability ? `${text} — requires ${capability}` : text}
         className={`${ITEM_BASE} ${
           active
             ? 'bg-surface-elevated text-text-primary'
@@ -186,6 +205,7 @@ function NavItem({
     <button
       type="button"
       aria-disabled="true"
+      data-capability={capability ?? undefined}
       title={explanation}
       aria-describedby={undefined}
       onClick={(e): void => {
@@ -637,13 +657,6 @@ export function NavigationBridge(): ReactElement {
 
   return (
     <>
-      <a
-        href="#nav-bridge-content"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-surface-elevated focus:px-3 focus:py-2 focus:text-text-primary"
-      >
-        {copy.skip}
-      </a>
-
       {/* Tablet/mobile trigger. Hidden from desktop, where the rail is persistent. */}
       <button
         type="button"
