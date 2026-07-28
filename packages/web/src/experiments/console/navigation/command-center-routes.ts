@@ -69,10 +69,10 @@ import {
 // ─── Manifest provenance ────────────────────────────────────────────────────
 
 export const MANIFEST_VERSION = '1.0.0';
-export const MANIFEST_ROUTE_COUNT = 61;
-export const MANIFEST_SHA256 = 'cf12629c09e2f87edd37d90c88bb87775dabb885c3013c753dd950c4b6769864';
+export const MANIFEST_ROUTE_COUNT = 62;
+export const MANIFEST_SHA256 = 'b2235accbf670bd93e43587764f7dc46720758a75776e964fe46a39b5b81541b';
 export const MANIFEST_PATH = '/opt/goviral-command-center/current/route-manifest.json';
-export const AGENCY_DEPLOYED_COMMIT = 'a2d8a7ecf9a8b3ad9318d5e10557d13e370ee435';
+export const AGENCY_DEPLOYED_COMMIT = 'df1650f8f3c0c6bf29e2f15d7721b85f1a7cc9b9';
 
 /** Named by the manifest itself as non-production; never bundled for release. */
 export const EXCLUDED_NON_PRODUCTION: readonly string[] = ['/console/_nav-preview'];
@@ -94,6 +94,7 @@ export type Capability =
   | 'edit_project'
   | 'manage_team'
   | 'request_approval'
+  | 'submit_run'
   | 'view_all_clients'
   | 'view_assigned_projects'
   | 'view_audit'
@@ -783,6 +784,18 @@ export const COMMAND_CENTER_ROUTES: readonly CommandCenterRoute[] = [
     group: 'platform',
     capability: 'view_dashboard',
     labels: { en: 'Skills', el: 'Δεξιότητες' },
+    params: [],
+    availability: 'available',
+    inNav: true,
+    modal: false,
+    parent: null,
+  },
+  {
+    id: 'submit',
+    path: '/submit',
+    group: 'production',
+    capability: 'submit_run',
+    labels: { en: 'Submit a run', el: 'Υποβολή εκτέλεσης' },
     params: [],
     availability: 'available',
     inNav: true,

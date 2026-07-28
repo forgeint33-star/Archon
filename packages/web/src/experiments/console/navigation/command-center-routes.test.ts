@@ -42,11 +42,11 @@ import {
 describe('manifest provenance', () => {
   test('pins the verified handoff values', () => {
     expect(MANIFEST_VERSION).toBe('1.0.0');
-    expect(MANIFEST_ROUTE_COUNT).toBe(61);
+    expect(MANIFEST_ROUTE_COUNT).toBe(62);
     expect(MANIFEST_SHA256).toBe(
-      'cf12629c09e2f87edd37d90c88bb87775dabb885c3013c753dd950c4b6769864'
+      'b2235accbf670bd93e43587764f7dc46720758a75776e964fe46a39b5b81541b'
     );
-    expect(AGENCY_DEPLOYED_COMMIT).toBe('a2d8a7ecf9a8b3ad9318d5e10557d13e370ee435');
+    expect(AGENCY_DEPLOYED_COMMIT).toBe('df1650f8f3c0c6bf29e2f15d7721b85f1a7cc9b9');
   });
 
   test('embeds exactly the declared number of routes', () => {
