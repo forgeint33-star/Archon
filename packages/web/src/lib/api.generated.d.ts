@@ -1755,7 +1755,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Abandon a workflow run (mark as failed) */
+    /** Abandon a workflow run (mark as cancelled) */
     post: {
       parameters: {
         query?: never;
@@ -3344,6 +3344,11 @@ export interface components {
       worktree?: {
         enabled?: boolean;
       };
+      container?: {
+        enabled?: boolean;
+        /** @enum {string} */
+        write_back?: 'approve' | 'auto';
+      };
       mutates_checkout?: boolean;
       persist_sessions?: boolean;
       tags?: string[];
@@ -3535,6 +3540,13 @@ export interface components {
           maxTurns?: number;
         };
       };
+      pi?: {
+        enableExtensions?: boolean;
+        interactive?: boolean;
+        extensionFlags?: {
+          [key: string]: boolean | string;
+        };
+      };
       /** @enum {string} */
       effort?: 'low' | 'medium' | 'high' | 'max';
       thinking?:
@@ -3600,7 +3612,9 @@ export interface components {
         until_bash?: string;
         interactive?: boolean;
         gate_message?: string;
-        prompt: string;
+        signal_completes?: boolean;
+        prompt?: string;
+        command?: string;
       };
       loop_group?: {
         until: string;
@@ -3610,6 +3624,7 @@ export interface components {
         until_bash?: string;
         interactive?: boolean;
         gate_message?: string;
+        signal_completes?: boolean;
         nodes: components['schemas']['DagNode'][];
       };
       approval?: {
@@ -3621,6 +3636,12 @@ export interface components {
         };
       };
       cancel?: string;
+      include?: string;
+      workflow?: string;
+      input?: string;
+      /** @enum {string} */
+      isolation?: 'inherit' | 'worktree';
+      with?: unknown;
       script?: string;
       /** @enum {string} */
       runtime?: 'bun' | 'uv';
@@ -3665,6 +3686,7 @@ export interface components {
       last_activity_at: string | null;
       working_path: string | null;
       user_id: string | null;
+      parent_run_id: string | null;
       codebase_name: string | null;
       platform_type: string | null;
       worker_platform_id: string | null;
@@ -3715,6 +3737,7 @@ export interface components {
       last_activity_at: string | null;
       working_path: string | null;
       user_id: string | null;
+      parent_run_id: string | null;
     };
     WorkflowRunByWorkerResponse: {
       run: components['schemas']['WorkflowRun'];
@@ -3910,6 +3933,8 @@ export interface components {
       runningWorkflows: number;
       version?: string;
       is_docker: boolean;
+      is_wsl: boolean;
+      wsl_distro?: string;
       activePlatforms?: string[];
     };
     UpdateCheckResponse: {

@@ -70,8 +70,7 @@ Variables are substituted at runtime in command bodies and workflow `prompt:` fi
 
 | Variable | Available In | Contains |
 |----------|-------------|----------|
-| `$ARGUMENTS` | Commands, prompts | All arguments passed to the command as a single string |
-| `$1`, `$2`, `$3` | Commands, prompts | First, second, third positional arguments |
+| `$ARGUMENTS` / `$USER_MESSAGE` | Commands, prompts | The user's whole trigger message (positional `$1`/`$2`/`$3` are not supported) |
 | `$ARTIFACTS_DIR` | Commands, prompts | Absolute path to the workflow run's artifact directory |
 | `$WORKFLOW_ID` | Commands, prompts | The current workflow run ID |
 | `$BASE_BRANCH` | Commands, prompts | Base git branch (auto-detected or set via `worktree.baseBranch`) |
@@ -128,6 +127,8 @@ All nodes share these base fields:
 | `loop_group` | One of | object | Multi-node sub-DAG repeated per iteration (see Loop Group Options below) |
 | `approval` | One of | object | Pause for human review; see [Approval Nodes](/guides/approval-nodes/) |
 | `cancel` | One of | string | Reason string; terminates the run with `cancelled` status (not `failed`). Usually gated with `when:` |
+| `include` | One of | string | Name of another workflow whose nodes are inlined at discovery as a namespaced sub-DAG; see [Reusing a Shared Sub-DAG](/guides/authoring-workflows/#reusing-a-shared-sub-dag-with-include) |
+| `workflow` | One of | string | Name of another workflow run at execution time as a separate governed CHILD run (own run record, gates, artifacts, cost); see [Composing a Governed Sub-Run](/guides/authoring-workflows/#composing-a-governed-sub-run-with-workflow) |
 | `depends_on` | No | string[] | Node IDs that must complete before this node runs |
 | `when` | No | string | Condition expression; node is skipped if false |
 | `trigger_rule` | No | string | Join semantics when multiple upstreams exist (see Trigger Rules) |
@@ -151,6 +152,15 @@ All nodes share these base fields:
 | `runtime` | Yes | `'bun'` \| `'uv'` | Which runtime executes the script. Must match file extension for named scripts (`.ts`/`.js` → bun, `.py` → uv) |
 | `deps` | No | string[] | Python dependencies for `uv run --with`. Ignored for bun (bun auto-installs) |
 | `timeout` | No | number | Hard kill in ms. Default: 120000 (2 min). Same semantics as `bash` timeout |
+
+**Workflow (sub-run)-specific fields** (when `workflow:` is set):
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `input` | No | string | Data string forwarded as the child's `$ARGUMENTS`. Substituted like a `prompt:` body (`$nodeId.output`, workflow variables) |
+| `isolation` | No | `'inherit'` | Only `'inherit'` (shared checkout) is supported; `'worktree'` is reserved and rejected at load time (slice 2) |
+
+`retry` is rejected on `workflow:` nodes, and `workflow:` is rejected inside a `loop_group` body. The child's terminal output threads back as `$nodeId.output`; a child approval gate pauses the whole tree — approve the **child** by run id and the parent auto-resumes.
 
 **Approval-specific fields** (required when `approval:` is set):
 
@@ -178,7 +188,8 @@ Defined under `loop:` inside a node:
 
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
-| `prompt` | Yes | string | AI instructions executed each iteration |
+| `prompt` | One of `prompt`/`command` | string | Inline AI instructions executed each iteration |
+| `command` | One of `prompt`/`command` | string | Command file (under `.archon/commands/`) whose body is the iteration prompt — exactly one of `prompt` or `command` |
 | `until` | Yes | string | Completion signal string — loop ends when AI output contains this |
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | Start a new session each iteration (default: false) |

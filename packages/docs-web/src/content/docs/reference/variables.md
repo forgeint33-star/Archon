@@ -8,18 +8,18 @@ sidebar:
   order: 5
 ---
 
-Archon substitutes variables in command files, inline prompts, bash scripts, and `script:` node bodies before execution. There are three categories of variables: workflow variables (substituted by the workflow engine), positional arguments (substituted by the command handler), and node output references (DAG workflows only).
+Archon substitutes variables in command files, inline prompts, bash scripts, and `script:` node bodies before execution. There are two categories of variables: workflow variables (substituted by the workflow engine) and node output references (DAG workflows only).
 
 ## Workflow Variables
 
-These variables are substituted by the workflow executor in all node types (`command:`, `prompt:`, `bash:`, `script:`, `loop:`).
+These variables are substituted by the workflow executor in all node types (`command:`, `prompt:`, `bash:`, `script:`, `loop:`, `loop_group:`, and a `workflow:` node's `input:` field — which behaves like a `prompt:` body, not a bash-escaped one).
 
 | Variable | Resolves to | Notes |
 |----------|-------------|-------|
 | `$ARGUMENTS` | The user's input message that triggered the workflow | Primary way to pass user input to commands |
 | `$USER_MESSAGE` | Same as `$ARGUMENTS` | Alias |
 | `$WORKFLOW_ID` | Unique ID for the current workflow run | Useful for artifact naming and log correlation |
-| `$ARTIFACTS_DIR` | Pre-created external artifacts directory (`~/.archon/workspaces/<owner>/<repo>/artifacts/runs/<id>/`) | Always exists before node execution; stored outside the repo to avoid polluting the working tree |
+| `$ARTIFACTS_DIR` | Pre-created external artifacts directory (`~/.archon/workspaces/<owner>/<repo>/artifacts/runs/<id>/`) | Always exists before node execution; stored outside the repo to avoid polluting the working tree. **Container runs (`--container`):** this host path is **not mounted into the container**, so a node that writes *directly* to `$ARTIFACTS_DIR` from inside the container will fail — write to the workspace instead. Engine-written typed-output sidecars still work (they are written on the host from captured stdout). |
 | `$BASE_BRANCH` | Base branch for git operations | Resolved in order: `worktree.baseBranch` in `.archon/config.yaml`, then the registered codebase's stored default branch, then git auto-detection. Throws an error if referenced in a prompt but cannot be resolved |
 | `$DOCS_DIR` | Documentation directory path | Configured via `docs.path` in `.archon/config.yaml`. Defaults to `docs/` when not set. Never throws |
 | `$CONTEXT` | GitHub issue or PR context, if available | Populated when the workflow is triggered from a GitHub issue/PR. Replaced with empty string when unavailable |
@@ -46,17 +46,14 @@ Unlike other variables, `$BASE_BRANCH` will cause the workflow to **fail immedia
 
 If the variable is not referenced, no error occurs even if the base branch cannot be determined.
 
-## Positional Arguments
+## Positional Arguments (not supported)
 
-These variables are substituted by the command handler when commands are invoked directly (outside workflows). They are processed before workflow variables.
-
-| Variable | Resolves to | Notes |
-|----------|-------------|-------|
-| `$1` | First positional argument | Split by whitespace from the user's input |
-| `$2` | Second positional argument | |
-| `$3` ... `$9` | Third through ninth positional arguments | |
-| `$ARGUMENTS` | All arguments as a single string | Same variable, available in both contexts |
-| `\$` | Literal `$` character | Escape a dollar sign to prevent substitution |
+Archon does **not** support positional arguments (`$1`, `$2`, `$3`, … `$9`).
+Command files and workflow prompts receive the user's whole trigger message via
+`$ARGUMENTS` / `$USER_MESSAGE` only — there is no whitespace-splitting into
+numbered slots, in either direct command invocation or workflow nodes. If you
+need structured inputs, parse them out of `$ARGUMENTS` inside the command or
+prompt body.
 
 ## Node Output References
 
@@ -70,6 +67,8 @@ In DAG workflows, nodes can reference the output of any completed upstream node.
 ### Shell Quoting in `bash:` vs `script:`
 
 `$nodeId.output` values are **auto shell-quoted** when substituted into `bash:` scripts, so the value is always safe to embed in a shell command. For small outputs, values are single-quoted inline. For outputs exceeding 32 KB, Archon spills to a temp file and substitutes `$(cat '/tmp/path')` instead — the unquoted assignment form is correct in both cases. They are **not** shell-quoted when substituted into `script:` bodies — the raw value is embedded as-is. For script nodes, treat substituted values as untrusted input and parse them with language features (e.g. `JSON.parse`), not by interpolating into shell syntax.
+
+User-controlled variables (`$ARGUMENTS`, `$USER_MESSAGE`, `$LOOP_USER_INPUT`, `$LOOP_PREV_OUTPUT`, `$REJECTION_REASON`, `$CONTEXT` and its aliases) are delivered to `bash:` and `script:` nodes as subprocess **environment variables** (`ARGUMENTS`, `USER_MESSAGE`, `LOOP_USER_INPUT`, `LOOP_PREV_OUTPUT`, `REJECTION_REASON`, `CONTEXT`/`EXTERNAL_CONTEXT`/`ISSUE_CONTEXT`), never spliced as raw text into executable code — so attacker-influenced input can't inject. In `bash:` read them as `"$ARGUMENTS"`; in `script:` read them via `process.env.ARGUMENTS` (bun) or `os.environ['ARGUMENTS']` (uv/python). A literal `$ARGUMENTS`/`$USER_MESSAGE`/`$CONTEXT` left in a `script:` body no longer resolves and logs a one-release migration warning.
 
 Because `bash:` substitutions arrive pre-quoted, wrapping them in double quotes is a silent footgun for small (inline) values:
 
@@ -118,14 +117,13 @@ Inside a `loop_group` body, `$LOOP_PREV.<nodeId>.output` refs are resolved
 first (before `$LOOP_USER_INPUT` is spliced in, so user-provided text is never
 re-processed as a workflow ref), then the node's normal substitution runs.
 
-Positional arguments (`$1` through `$9`) are substituted separately by the command handler and are only available when commands are invoked directly, not through workflow nodes.
+Positional arguments (`$1` through `$9`) are **not** supported in any context — `$ARGUMENTS` / `$USER_MESSAGE` deliver the whole trigger message instead.
 
 ## Variable Availability by Context
 
 | Variable | Workflow nodes | Direct command invocation | `when:` conditions |
 |----------|---------------|--------------------------|-------------------|
-| `$ARGUMENTS` / `$USER_MESSAGE` | Yes | Yes (as `$ARGUMENTS`) | No |
-| `$1` ... `$9` | No | Yes | No |
+| `$ARGUMENTS` / `$USER_MESSAGE` | Yes | Yes (both aliases) | No |
 | `$WORKFLOW_ID` | Yes | No | No |
 | `$ARTIFACTS_DIR` | Yes | No | No |
 | `$BASE_BRANCH` | Yes | No | No |

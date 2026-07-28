@@ -10,7 +10,6 @@
  */
 
 import { join, resolve, isAbsolute } from 'path';
-import { homedir } from 'os';
 import { access, readFile } from 'fs/promises';
 import {
   createLogger,
@@ -22,7 +21,8 @@ import {
 import { execFileAsync } from '@archon/git';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { isValidCommandName } from './command-validation';
-import { getProviderCapabilities, isRegisteredProvider } from '@archon/providers';
+import { levenshtein, findSimilar } from './utils/fuzzy-match';
+import { getProviderCapabilities, isRegisteredProvider, skillSearchRoots } from '@archon/providers';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -30,7 +30,7 @@ function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.validator');
   return cachedLog;
 }
-import { isBashNode, isLoopNode, isLoopGroupNode, isScriptNode } from './schemas';
+import { isBashNode, isLoopNode, isLoopGroupNode, isScriptNode, isIncludeNode } from './schemas';
 import type { WorkflowDefinition, DagNode, WorkflowSource } from './schemas';
 import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -91,42 +91,11 @@ export interface ValidationConfig {
   tiers?: RawTiersConfig;
 }
 
-// =============================================================================
-// Levenshtein distance and fuzzy matching
-// =============================================================================
-
-/** Classic Levenshtein distance between two strings */
-export function levenshtein(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0) as number[]);
-
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
-    }
-  }
-
-  return dp[m][n];
-}
-
-/** Find the closest matches from a list of candidates */
-export function findSimilar(
-  name: string,
-  candidates: readonly string[],
-  maxDistance?: number
-): string[] {
-  const threshold = maxDistance ?? Math.max(2, Math.floor(name.length * 0.3));
-  const scored = candidates
-    .map(c => ({ name: c, distance: levenshtein(name.toLowerCase(), c.toLowerCase()) }))
-    .filter(s => s.distance <= threshold && s.distance > 0)
-    .sort((a, b) => a.distance - b.distance);
-  return scored.slice(0, 3).map(s => s.name);
-}
+// Levenshtein distance and fuzzy matching now live in ./utils/fuzzy-match so lean
+// modules can reuse them without validator.ts's heavy deps (imported above for the
+// internal command/tool did-you-mean hints). Re-exported to preserve validator.ts's
+// public surface for existing importers (e.g. validator.test.ts).
+export { levenshtein, findSimilar };
 
 // =============================================================================
 // Command discovery
@@ -385,6 +354,14 @@ export async function validateWorkflowResources(
   collectNodes(workflow.nodes);
 
   for (const node of allNodes) {
+    // Include nodes carry no resources to check — the target workflow is resolved and
+    // inlined at DISCOVERY time (see include-expander.ts), so discovery-fed validation
+    // (CLI `validate workflows`) sees the already-expanded nodes and checks their
+    // commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current caller reaches
+    // it with an unexpanded include node (POST /api/workflows/validate only runs
+    // parseWorkflow, not this resource pass). Kept so a future raw caller can't crash here.
+    if (isIncludeNode(node)) continue;
+
     const provider = resolveProvider(node, workflow.provider, defaultProvider);
 
     if (requiresPortableModelRefs && 'model' in node && node.model?.startsWith('@')) {
@@ -426,6 +403,37 @@ export async function validateWorkflowResources(
           issue.suggestions = similar;
         }
         issues.push(issue);
+      }
+    }
+
+    // --- Loop nodes with loop.command: check file exists (parallel to command-node check above) ---
+    if (isLoopNode(node) && node.loop.command !== undefined) {
+      const loopCommand = node.loop.command;
+      if (!isValidCommandName(loopCommand)) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'loop.command',
+          message: `Invalid command name '${loopCommand}' — must not contain '/', '\\', '..', or start with '.'`,
+          hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
+        });
+      } else {
+        const resolved = await resolveCommand(loopCommand, cwd, config);
+        if (!resolved) {
+          const similar = findSimilar(loopCommand, availableCommands);
+          const issue: ValidationIssue = {
+            level: 'error',
+            nodeId: node.id,
+            field: 'loop.command',
+            message: `Command '${loopCommand}' not found`,
+            hint: `Create .archon/commands/${loopCommand}.md or use an existing command name`,
+          };
+          if (similar.length > 0) {
+            issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${loopCommand}.md`;
+            issue.suggestions = similar;
+          }
+          issues.push(issue);
+        }
       }
     }
 
@@ -484,20 +492,24 @@ export async function validateWorkflowResources(
 
     // --- Skills nodes: check skill directories exist ---
     if ('skills' in node && Array.isArray(node.skills)) {
+      const searchRoots = skillSearchRoots(cwd);
       for (const skillName of node.skills) {
-        const projectSkillPath = join(cwd, '.claude', 'skills', skillName, 'SKILL.md');
-        const userSkillPath = join(homedir(), '.claude', 'skills', skillName, 'SKILL.md');
+        let found = false;
+        for (const root of searchRoots) {
+          const skillPath = join(root, skillName, 'SKILL.md');
+          if (await fileExists(skillPath)) {
+            found = true;
+            break;
+          }
+        }
 
-        const projectExists = await fileExists(projectSkillPath);
-        const userExists = await fileExists(userSkillPath);
-
-        if (!projectExists && !userExists) {
+        if (!found) {
           issues.push({
             level: 'warning',
             nodeId: node.id,
             field: 'skills',
-            message: `Skill '${skillName}' not found in .claude/skills/ or ~/.claude/skills/`,
-            hint: `Install with: npx skills add <repo> — or create manually at .claude/skills/${skillName}/SKILL.md`,
+            message: `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
+            hint: `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
           });
         }
       }

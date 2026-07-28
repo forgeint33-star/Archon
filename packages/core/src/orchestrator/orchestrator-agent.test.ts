@@ -34,6 +34,10 @@ const mockSyncWorkspace = mock(() =>
 );
 // Identity passthrough — strips branded type for test simplicity; empty-string guard not needed here
 const mockToRepoPath = mock((p: string) => p);
+// Remote auto-detection defaults to 'origin' (standard repos)
+const mockGetDefaultRemote = mock(() => Promise.resolve('origin' as string | null));
+// Repo config defaults to empty (no worktree.remote configured)
+const mockLoadRepoConfig = mock(() => Promise.resolve({} as Record<string, unknown>));
 const mockGetOrCreateConversation = mock(() => Promise.resolve(null as unknown));
 const mockGetCodebase = mock(() => Promise.resolve(null as unknown));
 const mockExecuteWorkflow = mock(() => Promise.resolve());
@@ -187,6 +191,9 @@ mock.module('../workflows/store-adapter', () => ({
 const mockGetPausedWorkflowRun = mock(() => Promise.resolve(null as unknown));
 const mockFindResumableRunByParentConversation = mock(() => Promise.resolve(null as unknown));
 const mockUpdateWorkflowRun = mock(() => Promise.resolve());
+// approveWorkflow stamps the resolution atomically via this CAS (#2113), not
+// updateWorkflowRun. Defaults to "won the race".
+const mockResolveApprovalGate = mock(() => Promise.resolve({ resolved: true }));
 // approveWorkflow (operations/workflow-operations, called by the NL approval
 // path) re-reads the run via getWorkflowRun before recording the resolution.
 const mockGetWorkflowRunDb = mock(() => Promise.resolve(null as unknown));
@@ -195,6 +202,7 @@ mock.module('../db/workflows', () => ({
   getWorkflowRun: mockGetWorkflowRunDb,
   findResumableRunByParentConversation: mockFindResumableRunByParentConversation,
   updateWorkflowRun: mockUpdateWorkflowRun,
+  resolveApprovalGate: mockResolveApprovalGate,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -204,6 +212,7 @@ mock.module('../db/workflow-events', () => ({
 
 mock.module('../config/config-loader', () => ({
   loadConfig: mockLoadConfig,
+  loadRepoConfig: mockLoadRepoConfig,
 }));
 
 const mockGenerateAndSetTitle = mock(() => Promise.resolve());
@@ -251,6 +260,7 @@ mock.module('../utils/worktree-sync', () => ({
 }));
 
 mock.module('@archon/git', () => ({
+  getDefaultRemote: mockGetDefaultRemote,
   syncWorkspace: mockSyncWorkspace,
   toRepoPath: mockToRepoPath,
   toBranchName: mock((b: string) => b),
@@ -310,6 +320,7 @@ import {
   parseOrchestratorCommands,
   handleMessage,
   resolveChatModelRequest,
+  resolveTitleRequest,
 } from './orchestrator-agent';
 import { buildAiProfile } from '@archon/workflows/model-validation';
 
@@ -1060,6 +1071,10 @@ describe('discoverAllWorkflows — remote sync', () => {
   beforeEach(() => {
     mockSyncWorkspace.mockClear();
     mockToRepoPath.mockClear();
+    mockGetDefaultRemote.mockClear();
+    mockGetDefaultRemote.mockImplementation(() => Promise.resolve('origin'));
+    mockLoadRepoConfig.mockClear();
+    mockLoadRepoConfig.mockImplementation(() => Promise.resolve({}));
     mockGetOrCreateConversation.mockReset();
     mockGetCodebase.mockReset();
     mockListCodebases.mockReset();
@@ -1090,8 +1105,11 @@ describe('discoverAllWorkflows — remote sync', () => {
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', 'What is the latest commit?');
 
-    // Non-destructive default sync (#1864): 2-arg call, no explicit reset mode.
-    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined);
+    // Non-destructive default sync (#1864): no explicit reset mode, only the
+    // resolved remote rides in the options.
+    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
+      remote: 'origin',
+    });
     // cwd resolution behavior — scoped chat runs the provider in the repo's
     // default_cwd (not the workspaces root) and skips ensureArchonWorkspacesPath
     // — is covered by the 'provider cwd resolution' describe block (issue #1179).
@@ -1112,7 +1130,8 @@ describe('discoverAllWorkflows — remote sync', () => {
 
     expect(mockSyncWorkspace).toHaveBeenCalledWith(
       '/home/test/.archon/workspaces/owner/repo/source',
-      undefined
+      undefined,
+      { remote: 'origin' }
     );
   });
 
@@ -1125,7 +1144,47 @@ describe('discoverAllWorkflows — remote sync', () => {
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', 'What is the latest commit?');
 
-    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', 'develop');
+    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', 'develop', {
+      remote: 'origin',
+    });
+  });
+
+  test('passes configured worktree.remote through to syncWorkspace', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockLoadRepoConfig.mockResolvedValueOnce({ worktree: { remote: 'mar' } });
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
+
+    expect(mockSyncWorkspace).toHaveBeenCalledWith(
+      '/repos/test-repo',
+      undefined,
+      expect.objectContaining({ remote: 'mar' })
+    );
+    // Explicit config wins — auto-detection must not run
+    expect(mockGetDefaultRemote).not.toHaveBeenCalled();
+  });
+
+  test('auto-detects the remote when worktree.remote is not configured', async () => {
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockGetDefaultRemote.mockResolvedValueOnce('upstream');
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'What is the latest commit?');
+
+    expect(mockSyncWorkspace).toHaveBeenCalledWith(
+      '/repos/test-repo',
+      undefined,
+      expect.objectContaining({ remote: 'upstream' })
+    );
   });
 
   test('proceeds without throwing when syncWorkspace rejects', async () => {
@@ -1141,7 +1200,9 @@ describe('discoverAllWorkflows — remote sync', () => {
     await expect(
       handleMessage(platform, 'conv-1', 'What is the latest commit?')
     ).resolves.toBeUndefined();
-    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined);
+    expect(mockSyncWorkspace).toHaveBeenCalledWith('/repos/test-repo', undefined, {
+      remote: 'origin',
+    });
   });
 
   test('does not call syncWorkspace when conversation has no codebase_id', async () => {
@@ -1473,6 +1534,8 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockHydrateResumableRun.mockClear();
     mockUpdateWorkflowRun.mockClear();
     mockUpdateWorkflowRun.mockImplementation(() => Promise.resolve());
+    mockResolveApprovalGate.mockClear();
+    mockResolveApprovalGate.mockImplementation(() => Promise.resolve({ resolved: true }));
     mockHandleCommand.mockReset();
     mockHandleCommand.mockImplementation(() =>
       Promise.resolve({ success: true, message: 'ok', workflow: undefined })
@@ -1998,6 +2061,8 @@ describe('natural-language approval routing', () => {
     mockHydrateResumableRun.mockClear();
     mockUpdateWorkflowRun.mockClear();
     mockUpdateWorkflowRun.mockImplementation(() => Promise.resolve());
+    mockResolveApprovalGate.mockClear();
+    mockResolveApprovalGate.mockImplementation(() => Promise.resolve({ resolved: true }));
     mockDiscoverWorkflowsWithConfig.mockReset();
     mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
       Promise.resolve({ workflows: [], errors: [] })
@@ -2028,22 +2093,33 @@ describe('natural-language approval routing', () => {
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', 'looks good, proceed with implementation');
 
-    // Approval events should be written
-    expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+    // Approval events ride the CAS transaction now (#2146), not a direct write:
+    // node_completed + approval_received.
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    expect(casEvents).toHaveLength(2);
+    expect(casEvents[0].event_type).toBe('node_completed');
+    expect(casEvents[1].event_type).toBe('approval_received');
     // Resuming message sent
     expect(platform.sendMessage).toHaveBeenCalledWith(
       'conv-1',
       expect.stringContaining('Resuming')
     );
-    // Run stays 'paused' — resolution recorded on the approval context (#2075)
-    expect(mockUpdateWorkflowRun).toHaveBeenCalledWith('run-1', {
-      metadata: {
+    // Run stays 'paused' — resolution recorded atomically via the CAS on the
+    // approval context (#2075/#2113), with the audit events in the same
+    // transaction (#2146)
+    expect(mockResolveApprovalGate).toHaveBeenCalledWith(
+      'run-1',
+      {
         approval: { nodeId: 'gate-1', message: 'Please review', resolved: 'approved' },
         approval_response: 'approved',
         rejection_reason: '',
         rejection_count: 0,
       },
-    });
+      expect.any(Array)
+    );
     expect(mockHydrateResumableRun).toHaveBeenCalled();
     expect(mockExecuteWorkflow).toHaveBeenCalled();
     // NL approval path captures the binary resolution
@@ -2163,8 +2239,9 @@ describe('natural-language approval routing', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
     mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(makePausedRun()));
-    // Simulate DB error when writing approval events
-    mockCreateWorkflowEvent.mockRejectedValueOnce(new Error('connection lost'));
+    // Simulate a DB error resolving the gate — the resolution + audit events now
+    // commit atomically inside this CAS (#2146), so a failure here is the write path.
+    mockResolveApprovalGate.mockRejectedValueOnce(new Error('connection lost'));
 
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', 'go ahead');
@@ -3569,6 +3646,45 @@ describe('per-user AI prefs in chat + tier-fallback nudge', () => {
     expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('creator-1');
   });
 
+  test("per-user default provider wins over the conversation's stored assistant (#2241 chain)", async () => {
+    // Chain order: user pref → conversation row (creation-time default). The
+    // row says claude; the user's personal default assistant must win.
+    mockGetOrCreateConversation.mockReturnValueOnce(
+      Promise.resolve(makeConversation({ user_id: 'user-9' } as Partial<Conversation>))
+    );
+    mockGetUserAiPrefsDb.mockImplementation(async () => ({ defaultProvider: 'codex' }));
+    mockLogger.debug.mockClear();
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'Hello');
+
+    const sendingLog = mockLogger.debug.mock.calls.find(c => c[1] === 'sending_to_ai') as
+      | [Record<string, unknown>, string]
+      | undefined;
+    expect(sendingLog).toBeDefined();
+    expect(sendingLog?.[0].assistantType).toBe('claude');
+    expect(sendingLog?.[0].resolvedAssistantType).toBe('codex');
+  });
+
+  test("without an identity the conversation's stored assistant drives the turn (#2241 chain)", async () => {
+    // No sender and no creator: the creation-time default on the conversation
+    // row (resolved from config since #2241) is what executes.
+    mockGetOrCreateConversation.mockReturnValueOnce(
+      Promise.resolve(makeConversation({ ai_assistant_type: 'codex' }))
+    );
+    mockLogger.debug.mockClear();
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'Hello');
+
+    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalled();
+    const sendingLog = mockLogger.debug.mock.calls.find(c => c[1] === 'sending_to_ai') as
+      | [Record<string, unknown>, string]
+      | undefined;
+    expect(sendingLog).toBeDefined();
+    expect(sendingLog?.[0].resolvedAssistantType).toBe('codex');
+  });
+
   test('structurally invalid stored prefs degrade to config-only (chat still answers)', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(
       Promise.resolve(makeConversation({ user_id: 'user-9' } as Partial<Conversation>))
@@ -4003,5 +4119,94 @@ describe('resolveChatModelRequest', () => {
       { assistants: { claude: {}, codex: {} }, tiers }
     );
     expect(req.model).toBe('sonnet');
+  });
+});
+
+// ─── resolveTitleRequest (#1855): small-tier title generation ────────────────
+
+describe('resolveTitleRequest', () => {
+  beforeEach(() => {
+    mockLoadConfig.mockReset();
+    mockLoadConfig.mockImplementation(() =>
+      Promise.resolve({
+        assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
+        envVars: {},
+      })
+    );
+    mockGetUserAiPrefsDb.mockReset();
+    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
+  });
+
+  test('resolves the built-in codex small tier instead of the raw config-default model', async () => {
+    const req = await resolveTitleRequest('codex');
+
+    expect(req.provider).toBe('codex');
+    // Built-in codex small tier — NOT the (ChatGPT-plan-unsupported) assistants default.
+    expect(req.options.model).toBe('gpt-5.5');
+    // Preset effort is routed to the Codex reasoning-effort field.
+    expect(req.options.assistantConfig).toEqual({
+      model: 'gpt-5.3-codex',
+      modelReasoningEffort: 'minimal',
+    });
+  });
+
+  test('a configured small tier wins (including a provider switch)', async () => {
+    mockLoadConfig.mockResolvedValueOnce({
+      assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
+      tiers: { small: { provider: 'claude', model: 'haiku' } },
+      envVars: {},
+    });
+
+    const req = await resolveTitleRequest('codex');
+
+    expect(req.provider).toBe('claude');
+    expect(req.options.model).toBe('haiku');
+    expect(req.options.assistantConfig).toEqual({});
+  });
+
+  test('per-user small tier participates when a userId is available', async () => {
+    mockGetUserAiPrefsDb.mockResolvedValueOnce({
+      tiers: { small: { provider: 'codex', model: 'gpt-5.4-mini' } },
+    });
+
+    const req = await resolveTitleRequest('codex', 'user-1');
+
+    expect(mockGetUserAiPrefsDb).toHaveBeenCalledWith('user-1');
+    expect(req.provider).toBe('codex');
+    expect(req.options.model).toBe('gpt-5.4-mini');
+  });
+
+  test('per-user prefs are NOT consulted without a userId', async () => {
+    await resolveTitleRequest('codex');
+    expect(mockGetUserAiPrefsDb).not.toHaveBeenCalled();
+  });
+
+  test('per-user default provider rebases the built-in tier defaults', async () => {
+    mockGetUserAiPrefsDb.mockResolvedValueOnce({ defaultProvider: 'claude' });
+
+    const req = await resolveTitleRequest('codex', 'user-1');
+
+    expect(req.provider).toBe('claude');
+    expect(req.options.model).toBe('haiku');
+  });
+
+  test('structurally invalid stored prefs degrade to config-only resolution', async () => {
+    // Missing '@' prefix makes buildAiProfile throw for the user layer.
+    mockGetUserAiPrefsDb.mockResolvedValueOnce({
+      aliases: { fast: { provider: 'codex', model: 'gpt-5.5' } },
+    });
+
+    const req = await resolveTitleRequest('codex', 'user-1');
+
+    expect(req.provider).toBe('codex');
+    expect(req.options.model).toBe('gpt-5.5');
+  });
+
+  test('NEVER throws — config load failure falls back to the bare legacy request', async () => {
+    mockLoadConfig.mockRejectedValueOnce(new Error('config exploded'));
+
+    const req = await resolveTitleRequest('codex', 'user-1');
+
+    expect(req).toEqual({ provider: 'codex', options: {} });
   });
 });

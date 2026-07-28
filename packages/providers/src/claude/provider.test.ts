@@ -167,6 +167,7 @@ describe('ClaudeProvider', () => {
         thinkingControl: true,
         fallbackModel: true,
         sandbox: true,
+        settingSources: true,
         nativeTools: true,
       });
     });
@@ -646,6 +647,87 @@ describe('ClaudeProvider', () => {
       expect(chunks[0]).toMatchObject({ type: 'task_notification', status: 'failed' });
     });
 
+    // --- #2083 — background-task liveness (SDK 0.3.209 background_tasks_changed) ---
+
+    test('yields background_tasks chunk from SDK background_tasks_changed', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [
+            { task_id: 't-1', task_type: 'local_agent', description: 'Research problem A' },
+            { task_id: 't-2', task_type: 'local_agent', description: 'Research problem B' },
+          ],
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'background_tasks',
+          tasks: [
+            { taskId: 't-1', taskType: 'local_agent', description: 'Research problem A' },
+            { taskId: 't-2', taskType: 'local_agent', description: 'Research problem B' },
+          ],
+        },
+      ]);
+    });
+
+    test('forwards an EMPTY background_tasks_changed set (drain signal)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // An empty set means "all background work drained" — it must be forwarded,
+      // not dropped, or the executor's wait gate would never release.
+      expect(chunks).toEqual([{ type: 'background_tasks', tasks: [] }]);
+    });
+
+    test('keeps forwarding chunks that arrive AFTER the result (background-task wait window)', async () => {
+      // Single-turn queries keep streaming after the turn-level result while
+      // background tasks drain; streamClaudeMessages must not stop at result.
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [{ task_id: 't-1', task_type: 'local_agent', description: 'bg work' }],
+        };
+        yield { type: 'result', subtype: 'success', session_id: 's-1', is_error: false };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-1',
+          status: 'completed',
+          output_file: '/tmp/t-1.md',
+          summary: 'done',
+        };
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+        yield { type: 'result', subtype: 'success', session_id: 's-1', is_error: false };
+      });
+
+      const types = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        types.push(chunk.type);
+      }
+
+      expect(types).toEqual([
+        'background_tasks',
+        'result',
+        'task_notification',
+        'background_tasks',
+        'result',
+      ]);
+    });
+
     test('yields hook_started chunk from SDK system message', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
@@ -946,6 +1028,35 @@ describe('ClaudeProvider', () => {
       spy.mockRestore();
     });
 
+    test('container run SKIPS host binary resolution (works when host Claude is absent)', async () => {
+      // Simulate a compiled binary with no host Claude — resolveClaudeBinaryPath
+      // would throw. A container run must NOT call it (Claude is baked into the
+      // runner image; the SDK bypasses disk resolution via spawnClaudeCodeProcess).
+      const spy = spyOn(binaryResolver, 'resolveClaudeBinaryPath').mockRejectedValue(
+        new Error('Claude Code not found — set CLAUDE_BIN_PATH')
+      );
+      mockQuery.mockImplementation(async function* () {
+        // empty
+      });
+
+      // Must not throw at resolution time.
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        execContext: { kind: 'container', containerId: 'c-1' },
+      })) {
+        // consume
+      }
+
+      expect(spy).not.toHaveBeenCalled();
+      const callArgs = mockQuery.mock.calls[0][0] as {
+        options: { pathToClaudeCodeExecutable?: string; spawnClaudeCodeProcess?: unknown };
+      };
+      // SDK spawn hook is set; host disk path is omitted.
+      expect(typeof callArgs.options.spawnClaudeCodeProcess).toBe('function');
+      expect(callArgs.options.pathToClaudeCodeExecutable).toBeUndefined();
+
+      spy.mockRestore();
+    });
+
     test('classifies exit code errors as crash and retries up to 3 times', async () => {
       const error = new Error('process exited with code 1');
       mockQuery.mockImplementation(async function* () {
@@ -1131,6 +1242,41 @@ describe('ClaudeProvider', () => {
       expect(mockQuery).toHaveBeenCalledTimes(1);
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
       expect(callArgs.options.settingSources).toEqual(['project']);
+    });
+
+    test('per-node settingSources override wins over the assistant default', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        nodeConfig: { settingSources: ['project'] },
+        assistantConfig: { settingSources: ['project', 'user'] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project']);
+    });
+
+    test('per-node settingSources applies when no assistant default is set', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        nodeConfig: { settingSources: [] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      // An explicit empty array is a valid opt-out of ALL setting sources —
+      // it must not fall through to the ['project', 'user'] default.
+      expect(callArgs.options.settingSources).toEqual([]);
     });
 
     test('passes env from requestOptions into SDK options', async () => {
@@ -2122,6 +2268,53 @@ describe('API error surfaced as text (#1797)', () => {
     const { error } = await collect(client.sendQuery('test', '/workspace'));
     expect(error?.message).toContain('Claude API error (rate_limit)');
     // MAX_SUBPROCESS_RETRIES = 3 → 4 attempts total
+    expect(mockQuery).toHaveBeenCalledTimes(4);
+  }, 5_000);
+
+  test('400 tool-use-concurrency error with a catch-all code retries like a rate limit (#1341)', async () => {
+    // The SDK types this transient 400 with a catch-all code ('unknown' here;
+    // 'invalid_request' classifies identically), so code-only classification
+    // would fail fast. The narrow text fallback must reclassify it as
+    // rate_limit and drive the existing backoff.
+    const text = 'API Error: 400 due to tool use concurrency issues.';
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('unknown', text);
+      yield { ...apiErrorResult(text), api_error_status: 400 };
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (unknown)');
+    expect(error?.message).toContain('tool use concurrency');
+    // MAX_SUBPROCESS_RETRIES = 3 → 4 attempts total
+    expect(mockQuery).toHaveBeenCalledTimes(4);
+  }, 5_000);
+
+  test('other catch-all-coded api errors stay non-retryable', async () => {
+    // Guards the narrowness of the #1341 fallback: a genuine client error that
+    // also lands on a catch-all code must NOT be retried.
+    const text = 'Invalid request: max_tokens exceeds model limit';
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('invalid_request', text);
+      yield { ...apiErrorResult(text), api_error_status: 400 };
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (invalid_request)');
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test('thrown subprocess error mentioning tool use concurrency retries as rate_limit (#1341)', async () => {
+    mockQuery.mockImplementation(async function* () {
+      throw new Error('API Error: 400 due to tool use concurrency issues.');
+    });
+
+    const consumeGenerator = async (): Promise<void> => {
+      for await (const _ of client.sendQuery('test', '/workspace')) {
+        // consume
+      }
+    };
+
+    await expect(consumeGenerator()).rejects.toThrow(/Claude Code rate_limit/);
     expect(mockQuery).toHaveBeenCalledTimes(4);
   }, 5_000);
 

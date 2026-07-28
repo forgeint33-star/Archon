@@ -17,6 +17,7 @@
 import { join, dirname, normalize, basename } from 'path';
 import { homedir } from 'os';
 import { access, mkdir, symlink, lstat, readdir, readlink, realpath, rm, stat } from 'fs/promises';
+import { readFileSync } from 'fs';
 import { createLogger } from './logger';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -46,6 +47,47 @@ export function isDocker(): boolean {
     (process.env.HOME === '/root' && Boolean(process.env.WORKSPACE_PATH)) ||
     process.env.ARCHON_DOCKER === 'true'
   );
+}
+
+/**
+ * Detect if running inside WSL (Windows Subsystem for Linux).
+ *
+ * Two signals (either is sufficient):
+ *   - `WSL_DISTRO_NAME` env var is set (always true inside a WSL distro)
+ *   - `/proc/sys/kernel/osrelease` contains "microsoft" (lower-cased)
+ *
+ * Used by callers that need to emit Windows-host-friendly URIs
+ * (`vscode://vscode-remote/wsl+<distro>/...` instead of `vscode://file/...`)
+ * when the server is inside WSL but the browser is on the Windows host.
+ */
+export function isWSL(): boolean {
+  if (process.env.WSL_DISTRO_NAME) return true;
+
+  try {
+    const release = readFileSync('/proc/sys/kernel/osrelease', 'utf8').toLowerCase();
+    return release.includes('microsoft');
+  } catch {
+    // Unable to read the fallback signal; return false conservatively. This
+    // can be a false negative (WSL with the env var absent and an unreadable
+    // /proc/sys/kernel/osrelease), in which case callers fall back to the
+    // plain vscode://file/... URI.
+    return false;
+  }
+}
+
+/**
+ * Return the configured `WSL_DISTRO_NAME` value (`Ubuntu`, `Debian`, …) if
+ * present, otherwise `undefined`. WSL sets this env var in every distro
+ * shell; it may also be set manually to opt into the WSL URI path.
+ *
+ * Note this only reads the env var — `isWSL()` may still be true via the
+ * `/proc` fallback while this returns `undefined`. Without the env var we
+ * don't know what distro to put into a
+ * `vscode://vscode-remote/wsl+<distro>/...` URI, and guessing is worse than
+ * a sentinel that callers can fall back on.
+ */
+export function getWSLDistroName(): string | undefined {
+  return process.env.WSL_DISTRO_NAME ?? undefined;
 }
 
 /**
@@ -390,6 +432,35 @@ export function parseOwnerRepo(name: string): { owner: string; repo: string } | 
   if (owner === '.' || owner === '..' || repo === '.' || repo === '..') return null;
   if (!SAFE_NAME.test(owner) || !SAFE_NAME.test(repo)) return null;
   return { owner, repo };
+}
+
+/**
+ * Resolve the `{ owner, repo }` storage identity for a registered *repo*-kind
+ * codebase. This is the single source of truth that keeps `registerRepository()`
+ * (which creates the on-disk `owner/repo` tree), the log/artifact path
+ * resolvers, and the worktree base (`getWorktreeBase()` in `@archon/git`) in
+ * agreement — a mismatch between them dropped no-remote repos' logs/artifacts
+ * into `<cwd>/.archon` instead of `ARCHON_HOME` (#2132), and later split
+ * worktrees and storage across two different workspace trees (#2227).
+ *
+ * - A `name` in exact `owner/repo` form (clones, web-registered repos) → that
+ *   owner/repo.
+ * - Otherwise — most commonly a no-remote local repo registered under its bare
+ *   directory basename — the working directory's basename scoped under the
+ *   `_local` pseudo-owner, mirroring what registration writes to disk.
+ *   `basename()` never contains a path separator, so the only traversal risk is
+ *   `..`; that, `.`, and an empty segment return null so the caller can fall
+ *   back to cwd-local storage.
+ */
+export function resolveRepoProjectIdentity(
+  name: string,
+  cwd: string
+): { owner: string; repo: string } | null {
+  const parsed = parseOwnerRepo(name);
+  if (parsed) return parsed;
+  const repo = basename(cwd);
+  if (repo === '' || repo === '.' || repo === '..') return null;
+  return { owner: '_local', repo };
 }
 
 /**

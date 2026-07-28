@@ -11,6 +11,8 @@ sidebar:
 
 You must configure **at least one** AI assistant. All four can be configured and mixed within workflows.
 
+For a canonical, at-a-glance comparison of which per-node features each provider supports, see the [Provider Capability Matrix](/reference/provider-capabilities/) — it is generated directly from the providers' capability declarations, so it never drifts from runtime behavior. The per-provider sections below add the field-level YAML syntax and caveats.
+
 ## Structured output guarantees
 
 When a workflow node sets `output_format`, the guarantee level depends on the provider's tier (exposed as `capabilities.structuredOutput` on `GET /api/providers`):
@@ -142,7 +144,7 @@ assistants:
     # claudeBinaryPath: /absolute/path/to/claude
 ```
 
-The `settingSources` option controls which `CLAUDE.md`, skill, command, and agent files the Claude Code SDK loads. The default is `['project', 'user']`, which loads both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. Set it to `['project']` if you want to scope a workflow to project-only resources.
+The `settingSources` option controls which `CLAUDE.md`, skill, command, and agent files the Claude Code SDK loads. The default is `['project', 'user']`, which loads both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. Set it to `['project']` if you want to scope a workflow to project-only resources. Individual workflow nodes can override this with a per-node `settingSources:` field (e.g. `settingSources: []` for a lean node that loads no setting sources at all) — see [Claude SDK Advanced Options](/guides/authoring-workflows/#claude-sdk-advanced-options).
 
 ### Set as Default (Optional)
 
@@ -230,7 +232,7 @@ You can configure Codex's behavior in `.archon/config.yaml`:
 ```yaml
 assistants:
   codex:
-    model: gpt-5.3-codex
+    model: gpt-5.6-sol
     modelReasoningEffort: medium  # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
     webSearchMode: live           # 'disabled' | 'cached' | 'live'
     additionalDirectories:
@@ -307,7 +309,7 @@ assistants:
 | Skills | ✅ | SKILL.md files with YAML frontmatter, pattern-based permissions |
 | Tool restrictions | ✅ | `tools` / `disallowedTools` per agent; deny wins over allow |
 | Inline agents (`agents:`) | ✅ | File-materialized agents; single and parallel multi-agent fan-out |
-| Hooks | ✅ | Plugin hook system (tool, session, message hooks) |
+| Hooks | ❌ | Archon's per-node `hooks` field is Claude-SDK-shaped; the OpenCode provider has no translation site, so a node's `hooks:` is ignored (with a warning) |
 | Effort / reasoning control | ❌ | No per-request param; not configurable in agent file, opencode puts it in config. |
 | Thinking control | ❌ | No explicit `thinking` field in agent frontmatter; OpenCode auto-enables reasoning when `agents[].model` is a reasoning-capable model (e.g. `anthropic/claude-sonnet-4-5`) |
 | Fallback model | ❌ | No native failover in the SDK |
@@ -421,7 +423,19 @@ Most extensions need three config surfaces:
 |---|---|
 | `extensionFlags` | Per-extension feature flags (maps 1:1 to Pi's `--flag` CLI switches) |
 | `env` | Env vars the extension reads at runtime (managed via `.archon/config.yaml` or the Web UI codebase env panel) |
-| Workflow-level `interactive: true` | Required for **approval-gate extensions** on the web UI — forces foreground execution so the user can respond |
+| `interactive: true` | Binds a UI context so approval-gate extensions can block for human input; also set the **workflow-level** `interactive: true` on the web UI so the run stays foreground |
+
+#### Scoping extension posture per node
+
+`enableExtensions`, `interactive`, and `extensionFlags` are the three fields that make up a node's **extension posture**. Setting them under `assistants.pi` applies the posture to *every* Pi node in *every* workflow — which is usually wrong. A planning extension like plannotator only belongs on the node that actually plans: if the same `plan: true` flag leaks into a downstream `implement` node, that node starts in planning mode, its code edits get blocked ("edits are limited to markdown files"), and it hangs waiting on a review nobody asked for.
+
+Scope the posture to the node that plays that role. Three layers resolve per node, in ascending precedence:
+
+1. **Assistant-level** (`assistants.pi.*`) — the install-wide default for every Pi node.
+2. **Install-level node map** (`assistants.pi.nodes.<nodeId>`) — overrides the default for a node id on this machine. Handy when you can't edit the workflow, but it's non-portable: the override lives in one machine's `config.yaml` and is keyed by node-id string, so a node rename silently orphans it.
+3. **Portable node `pi:` block** — the per-node posture written directly in the workflow YAML. It travels with the workflow and wins over both layers above. This is the recommended surface.
+
+Each layer's `extensionFlags` shallow-merge over the ones below it (later wins per key), so a node can negate an inherited flag with `plan: false`. The `pi:` block is honored on `prompt`, `command`, and `loop` nodes (a `loop:` node's per-iteration call is exactly where planning mode tends to leak); on a `loop_group` it's ignored with a warning — put it on the body nodes instead.
 
 **Example — [plannotator](https://github.com/dmcglinn/plannotator) (human-in-the-loop plan review):**
 
@@ -430,25 +444,60 @@ Most extensions need three config surfaces:
 pi install npm:@plannotator/pi-extension
 ```
 
+Keep `assistants.pi` free of the planning flag — set only the extension's runtime env there:
+
 ```yaml
 # .archon/config.yaml
 assistants:
   pi:
     model: anthropic/claude-haiku-4-5
-    extensionFlags:
-      plan: true              # enables the plannotator "plan" flag
     env:
       PLANNOTATOR_REMOTE: "1" # exposes the review URL on 127.0.0.1:19432 so you can open it from anywhere
 ```
 
+Then grant the `plan` flag and a UI context to the planner node, and explicitly deny them on the implement loop — right in the workflow, so the posture ships with it:
+
 ```yaml
-# .archon/workflows/my-piv.yaml
-name: my-piv
+# .archon/workflows/plan-then-build.yaml
+name: plan-then-build
 provider: pi
-interactive: true             # plannotator gates the node on human approval — required on web UI
+interactive: true             # workflow-level: keeps the run foreground on the web UI so you can approve
+nodes:
+  - id: plan
+    prompt: "Draft a plan for: $ARGUMENTS"
+    pi:
+      interactive: true        # bind the UI context — plannotator opens its review server
+      extensionFlags:
+        plan: true             # planning mode ON for this node only
+
+  - id: implement
+    depends_on: [plan]
+    loop:
+      prompt: "Implement the approved plan. Print DONE when finished."
+      until: "DONE"
+      max_iterations: 10
+    pi:
+      interactive: false       # no review server on the implement loop
+      extensionFlags:
+        plan: false            # planning mode OFF — code edits are allowed
 ```
 
-When the node runs, plannotator prints a review URL and blocks until you click approve/deny in the browser. Archon's CLI/SSE batch buffer flushes that URL to you immediately so you never get stuck waiting on a node that silently wants input.
+When the `plan` node runs, plannotator prints a review URL and blocks until you click approve/deny in the browser. Archon's CLI/SSE batch buffer flushes that URL to you immediately so you never get stuck waiting on a node that silently wants input. The `implement` loop then runs headless with edits allowed.
+
+If you can't edit the workflow (e.g. a bundled default), the same scoping is available install-side via the node map — same precedence, lower priority than the workflow's own `pi:` block:
+
+```yaml
+# .archon/config.yaml
+assistants:
+  pi:
+    nodes:
+      plan:
+        interactive: true
+        extensionFlags: { plan: true }
+      implement:
+        interactive: false
+        extensionFlags: { plan: false }
+```
 
 ### Model reference format
 
@@ -490,7 +539,7 @@ nodes:
 
 | Feature | Support | YAML field |
 |---|---|---|
-| Extensions (community + local) | ✅ (default on) | `enableExtensions: false` to disable; `interactive: false` to load without UI bridge; `extensionFlags: { <name>: true }` per extension |
+| Extensions (community + local) | ✅ (default on) | `enableExtensions: false` to disable; `interactive: false` to load without UI bridge; `extensionFlags: { <name>: true }` per extension. Scope per node with a `pi:` block (`pi: { interactive, enableExtensions, extensionFlags }`) — see [Scoping extension posture per node](#scoping-extension-posture-per-node) |
 | Session resume | ✅ | automatic (Archon persists `sessionId`) |
 | Tool restrictions | ✅ | `allowed_tools` / `denied_tools` (read, bash, edit, write, grep, find, ls) |
 | Thinking level | ✅ | `effort: low\|medium\|high\|max` (max → xhigh) |

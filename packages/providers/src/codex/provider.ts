@@ -210,8 +210,12 @@ function buildCodexMcpConfigOverrides(
   return { mcp_servers: mcpServers };
 }
 
+// Maps slugs that ChatGPT-plan accounts now reject (previously shipped as Archon
+// suggestions/defaults) to a current, plan-accepted slug to suggest instead.
 const CODEX_MODEL_FALLBACKS: Record<string, string> = {
-  'gpt-5.3-codex': 'gpt-5.2-codex',
+  'gpt-5.3-codex': 'gpt-5.6-sol',
+  'gpt-5.2-codex': 'gpt-5.6-sol',
+  'gpt-5.2': 'gpt-5.6-sol',
 };
 
 function isModelAccessError(errorMessage: string): boolean {
@@ -322,7 +326,7 @@ function buildTurnOptions(requestOptions?: SendQueryOptions): {
 /**
  * Fold the request/node-level systemPrompt into the user prompt.
  *
- * The Codex SDK (verified at @openai/codex-sdk 0.144.4) exposes NO
+ * The Codex SDK (verified at @openai/codex-sdk 0.144.5) exposes NO
  * instructions/system-prompt channel on ThreadOptions or TurnOptions, so the
  * only delivery mechanism is prepending to the prompt string, separated by
  * the same `---` delimiter augmentPromptForJsonSchema uses. See issue #1837.

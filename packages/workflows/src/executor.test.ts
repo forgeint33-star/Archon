@@ -27,6 +27,7 @@ const mockCaptureWorkflowCompleted = mock(() => {});
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   parseOwnerRepo: mock(() => null),
+  resolveRepoProjectIdentity: mock(() => null),
   getRunArtifactsPath: mock(() => '/tmp/artifacts'),
   getProjectLogsPath: mock(() => '/tmp/logs'),
   getProjectArtifactsPath: mock(() => '/tmp/artifacts-root'),
@@ -54,6 +55,13 @@ mock.module('@archon/git', () => ({
 const mockExecuteDagWorkflow = mock(async (): Promise<string | undefined> => undefined);
 mock.module('./dag-executor', () => ({
   executeDagWorkflow: mockExecuteDagWorkflow,
+  // Passthrough for the sub-run outcome mapper (#2121) — executor.ts imports it;
+  // no test here exercises the sub-run path, but the export must exist so the
+  // mocked module doesn't shadow it with `undefined`.
+  childOutcomeFromRun: mock((run: { id: string; status: string }) => ({
+    childRunId: run.id,
+    status: run.status,
+  })),
 }));
 
 // --- Mock logger functions ---
@@ -94,6 +102,8 @@ import type { WorkflowDefinition, WorkflowRun } from './schemas';
 function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
   return {
     getActiveWorkflowRunByPath: mock(async () => null),
+    findChildRuns: mock(async () => []),
+    getRunAncestry: mock(async () => []),
     failOrphanedRuns: mock(async () => ({ count: 0 })),
     createWorkflowRun: mock(async () => makeRun()),
     updateWorkflowRun: mock(async () => {}),
@@ -168,6 +178,67 @@ describe('executeWorkflow', () => {
     mockGetDefaultBranch.mockClear();
     mockGetDefaultBranch.mockImplementation(async () => 'main');
     mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // Container resume guard (Phase C)
+  // -------------------------------------------------------------------------
+
+  describe('container resume guard', () => {
+    it('fails a container run resumed without a container context, pointing at the CLI', async () => {
+      const failSpy = mock(async () => {});
+      const store = makeStore({ failWorkflowRun: failSpy });
+      const preCreatedRun = makeRun({
+        id: 'crun',
+        metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun, priorCompletedNodes: new Map([['node1', 'out']]) }
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/executed inside an isolation container/);
+      expect(failSpy).toHaveBeenCalledTimes(1);
+      // The DAG is never entered — the guard returns before any execution.
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('proceeds when the container context IS provided (guard passes)', async () => {
+      const preCreatedRun = makeRun({
+        id: 'crun2',
+        metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+      });
+      const backend = {
+        suspend: mock(async () => {}),
+        finalize: mock(async () => ({ requiresApproval: false })),
+        applyChanges: mock(async () => ({ filesApplied: 0, filesDeleted: 0, warnings: [] })),
+        discardChanges: mock(async () => {}),
+      };
+      const result = await executeWorkflow(
+        makeDeps(),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun,
+          priorCompletedNodes: new Map([['node1', 'out']]),
+          execContext: { kind: 'container', containerId: 'cid' },
+          container: { envId: 'env-x', writeBack: 'approve', backend },
+        }
+      );
+      // Guard passed → DAG entered (mocked no-op) → run completes.
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -651,6 +722,67 @@ describe('executeWorkflow', () => {
         makeWorkflow(),
         'test message',
         'db-conv-1'
+      );
+
+      expect(mockGetDefaultBranch).toHaveBeenCalledWith('/tmp/worktree');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[10]).toBe('main');
+    });
+
+    it('skips git auto-detection for a folder-kind codebase, no ERROR/WARN spam (#2159)', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-folder',
+          name: 'Ops Root',
+          repository_url: null,
+          default_cwd: '/tmp/ops',
+          kind: 'folder' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1',
+        { codebaseId: 'cb-folder' }
+      );
+
+      // Non-git root: detection is never attempted (no git shell-out), so the
+      // benign auto-detect WARN is never emitted and $BASE_BRANCH resolves to
+      // empty (unresolved-but-not-referenced).
+      expect(mockGetDefaultBranch).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[10]).toBe('');
+      const warnedAutoDetect = (mockLogFn.mock.calls as unknown[][]).some(
+        args => args[1] === 'workflow.base_branch_auto_detect_failed'
+      );
+      expect(warnedAutoDetect).toBe(false);
+    });
+
+    it('still auto-detects for a repo-kind codebase (folder skip does not over-trigger)', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp/worktree',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
       );
 
       expect(mockGetDefaultBranch).toHaveBeenCalledWith('/tmp/worktree');
@@ -1576,7 +1708,7 @@ describe('resolveProjectPaths', () => {
 
   it('routes repo projects to owner/repo/ storage (unchanged)', async () => {
     const paths = await import('@archon/paths');
-    (paths.parseOwnerRepo as ReturnType<typeof mock>).mockReturnValueOnce({
+    (paths.resolveRepoProjectIdentity as ReturnType<typeof mock>).mockReturnValueOnce({
       owner: 'acme',
       repo: 'widget',
     });
@@ -1594,6 +1726,39 @@ describe('resolveProjectPaths', () => {
     const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
 
     // getRunArtifactsPath/getProjectLogsPath/getProjectArtifactsPath are mocked to constants
+    expect(result.artifactsDir).toBe('/tmp/artifacts');
+    expect(result.logDir).toBe('/tmp/logs');
+    expect(result.artifactsRoot).toBe('/tmp/artifacts-root');
+  });
+
+  it('routes a no-remote local repo to _local/<basename> storage (#2132)', async () => {
+    const paths = await import('@archon/paths');
+    // A bare-basename codebase name resolves to the _local pseudo-owner rather
+    // than falling through to <cwd>/.archon.
+    (paths.resolveRepoProjectIdentity as ReturnType<typeof mock>).mockReturnValueOnce({
+      owner: '_local',
+      repo: 'workspace',
+    });
+    const store = makeStore({
+      getCodebase: mock(async () => ({
+        id: 'cb-local',
+        name: 'workspace',
+        repository_url: null,
+        default_cwd: '/home/username/workspace',
+        kind: 'repo' as const,
+      })),
+    });
+    const deps = makeDeps(store);
+
+    const result = await resolveProjectPaths(deps, '/home/username/workspace', RUN_ID, 'cb-local');
+
+    expect(paths.resolveRepoProjectIdentity).toHaveBeenCalledWith(
+      'workspace',
+      '/home/username/workspace'
+    );
+    expect(paths.getRunArtifactsPath).toHaveBeenCalledWith('_local', 'workspace', RUN_ID);
+    expect(paths.getProjectLogsPath).toHaveBeenCalledWith('_local', 'workspace');
+    // Routed to project storage (mocked constants), NOT the cwd fallback.
     expect(result.artifactsDir).toBe('/tmp/artifacts');
     expect(result.logDir).toBe('/tmp/logs');
     expect(result.artifactsRoot).toBe('/tmp/artifacts-root');

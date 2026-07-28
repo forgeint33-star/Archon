@@ -46,6 +46,7 @@ import type {
 } from '../types';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
+import { buildContainerSpawn } from './container-spawn';
 import { resolveClaudeBinaryPath } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
@@ -107,11 +108,90 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
   return { ...process.env };
 }
 
+/**
+ * Build the base env for a CONTAINER run. Deliberately does NOT spread
+ * `process.env` — that is the isolation boundary itself (the container must
+ * never inherit the host's environment). The Archon-managed bag
+ * (`requestOptions.env`: codebase env vars + per-user AI creds + GitHub token)
+ * is layered on top by the caller, and PATH/HOME/CLAUDE_CONFIG_DIR come from the
+ * runner image. Only a minimal, host-independent base is seeded here.
+ */
+function buildContainerBaseEnv(): NodeJS.ProcessEnv {
+  return { TERM: 'dumb' };
+}
+
+/**
+ * Resolve the environment delivered to the Claude subprocess for a request.
+ *
+ * This is the env-isolation ENFORCEMENT POINT. A container run
+ * (`execContext.kind === 'container'`) gets ONLY the Archon-managed bag
+ * (`requestOptions.env`: codebase env + per-user creds + GitHub token) layered
+ * over a minimal base — host `process.env` NEVER crosses the boundary. A host run
+ * inherits the (already-cleaned) host env exactly as before. Exported so the
+ * invariant can be unit-tested with a `process.env` canary.
+ */
+export function buildRequestSubprocessEnv(
+  requestOptions: SendQueryOptions | undefined
+): NodeJS.ProcessEnv {
+  const isContainerRun = requestOptions?.execContext?.kind === 'container';
+  const subprocessEnv = isContainerRun ? buildContainerBaseEnv() : buildSubprocessEnv();
+  const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
+  // CLAUDE_API_KEY is Archon's variable name; the Claude Code CLI only reads
+  // ANTHROPIC_API_KEY, so mirror it or solo .env installs never authenticate
+  // (delivery.ts sets both vars on the per-user api_key path). Guarded on the
+  // MERGED env, not process.env: a per-request CLAUDE_CODE_OAUTH_TOKEN (per-user
+  // subscription delivered via requestOptions.env) must stay authoritative — the
+  // CLI prefers ANTHROPIC_API_KEY over the OAuth token, so injecting the install
+  // key alongside it would silently rebill the run. Truthiness is intentional:
+  // empty string = missing credential. Never clobbers an explicit ANTHROPIC_API_KEY.
+  if (env.CLAUDE_API_KEY && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
+    env.ANTHROPIC_API_KEY = env.CLAUDE_API_KEY;
+    getLog().debug('claude.api_key_mirrored');
+  }
+  return env;
+}
+
 /** Max retries for transient subprocess failures */
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
-const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overloaded'];
+const RATE_LIMIT_PATTERNS = [
+  'rate limit',
+  'too many requests',
+  '429',
+  'overloaded',
+  // "API Error: 400 due to tool use concurrency issues" — transient server-side
+  // rejection of concurrent tool calls; retrying after backoff succeeds (#1341).
+  'tool use concurrency',
+];
+
+/**
+ * Message-text fallbacks for Anthropic errors the SDK does not yet type.
+ *
+ * Entries are consulted ONLY when the SDK's typed error code has resolved to
+ * the catch-all 'unknown' class (see the ClaudeApiResultError branch in
+ * classifyAndEnrichError) — they must never override a typed classification.
+ * A matching entry reclassifies the error as rate_limit so the existing
+ * backoff-retry applies.
+ *
+ * Admission contract — each entry must:
+ *   1. Name the upstream error it matches.
+ *   2. Link an upstream issue/reference requesting the error be properly typed.
+ *   3. Be removed once the SDK types it.
+ * Do NOT add entries for errors the SDK already classifies.
+ *
+ * This is deliberately a separate list from RATE_LIMIT_PATTERNS above: that
+ * list matches raw subprocess text (no typed code exists at all), while this
+ * one is a narrow escape hatch inside the typed classification path (#1797).
+ */
+const UNTYPED_TRANSIENT_PATTERNS: readonly string[] = [
+  // Anthropic 400 "due to tool use concurrency issues" — transient server-side
+  // rejection of concurrent tool calls; retrying after backoff succeeds (#1341).
+  // TODO: link the upstream SDK issue requesting a typed code for this error,
+  // and remove this entry once the SDK classifies it.
+  'tool use concurrency',
+];
+
 const AUTH_PATTERNS = [
   'credit balance',
   'unauthorized',
@@ -578,12 +658,29 @@ function buildBaseClaudeOptions(
   const isJsExecutable = shouldPassNoEnvFile(cliPath);
   getLog().debug({ cliPath: cliPath ?? null, isJsExecutable }, 'claude.subprocess_env_file_flag');
 
+  // Container execution: the SDK runs Claude via our `docker exec` spawn hook
+  // instead of a local process. When the hook is set the SDK bypasses ALL disk
+  // resolution, so `pathToClaudeCodeExecutable` and the host-only
+  // `--no-env-file` executableArg are intentionally omitted — the in-container
+  // binary is resolved from the runner image's PATH.
+  const containerExecContext =
+    requestOptions?.execContext?.kind === 'container' ? requestOptions.execContext : undefined;
+  const spawnOverride = containerExecContext
+    ? { spawnClaudeCodeProcess: buildContainerSpawn(containerExecContext) }
+    : {};
+
   return {
     cwd,
     // In compiled binaries, the resolver supplies an absolute executable path;
     // in dev mode it returns undefined and the SDK resolves from node_modules.
-    ...(cliPath !== undefined ? { pathToClaudeCodeExecutable: cliPath } : {}),
-    ...(isJsExecutable ? { executableArgs: ['--no-env-file'] } : {}),
+    // Both are skipped for container runs (spawn hook bypasses disk resolution).
+    ...(cliPath !== undefined && containerExecContext === undefined
+      ? { pathToClaudeCodeExecutable: cliPath }
+      : {}),
+    ...(isJsExecutable && containerExecContext === undefined
+      ? { executableArgs: ['--no-env-file'] }
+      : {}),
+    ...spawnOverride,
     env,
     model: requestOptions?.model ?? assistantDefaults.model,
     abortController: controller,
@@ -605,7 +702,10 @@ function buildBaseClaudeOptions(
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
-    settingSources: assistantDefaults.settingSources ?? ['project', 'user'],
+    // Per-node override wins over the assistant-level default; the final
+    // fallback stays ['project', 'user'] (the SDK-loading default Archon ships).
+    settingSources: requestOptions?.nodeConfig?.settingSources ??
+      assistantDefaults.settingSources ?? ['project', 'user'],
     hooks: buildToolCaptureHooks(toolResultQueue),
     stderr: (data: string): void => {
       const output = data.trim();
@@ -782,6 +882,8 @@ async function* streamClaudeMessages(
         status?: string;
         output_file?: string;
         skip_transcript?: boolean;
+        // Background-task set (Claude SDK v0.3.209+ `background_tasks_changed`)
+        tasks?: { task_id: string; task_type: string; description: string }[];
         // Hook lifecycle (Claude SDK v0.2.89+)
         hook_id?: string;
         hook_name?: string;
@@ -846,6 +948,20 @@ async function* streamClaudeMessages(
           outputFile: sysMsg.output_file ?? '',
           ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
           ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+        };
+      } else if (subtype === 'background_tasks_changed') {
+        // Level signal: the FULL set of live background tasks after a membership
+        // change (REPLACE semantics — see the MessageChunk variant docs). An
+        // empty `tasks` array is meaningful ("all drained") and MUST be
+        // forwarded, so no `&& sysMsg.tasks` guard here.
+        const tasks = Array.isArray(sysMsg.tasks) ? sysMsg.tasks : [];
+        yield {
+          type: 'background_tasks',
+          tasks: tasks.map(t => ({
+            taskId: t.task_id,
+            taskType: t.task_type,
+            description: t.description,
+          })),
         };
       } else if (subtype === 'hook_started' && sysMsg.hook_id) {
         yield {
@@ -1059,7 +1175,20 @@ function classifyAndEnrichError(
   // API failures the SDK surfaced as text (#1797) carry a typed error code —
   // classify by that code, never by matching the (arbitrary) message text.
   if (error instanceof ClaudeApiResultError) {
-    const errorClass = classifySdkErrorCode(error.sdkErrorCode);
+    let errorClass = classifySdkErrorCode(error.sdkErrorCode);
+    // Exception for the SDK's catch-all codes only ('unknown'/'invalid_request'
+    // — a 400 status maps here): they conflate transient server-side rejections
+    // with true client errors, so the code alone carries no retry signal. For
+    // those, and ONLY those, fall back to UNTYPED_TRANSIENT_PATTERNS (see its
+    // admission contract) to reclassify known-transient errors as rate_limit
+    // so the existing backoff applies (#1341). Specific typed codes above
+    // remain authoritative and are never overridden by text.
+    if (errorClass === 'unknown') {
+      const message = error.message.toLowerCase();
+      if (UNTYPED_TRANSIENT_PATTERNS.some(p => message.includes(p))) {
+        errorClass = 'rate_limit';
+      }
+    }
     return {
       enrichedError: error,
       errorClass,
@@ -1136,24 +1265,21 @@ export class ClaudeProvider implements IAgentProvider {
     // Resolve Claude CLI path once before the retry loop. In binary mode this
     // throws immediately if neither env nor config supplies a valid path, so
     // the user gets a clean error rather than N retries of "Module not found".
-    const resolvedCliPath = await resolveClaudeBinaryPath(assistantDefaults.claudeBinaryPath);
+    // SKIP entirely for container runs: the SDK bypasses disk resolution when
+    // `spawnClaudeCodeProcess` is set (buildBaseClaudeOptions omits
+    // pathToClaudeCodeExecutable), and Claude is baked into the runner image — a
+    // compiled Archon binary has no host Claude, so resolving it here would throw
+    // and kill an otherwise-valid container run.
+    const isContainerRun = requestOptions?.execContext?.kind === 'container';
+    const resolvedCliPath = isContainerRun
+      ? undefined
+      : await resolveClaudeBinaryPath(assistantDefaults.claudeBinaryPath);
 
-    // Build subprocess env once (avoids re-logging auth mode per retry)
-    const subprocessEnv = buildSubprocessEnv();
-    const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
-    // CLAUDE_API_KEY is Archon's variable name; the Claude Code CLI only reads
-    // ANTHROPIC_API_KEY, so mirror it or solo .env installs never authenticate
-    // (delivery.ts sets both vars on the per-user api_key path). Guarded on the
-    // MERGED env, not process.env: a per-request CLAUDE_CODE_OAUTH_TOKEN (per-user
-    // subscription delivered via requestOptions.env) must stay authoritative —
-    // the CLI prefers ANTHROPIC_API_KEY over the OAuth token, so injecting the
-    // install key alongside it would silently rebill the run. Truthiness is
-    // intentional: empty string = missing credential. Never clobbers an
-    // explicit ANTHROPIC_API_KEY.
-    if (env.CLAUDE_API_KEY && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
-      env.ANTHROPIC_API_KEY = env.CLAUDE_API_KEY;
-      getLog().debug('using_mirrored_api_key');
-    }
+    // Build subprocess env once (avoids re-logging auth mode per retry). A
+    // container run gets ONLY the Archon-managed bag + a minimal base — host
+    // process.env never crosses the boundary (the isolation invariant); the host
+    // path inherits the (already-cleaned) process env exactly as before.
+    const env = buildRequestSubprocessEnv(requestOptions);
 
     // Apply nodeConfig translation once (deterministic, not retry-dependent)
     // We need a throwaway Options to extract warnings from applyNodeConfig,

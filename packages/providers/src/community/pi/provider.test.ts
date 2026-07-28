@@ -85,7 +85,9 @@ const mockGetApiKey = mock(async (providerId: string): Promise<string | undefine
   if (runtimeOverrides[providerId]) return runtimeOverrides[providerId];
   const cred = fileCreds[providerId];
   if (cred?.type === 'api_key') return cred.key;
-  if (cred?.type === 'oauth') return 'oauth-access-token-stub';
+  // Real Anthropic subscription OAuth access tokens are `sk-ant-oat…` — keep
+  // the stub shape-accurate so token-shape-based detection is exercised.
+  if (cred?.type === 'oauth') return 'sk-ant-oat01-file-stub';
   return undefined;
 });
 const mockAuthCreate = mock(() => ({
@@ -185,7 +187,7 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
 }));
 
 // Import AFTER mocks are set — module resolution freezes the mocks.
-import { PiProvider } from './provider';
+import { ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT, PiProvider } from './provider';
 import { PI_CAPABILITIES } from './capabilities';
 // Same module instance the provider dynamic-imports, so clearing this cache
 // resets the loader the provider reuses across calls (issue #1877).
@@ -715,7 +717,7 @@ describe('PiProvider', () => {
     expect(mockSetRuntimeApiKey).toHaveBeenCalledWith('anthropic', 'sk-ant-oat01-proc');
   });
 
-  test('yields assistant chunks from text_delta events', async () => {
+  test('coalesces text_delta events into a single assistant chunk (#1814)', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript([
       {
@@ -759,9 +761,11 @@ describe('PiProvider', () => {
       })
     );
     expect(error).toBeUndefined();
+    // Consecutive text_delta events are coalesced into one block-level chunk
+    // (flushed before the terminal result) so downstream consumers don't see
+    // fragmented "Hello\n\n world" output — see #1814.
     expect(chunks).toEqual([
-      { type: 'assistant', content: 'Hello' },
-      { type: 'assistant', content: ' world' },
+      { type: 'assistant', content: 'Hello world' },
       expect.objectContaining({ type: 'result', stopReason: 'stop' }),
     ]);
   });
@@ -1303,6 +1307,134 @@ describe('PiProvider', () => {
     expect(loaderArgs?.systemPrompt).toBeUndefined();
   });
 
+  test('invalid request-level systemPrompt does not mask valid node-level prompt', async () => {
+    // Regression: a non-string request-level prompt (preset object) must NOT win
+    // via `??` and shadow a valid node-level string — each level is validated
+    // independently before precedence applies.
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        systemPrompt: {
+          type: 'preset',
+          preset: 'claude_code',
+          append: 'extra',
+        } as unknown as string,
+        nodeConfig: { systemPrompt: 'node-level prompt' },
+      })
+    );
+
+    // The dropped request-level object is reported, tagged with its source.
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ systemPromptType: 'object', systemPromptSource: 'request' }),
+      'pi.system_prompt_dropped_non_string'
+    );
+
+    // The valid node-level string is used.
+    const loaderArgs = MockDefaultResourceLoader.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(loaderArgs?.systemPrompt).toBe('node-level prompt');
+  });
+
+  // ─── Anthropic subscription-OAuth default system prompt (#1831) ───────
+
+  test('Anthropic OAuth session (env token) falls back to the OAuth-safe default prompt', async () => {
+    // A subscription token (sk-ant-oat*) with no explicit systemPrompt must
+    // suppress Pi's built-in prompt — Anthropic's OAuth endpoint 400s it.
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+        env: { ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-bearer' },
+      })
+    );
+
+    const loaderArgs = MockDefaultResourceLoader.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(loaderArgs?.systemPrompt).toBe(ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT);
+  });
+
+  test('Anthropic OAuth session (auth.json subscription cred) falls back to the default prompt', async () => {
+    // Same detection via the `pi /login` path: getApiKey resolves the stored
+    // OAuth access token (sk-ant-oat*), no env var involved.
+    fileCreds.anthropic = { type: 'oauth' };
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+      })
+    );
+
+    const loaderArgs = MockDefaultResourceLoader.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(loaderArgs?.systemPrompt).toBe(ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT);
+  });
+
+  test('Anthropic API-key session keeps Pi built-in prompt (systemPrompt undefined)', async () => {
+    // Narrowed scope: API-key auth is not affected by the OAuth classifier, so
+    // Pi's built-in prompt (with its dynamic tool list) must stay intact.
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-api03-key';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+      })
+    );
+
+    const loaderArgs = MockDefaultResourceLoader.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(loaderArgs?.systemPrompt).toBeUndefined();
+  });
+
+  test('non-Anthropic backend keeps Pi built-in prompt (systemPrompt undefined)', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, { model: 'google/gemini-2.5-pro' })
+    );
+
+    const loaderArgs = MockDefaultResourceLoader.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(loaderArgs?.systemPrompt).toBeUndefined();
+  });
+
+  test('explicit systemPrompt wins over the OAuth default on an OAuth session', async () => {
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+        env: { ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-bearer' },
+        nodeConfig: { systemPrompt: 'node-level custom prompt' },
+      })
+    );
+
+    const loaderArgs = MockDefaultResourceLoader.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(loaderArgs?.systemPrompt).toBe('node-level custom prompt');
+  });
+
+  test('ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT carries no third-party "pi harness" tell', () => {
+    // Regression guard: the default must never reintroduce the self-referential
+    // vocabulary that trips Anthropic's subscription-OAuth detector.
+    const p = ARCHON_PI_ANTHROPIC_OAUTH_SYSTEM_PROMPT.toLowerCase();
+    expect(p).not.toContain('pi documentation');
+    expect(p).not.toContain('coding agent harness');
+    expect(p).not.toContain('operating inside pi');
+  });
+
   test('capabilities reflect v2 wiring', () => {
     const caps = new PiProvider().getCapabilities();
     expect(caps.thinkingControl).toBe(true);
@@ -1776,6 +1908,170 @@ describe('PiProvider', () => {
 
     expect(mockSetFlagValue).not.toHaveBeenCalled();
     expect(mockBindExtensions).not.toHaveBeenCalled();
+  });
+
+  // ─── Per-node extension posture (assistants.pi.nodes.<nodeId>, #2073) ──
+
+  test('node override drops UIContext and negates the plan flag for that node', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: {
+          enableExtensions: true,
+          interactive: true,
+          extensionFlags: { plan: true },
+          nodes: { implement: { interactive: false, extensionFlags: { plan: false } } },
+        },
+        nodeConfig: { nodeId: 'implement' },
+      })
+    );
+
+    // Extensions still load (session_start must fire) but with no UIContext —
+    // hasUI stays false so plannotator won't open its blocking review server.
+    expect(mockBindExtensions).toHaveBeenCalledTimes(1);
+    const [bindings] = mockBindExtensions.mock.calls[0] as [{ uiContext?: unknown }];
+    expect(bindings.uiContext).toBeUndefined();
+    // Merged flags: node-level plan: false wins over assistant-level plan: true.
+    expect(mockSetFlagValue).toHaveBeenCalledTimes(1);
+    expect(mockSetFlagValue).toHaveBeenCalledWith('plan', false);
+  });
+
+  test('node without an override keeps assistant-level UIContext and flags', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: {
+          enableExtensions: true,
+          interactive: true,
+          extensionFlags: { plan: true },
+          nodes: { implement: { interactive: false, extensionFlags: { plan: false } } },
+        },
+        nodeConfig: { nodeId: 'plan' },
+      })
+    );
+
+    expect(mockBindExtensions).toHaveBeenCalledTimes(1);
+    const [bindings] = mockBindExtensions.mock.calls[0] as [{ uiContext?: unknown }];
+    expect(bindings.uiContext).toBeDefined();
+    expect(mockSetFlagValue).toHaveBeenCalledTimes(1);
+    expect(mockSetFlagValue).toHaveBeenCalledWith('plan', true);
+  });
+
+  test('direct chat (no nodeConfig) ignores nodes overrides', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: {
+          interactive: true,
+          nodes: { implement: { interactive: false } },
+        },
+      })
+    );
+
+    expect(mockBindExtensions).toHaveBeenCalledTimes(1);
+    const [bindings] = mockBindExtensions.mock.calls[0] as [{ uiContext?: unknown }];
+    expect(bindings.uiContext).toBeDefined();
+  });
+
+  test('node enableExtensions: false skips binding entirely for that node', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: {
+          enableExtensions: true,
+          interactive: true,
+          extensionFlags: { plan: true },
+          nodes: { implement: { enableExtensions: false } },
+        },
+        nodeConfig: { nodeId: 'implement' },
+      })
+    );
+
+    expect(mockBindExtensions).not.toHaveBeenCalled();
+    expect(mockSetFlagValue).not.toHaveBeenCalled();
+  });
+
+  // ─── Portable node-YAML posture (nodeConfig.pi, #2133) ─────────────────
+
+  test('node-YAML pi overrides the config nodes.<id> map (drops UI, negates plan)', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: {
+          enableExtensions: true,
+          interactive: true,
+          extensionFlags: { plan: true },
+          // config map says implement is UI-on with plan: true …
+          nodes: { implement: { interactive: true, extensionFlags: { plan: true } } },
+        },
+        // … but the portable node-YAML block wins and turns it headless.
+        nodeConfig: {
+          nodeId: 'implement',
+          pi: { interactive: false, extensionFlags: { plan: false } },
+        },
+      })
+    );
+
+    expect(mockBindExtensions).toHaveBeenCalledTimes(1);
+    const [bindings] = mockBindExtensions.mock.calls[0] as [{ uiContext?: unknown }];
+    expect(bindings.uiContext).toBeUndefined();
+    expect(mockSetFlagValue).toHaveBeenCalledTimes(1);
+    expect(mockSetFlagValue).toHaveBeenCalledWith('plan', false);
+  });
+
+  test('node-YAML pi grants posture with no config nodes map present', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: { enableExtensions: true, interactive: false },
+        // No nodes map; the node's own pi: block re-enables the UI bridge and grants plan.
+        nodeConfig: { nodeId: 'plan', pi: { interactive: true, extensionFlags: { plan: true } } },
+      })
+    );
+
+    expect(mockBindExtensions).toHaveBeenCalledTimes(1);
+    const [bindings] = mockBindExtensions.mock.calls[0] as [{ uiContext?: unknown }];
+    expect(bindings.uiContext).toBeDefined();
+    expect(mockSetFlagValue).toHaveBeenCalledTimes(1);
+    expect(mockSetFlagValue).toHaveBeenCalledWith('plan', true);
+  });
+
+  test('node-YAML pi enableExtensions: false skips binding even when the config map re-enables', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: {
+          enableExtensions: true,
+          interactive: true,
+          nodes: { implement: { enableExtensions: true, interactive: true } },
+        },
+        nodeConfig: { nodeId: 'implement', pi: { enableExtensions: false } },
+      })
+    );
+
+    expect(mockBindExtensions).not.toHaveBeenCalled();
+    expect(mockSetFlagValue).not.toHaveBeenCalled();
   });
 
   test('assistantConfig.env applies to process.env when not already set', async () => {

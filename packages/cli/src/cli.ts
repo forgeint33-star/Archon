@@ -130,7 +130,7 @@ Commands:
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (downloads web UI on first run)
   skill install [path]       Install the bundled Archon skill into .claude/skills/archon
-  doctor                     Verify your Archon setup (Claude binary, gh auth, DB, adapters)
+  doctor [--full]            Verify your Archon setup (Claude/Codex binaries, gh auth, DB, adapters; --full also probes the OpenCode runtime SDK)
   auth github                Connect your GitHub identity via device flow (multi-user installs)
   ai key set <provider>      Connect an AI provider API key (multi-user installs; key read from prompt/stdin)
   ai login <provider>        Connect a subscription (claude/copilot) via OAuth — codex is API-key only
@@ -278,6 +278,7 @@ async function main(): Promise<number> {
         'from-branch': { type: 'string' },
         'no-worktree': { type: 'boolean' },
         folder: { type: 'boolean' },
+        container: { type: 'boolean' },
         resume: { type: 'boolean' },
         spawn: { type: 'boolean' },
         quiet: { type: 'boolean', short: 'q' },
@@ -302,6 +303,7 @@ async function main(): Promise<number> {
         status: { type: 'string' },
         limit: { type: 'string' },
         effort: { type: 'string' },
+        full: { type: 'boolean' },
       },
       allowPositionals: true,
       strict: false, // Allow unknown flags to pass through
@@ -322,6 +324,7 @@ async function main(): Promise<number> {
     (values.from as string | undefined) ?? (values['from-branch'] as string | undefined);
   const noWorktree = values['no-worktree'] as boolean | undefined;
   const folderFlag = values.folder as boolean | undefined;
+  const containerFlag = values.container as boolean | undefined;
   const resumeFlag = values.resume as boolean | undefined;
   const spawnFlag = values.spawn as boolean | undefined;
   const jsonFlag = values.json as boolean | undefined;
@@ -554,6 +557,7 @@ async function main(): Promise<number> {
               fromBranch,
               noWorktree,
               folder: folderFlag,
+              container: containerFlag,
               resume: resumeFlag,
               quiet: values.quiet as boolean | undefined,
               verbose: values.verbose as boolean | undefined,
@@ -859,7 +863,7 @@ async function main(): Promise<number> {
       }
 
       case 'doctor': {
-        return await doctorCommand();
+        return await doctorCommand(undefined, Boolean(values.full));
       }
 
       case 'auth': {

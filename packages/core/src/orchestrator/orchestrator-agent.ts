@@ -29,7 +29,14 @@ import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
-import { execFileAsync, findRepoRoot, syncWorkspace, toBranchName, toRepoPath } from '@archon/git';
+import {
+  execFileAsync,
+  findRepoRoot,
+  getDefaultRemote,
+  syncWorkspace,
+  toBranchName,
+  toRepoPath,
+} from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow, resolveWorkflowName } from '@archon/workflows/router';
@@ -52,7 +59,7 @@ import { deliverCredential } from '../credentials/delivery';
 import { listDecryptedUserProviderCredentials } from '../db/user-provider-key-store';
 import { getUserAiPrefs, type UserAiPrefs } from '../db/user-ai-prefs-store';
 import { createWorkflowDeps } from '../workflows/store-adapter';
-import { loadConfig } from '../config/config-loader';
+import { loadConfig, loadRepoConfig } from '../config/config-loader';
 import type { MergedConfig } from '../config/config-types';
 import { generateAndSetTitle } from '../services/title-generator';
 import { validateAndResolveIsolation, dispatchBackgroundWorkflow } from './orchestrator';
@@ -198,6 +205,71 @@ export function resolveChatModelRequest(
     return { ...request, model: installModel };
   }
   return request;
+}
+
+/** A resolved title-generation request: which provider to call, with fully resolved options. */
+export interface TitleRequest {
+  provider: string;
+  options: SendQueryOptions;
+}
+
+/**
+ * Resolve provider + request options for conversation-title generation (#1855).
+ *
+ * Server entry points that fire title generation outside a full chat turn
+ * (create-with-message, web workflow run) resolve the `small` tier here —
+ * config tiers plus per-user prefs when a userId is available — instead of
+ * letting the provider fall through to its raw config-default model, which
+ * the active account may not support (e.g. `gpt-5.3-codex` on ChatGPT-plan
+ * Codex accounts). Mirrors the chat path's title resolution in
+ * `handleMessage` (#1873), which keeps its own inline resolution to reuse
+ * the already-loaded config and profile.
+ *
+ * NEVER THROWS — degrades to `{ provider: fallbackProvider, options: {} }`
+ * (the legacy behavior) so fire-and-forget callers stay safe.
+ */
+export async function resolveTitleRequest(
+  fallbackProvider: string,
+  userId?: string
+): Promise<TitleRequest> {
+  try {
+    const config = await loadConfig();
+    const userAiPrefs = userId ? await resolveUserAiPrefsForChat(userId) : {};
+    let configuredProviderKey = userAiPrefs.defaultProvider ?? fallbackProvider;
+    let aiProfile: ReturnType<typeof buildAiProfile>;
+    try {
+      aiProfile = buildAiProfile(configuredProviderKey, {
+        repoTiers: config.tiers,
+        repoAliases: config.aliases,
+        userTiers: userAiPrefs.tiers,
+        userAliases: userAiPrefs.aliases,
+      });
+    } catch (profileErr) {
+      // Structurally invalid STORED prefs must not break title generation —
+      // degrade to config-only (mirrors the chat path in handleMessage).
+      getLog().warn({ err: profileErr as Error, userId }, 'orchestrator.title_prefs_invalid');
+      configuredProviderKey = fallbackProvider;
+      aiProfile = buildAiProfile(configuredProviderKey, {
+        repoTiers: config.tiers,
+        repoAliases: config.aliases,
+      });
+    }
+    const titleRequest = resolveModelRequest(aiProfile, 'small', configuredProviderKey);
+    const options: SendQueryOptions = {
+      model: titleRequest.model,
+      assistantConfig: { ...(config.assistants[titleRequest.provider] ?? {}) },
+    };
+    if (titleRequest.preset) {
+      applyPresetToRequestOptions(titleRequest.provider, titleRequest.preset, options);
+    }
+    return { provider: titleRequest.provider, options };
+  } catch (err) {
+    getLog().warn(
+      { err: err as Error, fallbackProvider },
+      'orchestrator.title_request_resolve_failed'
+    );
+    return { provider: fallbackProvider, options: {} };
+  }
 }
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -918,6 +990,8 @@ interface DiscoverResult {
   syncError?: string;
   config?: MergedConfig;
   codebase?: Codebase | null;
+  /** Remote name used for the workspace sync (undefined when no sync ran). */
+  remote?: string;
 }
 
 /** Discover global + repo-specific workflows, merge by name (repo overrides global) */
@@ -928,6 +1002,7 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
   let syncError: string | undefined;
   let config: MergedConfig | undefined;
   let codebase: Codebase | null | undefined;
+  let remote: string | undefined;
 
   try {
     // Home-scoped workflows at ~/.archon/workflows/ are discovered automatically
@@ -955,14 +1030,22 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
           );
         } else {
           try {
+            // Resolve the git remote: explicit repo config wins, otherwise
+            // auto-detect ('origin' if present, else the sole remote).
+            const repoPath = toRepoPath(codebase.default_cwd);
+            const repoConf = await loadRepoConfig(codebase.default_cwd);
+            remote =
+              repoConf.worktree?.remote?.trim() || (await getDefaultRemote(repoPath)) || undefined;
             syncResult = await syncWorkspace(
-              toRepoPath(codebase.default_cwd),
-              codebase.default_branch ? toBranchName(codebase.default_branch) : undefined
+              repoPath,
+              codebase.default_branch ? toBranchName(codebase.default_branch) : undefined,
+              { remote }
             );
             getLog().debug(
               {
                 codebaseId: codebase.id,
                 repoPath: codebase.default_cwd,
+                remote,
                 ...syncResult,
               },
               'workspace.sync_completed'
@@ -993,7 +1076,7 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
     }
   }
 
-  return { workflows, errors: allErrors, syncResult, syncError, config, codebase };
+  return { workflows, errors: allErrors, syncResult, syncError, config, codebase, remote };
 }
 
 /** Build the user-facing prompt with message and optional contexts */
@@ -1326,6 +1409,7 @@ export async function handleMessage(
       syncError,
       config: discoveredConfig,
       codebase: discoveredCodebase,
+      remote: syncRemote,
     } = await discoverAllWorkflows(conversation);
     const workflows: readonly WorkflowDefinition[] = workflowsWithSource.map(ws => ws.workflow);
     if (workflowErrors.length > 0) {
@@ -1345,7 +1429,7 @@ export async function handleMessage(
     } else if (syncResult?.state === 'diverged' && platform.sendStructuredEvent) {
       await platform.sendStructuredEvent(conversationId, {
         type: 'system',
-        content: `Local source/ has diverged from origin/${syncResult.branch} \u2014 manual merge or rebase needed`,
+        content: `Local source/ has diverged from ${syncRemote ?? 'origin'}/${syncResult.branch} \u2014 manual merge or rebase needed`,
       });
     } else if (
       syncResult?.state === 'in_sync' &&
@@ -1354,7 +1438,7 @@ export async function handleMessage(
     ) {
       await platform.sendStructuredEvent(conversationId, {
         type: 'system',
-        content: `Fast-forwarded to origin/${syncResult.branch} \u2014 ${syncResult.previousHead} \u2192 ${syncResult.newHead}`,
+        content: `Fast-forwarded to ${syncRemote ?? 'origin'}/${syncResult.branch} \u2014 ${syncResult.previousHead} \u2192 ${syncResult.newHead}`,
       });
     }
 

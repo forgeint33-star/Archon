@@ -18,6 +18,12 @@ export interface Run {
    * that endpoint. Use this when fetching the run's messages.
    */
   conversationPlatformId: string | null;
+  /**
+   * Platform id of the WORKER conversation for chat-dispatched (web) runs —
+   * where a chat-dispatched run's messages actually live. See
+   * runMessageConversationId() for how CLI vs. web runs are picked (#2048).
+   */
+  workerPlatformId: string | null;
   workflow: string;
   origin: RunOrigin;
   status: RunStatus;
@@ -43,6 +49,12 @@ export interface Run {
    * "resuming" hint instead of stale approve/reject buttons.
    */
   gateResolved?: 'approved' | 'rejected' | null;
+  /**
+   * Run-tree parent (#2121 Phase 2). Set when this run is a `workflow:` sub-run
+   * spawned by a parent run's node; null for top-level runs. Drives the "child of"
+   * affordance in the console so a sub-run isn't mistaken for an orphan top-level run.
+   */
+  parentRunId?: string | null;
 }
 
 // Server shapes we read from. These track the real server schema loosely —
@@ -56,6 +68,8 @@ interface RawWorkflowRun {
   conversation_id?: string | null;
   /** Platform-level conversation id — exposed on the getRun response only. */
   conversation_platform_id?: string | null;
+  /** Worker conversation platform id — getRun response only, web runs only. */
+  worker_platform_id?: string | null;
   status: string;
   started_at: string;
   completed_at?: string | null;
@@ -66,6 +80,8 @@ interface RawWorkflowRun {
   codebase_name?: string | null;
   platform_type?: string | null;
   current_step_name?: string | null;
+  /** Run-tree parent id (#2121 Phase 2); null/absent for top-level runs. */
+  parent_run_id?: string | null;
 }
 
 const KNOWN_STATUSES: readonly RunStatus[] = [
@@ -104,6 +120,19 @@ function readCost(meta: Record<string, unknown> | undefined): number | null {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
 }
 
+/**
+ * The platform conversation id that holds this run's messages — the id the
+ * `/api/conversations/:id/messages` route accepts. CLI runs expose it as
+ * `conversationPlatformId`; chat-dispatched (web) runs only expose the worker
+ * conversation as `workerPlatformId`, which is where their agent output is
+ * persisted (#2048). Null for list-sourced rows (neither field is present)
+ * and for a run that hasn't loaded yet, so message fetching stays off there.
+ */
+export function runMessageConversationId(run: Run | undefined): string | null {
+  if (run === undefined) return null;
+  return run.conversationPlatformId ?? run.workerPlatformId;
+}
+
 export function toRun(raw: RawWorkflowRun): Run {
   const approval = raw.metadata?.approval;
   const isApprovalShape =
@@ -139,6 +168,7 @@ export function toRun(raw: RawWorkflowRun): Run {
     costUsd: readCost(raw.metadata),
     conversationId: raw.conversation_id ?? null,
     conversationPlatformId: raw.conversation_platform_id ?? null,
+    workerPlatformId: raw.worker_platform_id ?? null,
     workflow: raw.workflow_name,
     origin: normalizeOrigin(raw.platform_type),
     status: normalizeStatus(raw.status),
@@ -150,5 +180,6 @@ export function toRun(raw: RawWorkflowRun): Run {
     lastTool: null,
     approval: parsedApproval,
     gateResolved,
+    parentRunId: raw.parent_run_id ?? null,
   };
 }

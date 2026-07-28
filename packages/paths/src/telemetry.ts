@@ -180,7 +180,7 @@ export function classifyWorkflowForTelemetry(
  * Model ids are user-supplied (forwarded verbatim from workflow/`config.yaml`
  * YAML), so unlike `provider` they're not structurally categorical. Forward a
  * value only when it looks like a real model ref (alphanumerics plus `/._:-`,
- * bounded length — covers `sonnet`, `gpt-5.3-codex`, `anthropic/claude-haiku-4-5`,
+ * bounded length — covers `sonnet`, `gpt-5.6-sol`, `anthropic/claude-haiku-4-5`,
  * `openrouter/qwen/qwen3-coder`). Anything else is dropped so a stray free-text
  * value can't slip through the "categorical only" telemetry contract.
  *
@@ -586,7 +586,13 @@ export interface ChatTurnProperties {
 }
 
 /** Categorical terminal exit reason — a fixed enum, never raw error text. */
-export type WorkflowExitReason = 'no_nodes_completed' | 'node_error' | 'unhandled_error';
+export type WorkflowExitReason =
+  | 'no_nodes_completed'
+  | 'node_error'
+  | 'unhandled_error'
+  // Evidence gate (#2230): all nodes succeeded but `evidence_policy.required`
+  // found no `$ARTIFACTS_DIR/evidence.json`, so the run was marked failed.
+  | 'evidence_missing';
 
 /**
  * Categorical failure class derived from the engine's error classifier

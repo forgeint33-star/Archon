@@ -63,6 +63,48 @@ export type AssistantDefaults = ProviderDefaultsMap & {
   codex: CodexProviderDefaults;
 };
 
+/**
+ * Container isolation backend settings (folder projects only). Valid on both
+ * global and repo config; repo overrides global per-field. Defaults are applied
+ * when the CLI builds the backend config, not here (all fields optional).
+ */
+export interface ContainerConfig {
+  /**
+   * Runner image tag. Defaults to `archon-runner:latest` — the `build:runner-image`
+   * script tags both `archon-runner:<version>` and `:latest`, and defaulting to
+   * `:latest` avoids coupling to the dev-vs-binary version string. Pin an explicit
+   * version tag here for reproducibility.
+   * @default 'archon-runner:latest'
+   */
+  image?: string;
+
+  /**
+   * Container network mode. `none` disables egress; `bridge` is default NAT.
+   * @default 'bridge'
+   */
+  network?: 'bridge' | 'none';
+
+  /**
+   * Hard memory cap in MiB (`docker run --memory <n>m`).
+   * @default 4096
+   */
+  memoryMb?: number;
+
+  /**
+   * Process cap (`docker run --pids-limit <n>`) — a fork-bomb guard.
+   * @default 512
+   */
+  pidsLimit?: number;
+
+  /**
+   * Opt folder projects into the container backend WITHOUT the `--container`
+   * flag. The flag still wins when passed; workflow-level `container.enabled`
+   * sits between the flag and this config default.
+   * @default false
+   */
+  enabled?: boolean;
+}
+
 export interface GlobalConfig {
   /**
    * Bot display name (shown in messages)
@@ -130,6 +172,12 @@ export interface GlobalConfig {
      */
     maxConversations?: number;
   };
+
+  /**
+   * Container isolation backend defaults (folder projects). Repo config
+   * overrides these per-field.
+   */
+  container?: ContainerConfig;
 }
 
 /**
@@ -222,6 +270,20 @@ export interface RepoConfig {
      * @example '.worktrees'
      */
     path?: string;
+
+    /**
+     * Git remote name for fetch/push operations.
+     *
+     * When set, all git operations (fetch, push, branch tracking) use this
+     * remote instead of 'origin'. Useful for repos with multiple remotes or
+     * non-standard naming conventions.
+     *
+     * When omitted, auto-detected: 'origin' if it exists, otherwise the sole
+     * remote if only one is configured.
+     *
+     * @example 'upstream'
+     */
+    remote?: string;
   };
 
   /**
@@ -234,6 +296,12 @@ export interface RepoConfig {
      */
     path?: string;
   };
+
+  /**
+   * Container isolation backend settings for this repo (folder projects).
+   * Overrides global `container` per-field.
+   */
+  container?: ContainerConfig;
 
   /**
    * Per-project environment variables injected into Claude SDK subprocess env.
@@ -328,6 +396,12 @@ export interface MergedConfig {
    */
   baseBranch?: string;
   /**
+   * Git remote name from repo config (worktree.remote).
+   * When undefined, callers auto-detect at runtime via getDefaultRemote()
+   * or fall back to 'origin'.
+   */
+  remote?: string;
+  /**
    * Docs directory path from repo config (docs.path).
    * Used for $DOCS_DIR substitution in workflow commands.
    * @default 'docs/'
@@ -339,6 +413,12 @@ export interface MergedConfig {
    * Undefined when no env vars are configured.
    */
   envVars?: Record<string, string>;
+  /**
+   * Merged container backend settings (repo `container` over global `container`,
+   * per-field). Raw optional fields — defaults are applied where the container
+   * config is consumed (CLI folder branch). Undefined when nothing is configured.
+   */
+  container?: ContainerConfig;
 }
 
 /**

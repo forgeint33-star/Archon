@@ -40,6 +40,8 @@ export {
   approvalOnRejectSchema,
   cancelNodeSchema,
   scriptNodeSchema,
+  includeNodeSchema,
+  workflowNodeSchema,
   dagNodeSchema,
   isBashNode,
   isLoopNode,
@@ -47,16 +49,21 @@ export {
   isApprovalNode,
   isCancelNode,
   isScriptNode,
+  isIncludeNode,
+  isWorkflowNode,
   isPersistableNode,
   isTriggerRule,
   BASH_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
+  INCLUDE_NODE_IGNORED_FIELDS,
+  WORKFLOW_NODE_IGNORED_FIELDS,
   effortLevelSchema,
   thinkingConfigSchema,
   sandboxSettingsSchema,
   agentDefinitionSchema,
+  piNodeConfigSchema,
 } from './dag-node';
 export type {
   TriggerRule,
@@ -71,11 +78,14 @@ export type {
   ApprovalOnReject,
   CancelNode,
   ScriptNode,
+  IncludeNode,
+  WorkflowNode,
   DagNode,
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
   AgentDefinition,
+  PiNodeConfig,
 } from './dag-node';
 
 // Workflow definition
@@ -83,6 +93,7 @@ export {
   modelReasoningEffortSchema,
   webSearchModeSchema,
   workflowRequirementSchema,
+  workflowEvidencePolicySchema,
   workflowBaseSchema,
   workflowDefinitionSchema,
 } from './workflow';
@@ -90,6 +101,7 @@ export type {
   ModelReasoningEffort,
   WebSearchMode,
   WorkflowRequirement,
+  WorkflowEvidencePolicy,
   WorkflowBase,
   WorkflowDefinition,
 } from './workflow';
@@ -105,6 +117,7 @@ export {
   TERMINAL_WORKFLOW_STATUSES,
   RESUMABLE_WORKFLOW_STATUSES,
   isApprovalContext,
+  isRunBlockedOnChild,
 } from './workflow-run';
 export type {
   WorkflowRunStatus,

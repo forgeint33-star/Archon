@@ -78,6 +78,7 @@ import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { DashboardEventPoller } from './adapters/web/dashboard-event-poller';
 import { PgNotifyListener } from './adapters/web/pg-notify-listener';
 import { registerApiRoutes } from './routes/api';
+import { registerGithubWebhookRoute } from './routes/webhooks';
 import {
   handleMessage,
   pool,
@@ -113,6 +114,7 @@ import {
   captureArchonActive,
 } from '@archon/paths';
 import { selectGitHubAuthMode, parseGitCredentialPath } from './github-auth-bootstrap';
+import { isDiscordMentionRequired } from './discord-mention';
 import {
   getAuth,
   closeAuth,
@@ -519,6 +521,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         | 'batch';
       discord = new DiscordAdapter(process.env.DISCORD_BOT_TOKEN, discordStreamingMode);
       const discordAdapter = discord; // Capture for use in callback
+      const discordRequireMention = isDiscordMentionRequired();
 
       // Register message handler
       discordAdapter.onMessage(async ({ message, platformUserId, displayName }) => {
@@ -528,10 +531,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // Skip if no content
         if (!message.content) return;
 
-        // Check if bot was mentioned (required for activation)
-        // Exception: DMs don't require mention
+        // Check if bot was mentioned (required for activation unless
+        // DISCORD_REQUIRE_MENTION=false opts out of the gate)
+        // Exception: DMs never require mention
         const isDM = !message.guild;
-        if (!isDM && !discordAdapter.isBotMentioned(message)) {
+        if (!isDM && discordRequireMention && !discordAdapter.isBotMentioned(message)) {
           return; // Ignore messages that don't mention the bot
         }
 
@@ -723,32 +727,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // GitHub webhook endpoint
   if (github) {
-    app.post('/webhooks/github', async c => {
-      const eventType = c.req.header('x-github-event');
-      const deliveryId = c.req.header('x-github-delivery');
-
-      try {
-        const signature = c.req.header('x-hub-signature-256');
-        if (!signature) {
-          return c.json({ error: 'Missing signature header' }, 400);
-        }
-
-        // CRITICAL: Use c.req.text() for raw body (signature verification)
-        const payload = await c.req.text();
-
-        // Process async (fire-and-forget for fast webhook response)
-        // Note: github.handleWebhook() has internal error handling that notifies users
-        // This catch is a fallback for truly unexpected errors (e.g., signature verification bugs)
-        github.handleWebhook(payload, signature).catch((error: unknown) => {
-          getLog().error({ err: error, eventType, deliveryId }, 'webhook_processing_error');
-        });
-
-        return c.text('OK', 200);
-      } catch (error) {
-        getLog().error({ err: error, eventType, deliveryId }, 'webhook_endpoint_error');
-        return c.json({ error: 'Internal server error' }, 500);
-      }
-    });
+    registerGithubWebhookRoute(app, github);
     getLog().info('github_webhook_registered');
   }
 

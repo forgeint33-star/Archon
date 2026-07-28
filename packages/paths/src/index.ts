@@ -2,6 +2,8 @@
 export {
   expandTilde,
   isDocker,
+  isWSL,
+  getWSLDistroName,
   getArchonHome,
   getArchonWorkspacesPath,
   ensureArchonWorkspacesPath,
@@ -22,6 +24,7 @@ export {
   logArchonPaths,
   validateAppDefaultsPaths,
   parseOwnerRepo,
+  resolveRepoProjectIdentity,
   getProjectRoot,
   getProjectSourcePath,
   getProjectWorktreesPath,
@@ -52,7 +55,12 @@ export { createLogger, setLogLevel, getLogLevel, rootLogger } from './logger';
 export type { Logger } from './logger';
 
 // Build-time constants (rewritten by scripts/build-binaries.sh)
-export { BUNDLED_IS_BINARY, BUNDLED_VERSION, BUNDLED_GIT_COMMIT } from './bundled-build';
+export {
+  BUNDLED_IS_BINARY,
+  BUNDLED_VERSION,
+  BUNDLED_GIT_COMMIT,
+  BUNDLED_WEB_DIST_SHA256,
+} from './bundled-build';
 
 // Update check
 export {

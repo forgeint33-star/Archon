@@ -1,5 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  mock,
+  spyOn,
+  setSystemTime,
+  type Mock,
+} from 'bun:test';
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
+import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
@@ -64,13 +75,25 @@ import {
   substituteLoopPrevRefs,
   applyLoopPrevToBodyNode,
   executeDagWorkflow,
+  collectContainerIncompatibleProviders,
+  containerCommandName,
+  buildSubprocessDockerArgs,
 } from './dag-executor';
 import { writeNodeArtifact } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
-import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
+import type {
+  DagNode,
+  BashNode,
+  ScriptNode,
+  NodeOutput,
+  WorkflowRun,
+  WorkflowDefinition,
+} from './schemas';
+import { dagNodeSchema } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
+import { expandWorkflowIncludes } from './include-expander';
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
@@ -94,9 +117,12 @@ function createMockStore(): IWorkflowStore {
         completed_at: null,
         last_activity_at: null,
         working_path: null,
+        parent_run_id: null,
       })
     ),
     getWorkflowRun: mock(() => Promise.resolve(null)),
+    findChildRuns: mock(() => Promise.resolve([])),
+    getRunAncestry: mock(() => Promise.resolve([])),
     getActiveWorkflowRunByPath: mock(() => Promise.resolve(null)),
     failOrphanedRuns: mock(() => Promise.resolve({ count: 0 })),
     findResumableRun: mock(() => Promise.resolve(null)),
@@ -114,6 +140,7 @@ function createMockStore(): IWorkflowStore {
         completed_at: null,
         last_activity_at: null,
         working_path: null,
+        parent_run_id: null,
       })
     ),
     updateWorkflowRun: mock(() => Promise.resolve()),
@@ -122,6 +149,8 @@ function createMockStore(): IWorkflowStore {
     completeWorkflowRun: mock(() => Promise.resolve()),
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),
+    claimWriteback: mock(() => Promise.resolve({ claimed: true })),
+    releaseWritebackClaim: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve()),
     createWorkflowEvent: mock(() => Promise.resolve()),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
@@ -148,6 +177,7 @@ const mockClaudeCapabilities = () => ({
   thinkingControl: true,
   fallbackModel: true,
   sandbox: true,
+  settingSources: true,
 });
 /** Limited capabilities for Codex mock */
 const mockCodexCapabilities = () => ({
@@ -164,6 +194,7 @@ const mockCodexCapabilities = () => ({
   thinkingControl: false,
   fallbackModel: false,
   sandbox: false,
+  settingSources: false,
 });
 
 /** Mock AI sendQuery generator */
@@ -255,6 +286,7 @@ function makeWorkflowRun(id = 'dag-test-run-id', overrides?: Partial<WorkflowRun
     completed_at: null,
     last_activity_at: null,
     working_path: null,
+    parent_run_id: null,
     ...overrides,
   };
 }
@@ -790,6 +822,31 @@ describe('substituteNodeOutputRefs', () => {
     const outputs = new Map([['a', makeOutput('completed', '{"type":"BUG"}')]]);
     expect(() => substituteNodeOutputRefs('$a.output.missing', outputs)).toThrow(OutputRefError);
   });
+
+  it('unknown node ref WITH a field throws (no-silent-drop, unknown-node)', () => {
+    // The whole-text `$missing.output` form stays lenient ('' — see test above), but a
+    // `.field` ref to an unknown id is a typo the load-time validator can't always see
+    // (bash/script/approval/cancel + command-file refs aren't scanned). It must fail the
+    // consuming node loudly, matching known-producer strict-field posture.
+    const outputs = new Map([['analyze', makeOutput('completed', '{"type":"BUG"}')]]);
+    let caught: unknown;
+    try {
+      substituteNodeOutputRefs('Fix $analze.output.type', outputs);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(OutputRefError);
+    expect((caught as OutputRefError).reason).toBe('unknown-node');
+    // did-you-mean names the near miss.
+    expect((caught as OutputRefError).message).toContain("'analyze'");
+  });
+
+  it('unknown node ref WITH a field throws even in bash-escaped mode', () => {
+    const outputs = new Map<string, NodeOutput>();
+    expect(() => substituteNodeOutputRefs('echo $missing.output.field', outputs, true)).toThrow(
+      OutputRefError
+    );
+  });
 });
 
 describe('substituteNodeOutputRefs -- shell escaping', () => {
@@ -1134,6 +1191,81 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
     expect(nodeConfig?.allowed_tools).toEqual(['Read', 'Grep']);
+  });
+
+  it('passes settingSources to sendQuery nodeConfig for Claude node', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-setting-sources',
+        nodes: [{ id: 'lean-review', command: 'my-cmd', settingSources: ['project'] }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig?.settingSources).toEqual(['project']);
+    // Claude supports settingSources — no ignored-capability warning
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const warnings = sendMessage.mock.calls
+      .map(call => call[1] as string)
+      .filter(msg => typeof msg === 'string' && msg.includes('settingSources'));
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns that settingSources is ignored on a Codex node', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-setting-sources-codex',
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex', settingSources: ['project'] }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Capability gate: codex declares settingSources: false, so the executor
+    // must surface a visible "will be ignored" warning instead of a silent no-op.
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const warnings = sendMessage.mock.calls
+      .map(call => call[1] as string)
+      .filter(msg => typeof msg === 'string' && msg.includes('settingSources'));
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("doesn't support");
   });
 
   it('routes Codex tier effort to assistantConfig.modelReasoningEffort', async () => {
@@ -1561,6 +1693,70 @@ describe('executeDagWorkflow -- tool restrictions', () => {
   });
 });
 
+describe('executeDagWorkflow -- AI node prompt substitution failure', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-subst-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('records a node_failed event when $BASE_BRANCH cannot be resolved (not a silent skip)', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('subst-fail-run-id', {
+      workflow_name: 'subst-fail',
+      conversation_id: 'conv-subst',
+      user_message: 'test',
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-subst',
+      testDir,
+      {
+        name: 'subst-fail',
+        nodes: [{ id: 'needs-base', prompt: 'Diff the branch against $BASE_BRANCH and review.' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      '', // base branch unresolved — the prompt references $BASE_BRANCH so substitution throws
+      'docs/',
+      minimalConfig
+    );
+
+    // The substitution throw must surface as a node_failed event. Previously the
+    // catch returned state:'failed' silently — the node emitted node_started and
+    // then vanished with no terminal event, so downstream all_success rules
+    // skipped instead of the run reporting the failure.
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'needs-base'
+    );
+    expect(failedEvent).toBeDefined();
+    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toContain('No base branch could be resolved');
+    // The provider must never have been reached — the failure precedes the query.
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+  });
+});
+
 describe('executeDagWorkflow -- bash nodes', () => {
   let testDir: string;
 
@@ -1949,6 +2145,357 @@ describe('executeDagWorkflow -- bash nodes', () => {
       const envArg = (firstCall?.[2] as { env: NodeJS.ProcessEnv }).env;
       expect(envArg?.USER_MESSAGE).toBe('$(rm -rf /)');
       expect(envArg?.ARGUMENTS).toBe('$(rm -rf /)');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+});
+
+describe('executeDagWorkflow -- script node injection hardening (#2115)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-script-hardening-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    // force: true already no-ops on a missing dir — any other failure (EBUSY/EPERM)
+    // should surface, not be swallowed.
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('bun script delivers the user message via env var, never spliced into source', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      const workflowRun = makeWorkflowRun('script-inject-bun', {
+        workflow_name: 'script-inject',
+        conversation_id: 'conv-script-inject',
+        // If this were text-substituted into TS source the string literal would close
+        // and execSync would run; delivered as an env var it stays inert data.
+        user_message: '"); require("child_process").execSync("touch pwned"); //',
+      });
+
+      const scriptNode: ScriptNode = {
+        id: 'safe',
+        script: 'console.log(process.env.ARGUMENTS)',
+        runtime: 'bun',
+      };
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-inject',
+        testDir,
+        { name: 'script-inject-test', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      const [cmd, args, opts] = execSpy.mock.calls[0] as [
+        string,
+        string[],
+        { env: NodeJS.ProcessEnv },
+      ];
+      expect(cmd).toBe('bun');
+      // Source is byte-identical to the author's body — the payload never appears in it.
+      expect(args).toEqual(['--no-env-file', '-e', 'console.log(process.env.ARGUMENTS)']);
+      expect(args.join(' ')).not.toContain('execSync');
+      // The value reaches the script via env vars instead.
+      expect(opts.env.ARGUMENTS).toBe(workflowRun.user_message);
+      expect(opts.env.USER_MESSAGE).toBe(workflowRun.user_message);
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('leaves a literal $ARGUMENTS in the script body inert (not substituted)', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      const workflowRun = makeWorkflowRun('script-literal', {
+        workflow_name: 'script-literal',
+        conversation_id: 'conv-script-literal',
+        user_message: '$(rm -rf /)',
+      });
+
+      const scriptNode: ScriptNode = {
+        id: 'legacy',
+        script: 'console.log("value: $ARGUMENTS")',
+        runtime: 'bun',
+      };
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-literal',
+        testDir,
+        { name: 'script-literal-test', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const [, args] = execSpy.mock.calls[0] as [string, string[], unknown];
+      // The dangerous payload is NOT interpolated into the source; $ARGUMENTS stays literal.
+      expect(args[2]).toBe('console.log("value: $ARGUMENTS")');
+      expect(args[2]).not.toContain('rm -rf');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('uv/python script delivers the user message and issue context via env vars', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      const workflowRun = makeWorkflowRun('script-inject-uv', {
+        workflow_name: 'script-inject-uv',
+        conversation_id: 'conv-script-uv',
+        user_message: 'py-message',
+      });
+
+      const scriptNode: ScriptNode = {
+        id: 'py',
+        script: "import os; print(os.environ['ARGUMENTS'])",
+        runtime: 'uv',
+      };
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-uv',
+        testDir,
+        { name: 'script-uv-test', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined, // configuredCommandFolder
+        'ISSUE #42 body text' // issueContext
+      );
+
+      const [cmd, args, opts] = execSpy.mock.calls[0] as [
+        string,
+        string[],
+        { env: NodeJS.ProcessEnv },
+      ];
+      expect(cmd).toBe('uv');
+      expect(args).toEqual(['run', 'python', '-c', "import os; print(os.environ['ARGUMENTS'])"]);
+      expect(opts.env.ARGUMENTS).toBe('py-message');
+      expect(opts.env.CONTEXT).toBe('ISSUE #42 body text');
+      expect(opts.env.EXTERNAL_CONTEXT).toBe('ISSUE #42 body text');
+      expect(opts.env.ISSUE_CONTEXT).toBe('ISSUE #42 body text');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('a configured project env var cannot shadow an engine-reserved value (#2115)', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      const workflowRun = makeWorkflowRun('script-env-collision', {
+        workflow_name: 'script-env-collision',
+        conversation_id: 'conv-script-collision',
+        user_message: 'the-real-arguments',
+      });
+
+      const scriptNode: ScriptNode = {
+        id: 'collide',
+        script: 'console.log(process.env.ARGUMENTS)',
+        runtime: 'bun',
+      };
+
+      // A codebase env var that (maliciously or by accident) reuses a reserved name,
+      // alongside a legitimate non-reserved var that must still pass through.
+      const configWithEnv: WorkflowConfig = {
+        ...minimalConfig,
+        envVars: { ARGUMENTS: 'PROJECT_OVERRIDE', CONTEXT: 'PROJECT_CTX', MY_VAR: 'keep-me' },
+      };
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-collision',
+        testDir,
+        { name: 'script-env-collision', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        configWithEnv,
+        undefined, // configuredCommandFolder
+        'ENGINE_CONTEXT' // issueContext
+      );
+
+      const [, , opts] = execSpy.mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv }];
+      // Reserved workflow vars win over the colliding configured vars — the delivery
+      // channel this PR establishes can't be shadowed by a project env var.
+      expect(opts.env.ARGUMENTS).toBe('the-real-arguments');
+      expect(opts.env.CONTEXT).toBe('ENGINE_CONTEXT');
+      // Non-reserved configured vars still reach the subprocess.
+      expect(opts.env.MY_VAR).toBe('keep-me');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('still substitutes $nodeId.output raw into the script source (item 3 preserved)', async () => {
+    // upstream bash → 'UPSTREAM_RAW'; downstream bun script assigns $upstream.output directly.
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (_cmd: string, args: string[]) =>
+        args[0] === '-c'
+          ? { stdout: 'UPSTREAM_RAW\n', stderr: '' } // bash upstream
+          : { stdout: '', stderr: '' } // bun downstream
+    );
+    try {
+      const workflowRun = makeWorkflowRun('script-nodeoutput', {
+        workflow_name: 'script-nodeoutput',
+        conversation_id: 'conv-script-nodeoutput',
+        user_message: 'msg',
+      });
+
+      const nodes: DagNode[] = [
+        { id: 'upstream', bash: 'printf UPSTREAM_RAW' },
+        {
+          id: 'downstream',
+          script: 'const v = "$upstream.output"; console.log(v)',
+          runtime: 'bun',
+          depends_on: ['upstream'],
+        },
+      ];
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        createMockPlatform(),
+        'conv-script-nodeoutput',
+        testDir,
+        { name: 'script-nodeoutput-test', nodes },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const scriptCall = execSpy.mock.calls.find(
+        c => (c[0] as string) === 'bun' && (c[1] as string[]).includes('-e')
+      ) as [string, string[], unknown] | undefined;
+      expect(scriptCall).toBeDefined();
+      // Raw (unquoted) node-output splice is intact — the direct-assignment pattern.
+      expect(scriptCall?.[1][2]).toBe('const v = "UPSTREAM_RAW"; console.log(v)');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('warns when a script body still uses a literal user-controlled variable', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('script-warn', {
+        workflow_name: 'script-warn',
+        conversation_id: 'conv-script-warn',
+        user_message: 'hi',
+      });
+
+      const scriptNode: ScriptNode = {
+        id: 'legacy',
+        script: 'console.log("$ARGUMENTS and $CONTEXT")',
+        runtime: 'bun',
+      };
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        platform,
+        'conv-script-warn',
+        testDir,
+        { name: 'script-warn-test', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+        (c: unknown[]) => c[1] as string
+      );
+      const warn = messages.find(m => m.includes('no longer') && m.includes('#2115'));
+      expect(warn).toBeDefined();
+      // Language-appropriate accessor is suggested for both referenced vars.
+      expect(warn).toContain('process.env.ARGUMENTS');
+      expect(warn).toContain('process.env.CONTEXT');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('does not warn when the script reads values from the environment (correct form)', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    try {
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('script-nowarn', {
+        workflow_name: 'script-nowarn',
+        conversation_id: 'conv-script-nowarn',
+        user_message: 'hi',
+      });
+
+      const scriptNode: ScriptNode = {
+        id: 'modern',
+        // Contains the substring "ARGUMENTS" but not the literal $ARGUMENTS ref.
+        script: 'console.log(process.env.ARGUMENTS ?? "")',
+        runtime: 'bun',
+      };
+
+      await executeDagWorkflow(
+        createMockDeps(),
+        platform,
+        'conv-script-nowarn',
+        testDir,
+        { name: 'script-nowarn-test', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+        (c: unknown[]) => c[1] as string
+      );
+      expect(messages.find(m => m.includes('no longer substituted'))).toBeUndefined();
     } finally {
       execSpy.mockRestore();
     }
@@ -4167,6 +4714,201 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     );
   });
 
+  // ─── Background Agent Task Gating (#2083) ───────────────────────────────
+
+  describe('background task completion gating (#2083)', () => {
+    const runSingleNode = async (
+      store: ReturnType<typeof createMockStore>,
+      platform: IWorkflowPlatform,
+      runId: string
+    ): Promise<void> => {
+      const mockDeps = createMockDeps(store);
+      const workflowRun = makeWorkflowRun(runId);
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-bg-tasks',
+        testDir,
+        { name: 'bg-task-test', nodes: [{ id: 'step1', command: 'step1' }] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    };
+
+    const findCompletedEvent = (
+      store: ReturnType<typeof createMockStore>
+    ): { data: Record<string, unknown> } | undefined => {
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const call = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'node_completed' &&
+          (c[0] as { step_name: string }).step_name === 'step1'
+      );
+      return call?.[0] as { data: Record<string, unknown> } | undefined;
+    };
+
+    it('waits past a result with live background tasks and captures the follow-up output', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-1', taskType: 'local_agent', description: 'bg research' }],
+        };
+        yield { type: 'assistant', content: 'spawned agents' };
+        // Turn-level result while t-1 is still live — must NOT complete the node
+        yield { type: 'result', sessionId: 'sid', cost: 0.1 };
+        // Post-result: task drains, follow-up turn integrates its output
+        yield { type: 'assistant', content: ' + integrated task output' };
+        yield { type: 'background_tasks', tasks: [] };
+        yield { type: 'result', sessionId: 'sid', cost: 0.3 };
+      });
+
+      const store = createMockStore();
+      const platform = createMockPlatform();
+      await runSingleNode(store, platform, 'bg-wait-run');
+
+      const completed = findCompletedEvent(store);
+      expect(completed).toBeDefined();
+      // Output includes the post-result follow-up turn (the wait actually happened)
+      expect(completed!.data.node_output).toBe('spawned agents + integrated task output');
+      // Cost is the LAST result's session-cumulative value, not a sum
+      expect(completed!.data.cost_usd).toBe(0.3);
+      // Clean drain → no incompleteness recorded
+      expect(completed!.data.background_tasks_incomplete).toBeUndefined();
+      // The wait was announced to the user once
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+        String(c[1])
+      );
+      expect(sent.some(m => m.includes('background agent task(s) still running'))).toBe(true);
+    });
+
+    it('records background_tasks_incomplete and warns when the stream ends with live tasks', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-orphan', taskType: 'local_agent', description: 'never drains' }],
+        };
+        yield { type: 'assistant', content: 'partial work' };
+        yield { type: 'result', sessionId: 'sid' };
+        // Generator ends without the set draining (subprocess death analog)
+      });
+
+      const store = createMockStore();
+      const platform = createMockPlatform();
+      await runSingleNode(store, platform, 'bg-incomplete-run');
+
+      const completed = findCompletedEvent(store);
+      expect(completed).toBeDefined();
+      expect(completed!.data.background_tasks_incomplete).toEqual(['t-orphan']);
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+        String(c[1])
+      );
+      expect(sent.some(m => m.includes('output may be missing'))).toBe(true);
+    });
+
+    it('suppresses the incompleteness warning when the node is genuinely cancelled with live tasks', async () => {
+      // The run is cancelled mid-stream (caught by the throttled status check)
+      // while a background task is still live. The stream ends with the task
+      // dangling, but the node already returns 'failed — Cancelled by user',
+      // so the incompleteness warning must be suppressed as noise.
+      // setSystemTime jumps past CANCEL_CHECK_INTERVAL_MS between chunks so the
+      // second status check fires deterministically (no real waiting).
+      let tasksDelivered = false;
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-live', taskType: 'local_agent', description: 'still running' }],
+        };
+        tasksDelivered = true;
+        setSystemTime(new Date(Date.now() + 11_000));
+        yield { type: 'assistant', content: 'partial work' };
+        yield { type: 'assistant', content: 'MUST NOT BE REACHED' };
+      });
+
+      const store = createMockStore();
+      // 'running' until the task set has been delivered, 'cancelled' after —
+      // guarantees the abort happens with the task registered as live.
+      (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+        Promise.resolve(tasksDelivered ? 'cancelled' : 'running')
+      );
+      const platform = createMockPlatform();
+      try {
+        await runSingleNode(store, platform, 'bg-cancelled-run');
+      } finally {
+        setSystemTime(); // restore the real clock
+      }
+
+      // The node failed as cancelled — it never completed
+      expect(findCompletedEvent(store)).toBeUndefined();
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failedEvent = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'node_failed' &&
+          (c[0] as { step_name: string }).step_name === 'step1'
+      );
+      expect(failedEvent).toBeDefined();
+      expect((failedEvent![0] as { data: { error: string } }).data.error).toBe('Cancelled by user');
+      // Cancellation exemption: no user-facing incompleteness warning
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+        String(c[1])
+      );
+      expect(sent.some(m => m.includes('output may be missing'))).toBe(false);
+      expect(sent.some(m => m.includes('background agent'))).toBe(false);
+    });
+
+    it('breaks at the first result when no background_tasks chunk was seen (unchanged behavior)', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'normal output' };
+        yield { type: 'result', sessionId: 'sid' };
+        // Anything after the result must NOT be consumed
+        yield { type: 'assistant', content: ' MUST NOT APPEAR' };
+      });
+
+      const store = createMockStore();
+      const platform = createMockPlatform();
+      await runSingleNode(store, platform, 'bg-none-run');
+
+      const completed = findCompletedEvent(store);
+      expect(completed).toBeDefined();
+      expect(completed!.data.node_output).toBe('normal output');
+      expect(completed!.data.background_tasks_incomplete).toBeUndefined();
+    });
+
+    it('persists output_file on task_notification task_activity events', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'delegating' };
+        yield {
+          type: 'task_notification',
+          taskId: 't-9',
+          status: 'completed',
+          summary: 'wrote the report',
+          outputFile: '/tmp/task-9-output.md',
+        };
+        yield { type: 'result', sessionId: 'sid' };
+      });
+
+      const store = createMockStore();
+      const platform = createMockPlatform();
+      await runSingleNode(store, platform, 'bg-output-file-run');
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const taskEvent = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'task_activity' &&
+          (c[0] as { data: { task_id?: string } }).data.task_id === 't-9'
+      );
+      expect(taskEvent).toBeDefined();
+      expect((taskEvent![0] as { data: { output_file?: string } }).data.output_file).toBe(
+        '/tmp/task-9-output.md'
+      );
+    });
+  });
+
   // ─── Loop Node Tests ─────────────────────────────────────────────────────
 
   describe('loop node execution', () => {
@@ -4220,6 +4962,279 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(completeCalls[0][1]).toEqual({
         node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
       });
+    });
+
+    it('does not double-count cost when an iteration sees two results (background-task wait, #2083)', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-1', taskType: 'local_agent', description: 'bg work' }],
+        };
+        yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+        // Session-cumulative cost: 0.1 at the first result, 0.3 at the final one
+        yield { type: 'result', sessionId: 'loop-sid', cost: 0.1 };
+        yield { type: 'background_tasks', tasks: [] };
+        yield { type: 'result', sessionId: 'loop-sid', cost: 0.3 };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-bg-cost-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-bg-cost',
+          nodes: [
+            {
+              id: 'my-loop',
+              loop: {
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedEvent = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'node_completed' &&
+          (c[0] as { step_name: string }).step_name === 'my-loop'
+      );
+      expect(completedEvent).toBeDefined();
+      // 0.3 (last session-cumulative value), NOT 0.4 (0.1 + 0.3 double-count)
+      expect((completedEvent![0] as { data: { cost_usd?: number } }).data.cost_usd).toBe(0.3);
+    });
+
+    it('records the cross-iteration union of dangling background tasks on node_completed (#2083)', async () => {
+      // Iterations 1 and 2 each end with a different task still live (subprocess
+      // death analog); iteration 3 finishes cleanly and signals completion. The
+      // node_completed event must carry the UNION of dangling ids — last-iteration
+      // reporting would hide t-a and t-b behind the clean final iteration.
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          yield {
+            type: 'background_tasks',
+            tasks: [{ taskId: 't-a', taskType: 'local_agent', description: 'never drains' }],
+          };
+          yield { type: 'assistant', content: 'first pass' };
+          yield { type: 'result', sessionId: 'sid-1' };
+          // Generator ends with t-a live
+        } else if (callCount === 2) {
+          yield {
+            type: 'background_tasks',
+            tasks: [{ taskId: 't-b', taskType: 'local_agent', description: 'never drains' }],
+          };
+          yield { type: 'assistant', content: 'second pass' };
+          yield { type: 'result', sessionId: 'sid-2' };
+          // Generator ends with t-b live
+        } else {
+          yield { type: 'assistant', content: 'All done! <promise>COMPLETE</promise>' };
+          yield { type: 'result', sessionId: 'sid-3' };
+        }
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-bg-union-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-bg-union',
+          nodes: [
+            {
+              id: 'my-loop',
+              loop: {
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(3);
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedEvent = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'node_completed' &&
+          (c[0] as { step_name: string }).step_name === 'my-loop'
+      );
+      expect(completedEvent).toBeDefined();
+      const data = (completedEvent![0] as { data: Record<string, unknown> }).data;
+      expect(data.background_tasks_incomplete).toEqual(['t-a', 't-b']);
+      // Each incomplete iteration also warned the user
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+        String(c[1])
+      );
+      expect(sent.filter(m => m.includes('output may be missing')).length).toBe(2);
+    });
+
+    it('omits background_tasks_incomplete from node_completed when every iteration drains cleanly', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-1', taskType: 'local_agent', description: 'bg work' }],
+        };
+        yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'sid-clean' };
+        yield { type: 'background_tasks', tasks: [] };
+        yield { type: 'result', sessionId: 'sid-clean' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-bg-clean-run');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-bg-clean',
+          nodes: [
+            {
+              id: 'my-loop',
+              loop: {
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedEvent = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'node_completed' &&
+          (c[0] as { step_name: string }).step_name === 'my-loop'
+      );
+      expect(completedEvent).toBeDefined();
+      expect(
+        (completedEvent![0] as { data: Record<string, unknown> }).data.background_tasks_incomplete
+      ).toBeUndefined();
+    });
+
+    it('cancellation mid-stream aborts the iteration and suppresses the incompleteness warning', async () => {
+      // Mirrors the AI-node cancellation-exemption test: the run is cancelled
+      // while an iteration is streaming with a live background task. The new
+      // mid-stream status check must abort the iteration (previously the loop
+      // only noticed cancellation BETWEEN iterations), fail the node with the
+      // observed status, and suppress the incompleteness warning.
+      let tasksDelivered = false;
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-loop', taskType: 'local_agent', description: 'still running' }],
+        };
+        tasksDelivered = true;
+        setSystemTime(new Date(Date.now() + 11_000));
+        yield { type: 'assistant', content: 'working' };
+        yield { type: 'assistant', content: 'MUST NOT BE REACHED' };
+      });
+
+      const store = createMockStore();
+      // 'running' for the between-iteration check, 'cancelled' once the task
+      // set has been delivered mid-stream.
+      (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+        Promise.resolve(tasksDelivered ? 'cancelled' : 'running')
+      );
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-bg-cancel-run');
+
+      try {
+        await executeDagWorkflow(
+          mockDeps,
+          platform,
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-loop-bg-cancel',
+            nodes: [
+              {
+                id: 'my-loop',
+                loop: {
+                  prompt: 'Do tasks.',
+                  until: 'COMPLETE',
+                  max_iterations: 5,
+                },
+              },
+            ],
+          },
+          workflowRun,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig
+        );
+      } finally {
+        setSystemTime(); // restore the real clock
+      }
+
+      // Aborted during iteration 1 — no second iteration
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      // The loop never completed
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedEvent = eventCalls.find(
+        (c: unknown[]) =>
+          (c[0] as { event_type: string }).event_type === 'node_completed' &&
+          (c[0] as { step_name: string }).step_name === 'my-loop'
+      );
+      expect(completedEvent).toBeUndefined();
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c =>
+        String(c[1])
+      );
+      // The stop is surfaced with the observed status…
+      expect(sent.some(m => m.includes('stopped during iteration 1 (cancelled)'))).toBe(true);
+      // …and the incompleteness warning is suppressed as noise
+      expect(sent.some(m => m.includes('output may be missing'))).toBe(false);
     });
 
     it('completes after multiple iterations', async () => {
@@ -5796,6 +6811,526 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         >
       ).mock.calls;
       expect(pauseCalls.length).toBe(0);
+    });
+
+    // ─── loop.command (command-file-backed loop nodes) ──────────────────────
+    //
+    // Hidden mechanics these tests pin down:
+    //   • The command file is read ONCE per run/node — loaded at node start,
+    //     reused for every iteration, and persisted across an interactive gate
+    //     pause (`commandSnapshot`) so a file edited or deleted while paused
+    //     cannot change the running loop's prompt.
+    //   • A missing / empty / unsafe `loop.command` fails the node *before*
+    //     any iteration runs — no `sendQuery` call, one `node_failed` event
+    //     with an actionable error. The schema's superRefine catches unsafe
+    //     names at parse, but a hand-constructed workflow can bypass parse;
+    //     these tests exercise the executor's defense-in-depth branch.
+    //   • Loop variable substitution (`$LOOP_PREV_OUTPUT`, `$LOOP_USER_INPUT`,
+    //     and the standard workflow vars) applies to the loaded command-file
+    //     text identically to inline `loop.prompt` text.
+
+    it('reads loop.command file once at node start, not per iteration', async () => {
+      // Regression guard for the "load once, reuse" invariant. We write a
+      // command file, run iteration 1, delete the file synchronously inside
+      // the mock generator, and confirm iteration 2 still runs successfully.
+      // If the executor re-read the file per iteration, the load would fail
+      // on iteration 2 and surface as `node_failed` / `loop_iteration_failed`.
+      const cmdPath = join(testDir, '.archon', 'commands', 'read-once-loop.md');
+      await writeFile(cmdPath, 'Command-loaded loop body. iter prev=<<$LOOP_PREV_OUTPUT>>');
+
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          // Delete the source file *during* iteration 1 so it is gone by the
+          // time iteration 2 begins. Synchronous unlink ensures the file is
+          // removed before the next `for await` yield resumes the loop body.
+          unlinkSync(cmdPath);
+          yield { type: 'assistant', content: 'iter1 work output' };
+          yield { type: 'result', sessionId: 'sid-once-1' };
+        } else {
+          yield { type: 'assistant', content: 'iter2 done. <promise>COMPLETE</promise>' };
+          yield { type: 'result', sessionId: 'sid-once-2' };
+        }
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-cmd-read-once',
+          nodes: [
+            {
+              id: 'read-once-loop',
+              loop: {
+                command: 'read-once-loop',
+                until: 'COMPLETE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Both iterations ran — the mid-run deletion did not break iteration 2.
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      // No failure events of any kind.
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failedEvents = eventCalls.filter((call: unknown[]) => {
+        const evt = (call[0] as Record<string, unknown>).event_type as string;
+        return evt === 'node_failed' || evt === 'loop_iteration_failed';
+      });
+      expect(failedEvents).toHaveLength(0);
+      // Both iterations received the *same* file body as their prompt template
+      // — proving the file contents were loaded once and reused, not re-read.
+      expect(mockSendQueryDag.mock.calls[0][0] as string).toContain('Command-loaded loop body.');
+      expect(mockSendQueryDag.mock.calls[1][0] as string).toContain('Command-loaded loop body.');
+      // node_started carries the command name so the event stream identifies
+      // command-backed loops without reading the workflow YAML.
+      const started = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_started' &&
+          (call[0] as Record<string, unknown>).step_name === 'read-once-loop'
+      );
+      expect(started).toBeDefined();
+      const startedData = (started![0] as Record<string, unknown>).data as Record<string, unknown>;
+      expect(startedData.command).toBe('read-once-loop');
+    });
+
+    it('fails fast with node_failed when loop.command names a missing file', async () => {
+      // Schema rejection at parse only fires when the workflow is parsed via
+      // the loader; a hand-constructed workflow bypasses that. The runtime
+      // guard inside `executeLoopNode` must catch the missing command and
+      // fail the node before iteration 1 runs.
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-cmd-missing',
+          nodes: [
+            {
+              id: 'missing-loop',
+              loop: {
+                command: 'does-not-exist-anywhere',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // sendQuery must never have been invoked — load failed pre-iteration.
+      expect(mockSendQueryDag.mock.calls.length).toBe(0);
+      // `node_failed` event was emitted with the actionable message.
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failed = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'missing-loop'
+      );
+      expect(failed).toBeDefined();
+      const data = (failed![0] as Record<string, unknown>).data as Record<string, unknown>;
+      expect(String(data.error)).toContain('not found');
+      // The failing command name must travel with the event so consumers of the
+      // event stream see the same context as the structured log.
+      expect(data.command).toBe('does-not-exist-anywhere');
+
+      // node_started must be paired with node_failed even when the failure is
+      // pre-iteration — same lifecycle contract as bash and script nodes.
+      const started = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_started' &&
+          (call[0] as Record<string, unknown>).step_name === 'missing-loop'
+      );
+      expect(started).toBeDefined();
+    });
+
+    it('fails fast with node_failed when loop.command target file is empty', async () => {
+      // An empty command file is a load-time failure in `loadCommandPrompt`
+      // (same as for `command:` nodes). The loop must fail with the empty-file
+      // diagnostic before iteration 1.
+      await writeFile(join(testDir, '.archon', 'commands', 'empty-loop.md'), '');
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-cmd-empty',
+          nodes: [
+            {
+              id: 'empty-loop',
+              loop: {
+                command: 'empty-loop',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(0);
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failed = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'empty-loop'
+      );
+      expect(failed).toBeDefined();
+      const data = (failed![0] as Record<string, unknown>).data as Record<string, unknown>;
+      expect(String(data.error)).toContain('empty');
+      expect(data.command).toBe('empty-loop');
+    });
+
+    it('fails fast with node_failed when loop.command is an unsafe name', async () => {
+      // The loop schema's superRefine rejects `'../escape'` at parse, but a
+      // programmatically-constructed workflow bypasses parse. The executor
+      // branch must still flag this via `isValidCommandName` inside
+      // `loadCommandPrompt` rather than attempting any file resolution.
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-cmd-unsafe',
+          nodes: [
+            {
+              id: 'unsafe-loop',
+              loop: {
+                command: '../escape',
+                until: 'COMPLETE',
+                max_iterations: 3,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(0);
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failed = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'unsafe-loop'
+      );
+      expect(failed).toBeDefined();
+      const data = (failed![0] as Record<string, unknown>).data as Record<string, unknown>;
+      expect(String(data.error)).toContain('Invalid command name');
+      expect(data.command).toBe('../escape');
+    });
+
+    it('applies $LOOP_PREV_OUTPUT and $LOOP_USER_INPUT substitution to command-loaded text', async () => {
+      // Loop variable substitution applies to command-loaded prompt text
+      // identically to inline prompt text: both `$LOOP_PREV_OUTPUT` and
+      // `$LOOP_USER_INPUT` are embedded in the command file body, and the
+      // prompt actually sent to the AI must substitute them the same way the
+      // inline-prompt tests verify for `loop.prompt`. The body itself must
+      // appear in the sent prompt — proof the file contents (not the YAML
+      // node body) flow through `substituteWorkflowVariables`.
+      await writeFile(
+        join(testDir, '.archon', 'commands', 'subst-loop.md'),
+        'Cmd-file body. PREV=<<$LOOP_PREV_OUTPUT>> USER=<<$LOOP_USER_INPUT>>'
+      );
+
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          yield { type: 'assistant', content: 'iter1 result text' };
+          yield { type: 'result', sessionId: 'sid-subst-1' };
+        } else {
+          yield { type: 'assistant', content: 'done. <promise>COMPLETE</promise>' };
+          yield { type: 'result', sessionId: 'sid-subst-2' };
+        }
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-cmd-subst',
+          nodes: [
+            {
+              id: 'subst-loop',
+              loop: {
+                command: 'subst-loop',
+                until: 'COMPLETE',
+                max_iterations: 5,
+                fresh_context: true,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const promptIter1 = mockSendQueryDag.mock.calls[0][0] as string;
+      const promptIter2 = mockSendQueryDag.mock.calls[1][0] as string;
+      // The file body is what reached the AI — not the YAML inline-prompt path.
+      expect(promptIter1).toContain('Cmd-file body.');
+      expect(promptIter2).toContain('Cmd-file body.');
+      // Iteration 1: PREV substitutes to empty (no prior output); USER empty
+      // (non-interactive, no resume metadata).
+      expect(promptIter1).toContain('PREV=<<>>');
+      expect(promptIter1).toContain('USER=<<>>');
+      // Iteration 2: PREV carries iteration 1's cleaned output, USER stays
+      // empty (still non-interactive).
+      expect(promptIter2).toContain('PREV=<<iter1 result text>>');
+      expect(promptIter2).toContain('USER=<<>>');
+    });
+
+    it('reuses the pause-time command snapshot on approval resume — file mutated and deleted while paused', async () => {
+      // Two-invocation contract: invocation 1 loads the command file and pauses
+      // at the interactive gate, persisting the loaded body (`commandSnapshot`)
+      // in the pause context. While the run sits paused, the file is rewritten
+      // AND then deleted. Invocation 2 (the approval resume) must run the next
+      // iteration from the SNAPSHOT — never from the mutated file, and without
+      // failing on the missing file.
+      const cmdPath = join(testDir, '.archon', 'commands', 'gated-loop.md');
+      await writeFile(cmdPath, 'ORIGINAL gated body. USER=<<$LOOP_USER_INPUT>>');
+
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'iteration output, no signal yet' };
+        yield { type: 'result', sessionId: 'sid-gated-1' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      const gatedWorkflow = {
+        name: 'loop-cmd-gated',
+        nodes: [
+          {
+            id: 'gated-loop',
+            loop: {
+              command: 'gated-loop',
+              until: 'COMPLETE',
+              max_iterations: 5,
+              interactive: true,
+              gate_message: 'Review this iteration.',
+            },
+          } as unknown as DagNode,
+        ],
+      };
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        gatedWorkflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Invocation 1 paused at the gate and persisted the loaded body.
+      const pauseCalls = (
+        mockDeps.store.pauseWorkflowRun as Mock<
+          (id: string, ctx: Record<string, unknown>) => Promise<void>
+        >
+      ).mock.calls;
+      expect(pauseCalls.length).toBe(1);
+      const pausedContext = pauseCalls[0][1] as Record<string, unknown>;
+      expect(pausedContext.commandSnapshot).toContain('ORIGINAL gated body.');
+      expect(mockSendQueryDag.mock.calls[0][0] as string).toContain('ORIGINAL gated body.');
+
+      // While paused: the file is rewritten, then deleted entirely.
+      await writeFile(cmdPath, 'TAMPERED body that must never run');
+      unlinkSync(cmdPath);
+
+      // Invocation 2: approval resume with feedback (feedback forces a real
+      // resumed iteration rather than a bare-approve finalize).
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'refined. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'sid-gated-2' };
+      });
+      const resumedRun = makeWorkflowRun('gated-resume-run', {
+        metadata: {
+          approval: { ...pausedContext },
+          loop_user_input: 'tighten the summary',
+          loop_feedback_given: true,
+        },
+      });
+      const store2 = createMockStore();
+      const mockDeps2 = createMockDeps(store2);
+
+      await executeDagWorkflow(
+        mockDeps2,
+        platform,
+        'conv-dag',
+        testDir,
+        gatedWorkflow,
+        resumedRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // The resumed iteration ran from the snapshot: original body, user
+      // feedback substituted, no trace of the tampered content, no failure
+      // from the deleted file.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      const resumedPrompt = mockSendQueryDag.mock.calls[0][0] as string;
+      expect(resumedPrompt).toContain('ORIGINAL gated body.');
+      expect(resumedPrompt).toContain('USER=<<tighten the summary>>');
+      expect(resumedPrompt).not.toContain('TAMPERED');
+      const failed = (store2.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      expect(failed).toHaveLength(0);
+    });
+
+    it('closes the loop lifecycle with exactly one node_failed on max-iterations exhaustion', async () => {
+      // Failure finalizer contract: every failed exit after node_started goes
+      // through one finalizer — exactly one node_failed row per started loop
+      // node, paired with its node_started.
+      await writeFile(
+        join(testDir, '.archon', 'commands', 'exhaust-loop.md'),
+        'Body that never signals completion'
+      );
+
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'still going, no signal' };
+        yield { type: 'result', sessionId: 'sid-exhaust' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-cmd-exhaust',
+          nodes: [
+            {
+              id: 'exhaust-loop',
+              loop: {
+                command: 'exhaust-loop',
+                until: 'COMPLETE',
+                max_iterations: 2,
+                fresh_context: true,
+              },
+            } as unknown as DagNode,
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const started = eventCalls.filter(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_started' &&
+          (call[0] as Record<string, unknown>).step_name === 'exhaust-loop'
+      );
+      const failed = eventCalls.filter(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'exhaust-loop'
+      );
+      expect(started).toHaveLength(1);
+      expect(failed).toHaveLength(1);
+      const data = (failed[0][0] as Record<string, unknown>).data as Record<string, unknown>;
+      expect(String(data.error)).toContain('exceeded max iterations');
     });
   });
 });
@@ -9230,6 +10765,215 @@ describe('executeDagWorkflow -- final status derivation', () => {
   });
 });
 
+describe('executeDagWorkflow -- evidence gate (#2230)', () => {
+  // Thin terminal-success gate: when the workflow declares
+  // `evidence_policy.required: true`, the executor refuses terminal `completed`
+  // unless `$ARTIFACTS_DIR/evidence.json` exists. Presence check ONLY — the
+  // workflow's own bash/script nodes compute what counts as evidence.
+  let testDir: string;
+  let artifactsDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-evidence-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    artifactsDir = join(testDir, 'artifacts');
+    await mkdir(testDir, { recursive: true });
+    mockCaptureWorkflowCompleted.mockClear();
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  async function runEvidenceWorkflow(opts: {
+    store: IWorkflowStore;
+    platform: IWorkflowPlatform;
+    evidencePolicy?: { required: boolean };
+    priorCompletedNodes?: Map<string, string>;
+  }): Promise<void> {
+    const mockDeps = createMockDeps(opts.store);
+    const workflowRun = makeWorkflowRun('dag-evidence-run');
+    const nodes: DagNode[] = [{ id: 'work', bash: 'echo done' } as BashNode];
+
+    await executeDagWorkflow(
+      mockDeps,
+      opts.platform,
+      'conv-evidence',
+      testDir,
+      {
+        name: 'evidence-test',
+        nodes,
+        ...(opts.evidencePolicy ? { evidence_policy: opts.evidencePolicy } : {}),
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      opts.priorCompletedNodes
+    );
+  }
+
+  it('required: true + missing evidence.json -> failWorkflowRun with explicit reason, never completed', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: true },
+    });
+
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    const failCall = (mockStore.failWorkflowRun as ReturnType<typeof mock>).mock
+      .calls[0] as unknown[];
+    expect(failCall[1] as string).toContain('evidence_policy.required');
+    expect(failCall[1] as string).toContain(join(artifactsDir, 'evidence.json'));
+
+    // The user-facing message says exactly why
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    expect(messages.some(m => m.includes('evidence_policy.required'))).toBe(true);
+  });
+
+  it('missing evidence writes a structured metadata.evidence_validation note', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: true },
+    });
+
+    const updateCalls = (mockStore.updateWorkflowRun as ReturnType<typeof mock>).mock
+      .calls as unknown[][];
+    const metadataCall = updateCalls.find(call => {
+      const updates = call[1] as { metadata?: Record<string, unknown> };
+      return updates?.metadata?.evidence_validation !== undefined;
+    });
+    expect(metadataCall).toBeDefined();
+    const note = (metadataCall?.[1] as { metadata: Record<string, unknown> }).metadata
+      .evidence_validation as Record<string, unknown>;
+    expect(note.status).toBe('missing');
+    expect(note.policy).toBe('evidence_policy.required');
+    expect(note.expected_path).toBe(join(artifactsDir, 'evidence.json'));
+    expect(typeof note.checked_at).toBe('string');
+  });
+
+  it('missing evidence persists an evidence_validation_failed workflow event and telemetry exit reason', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: true },
+    });
+
+    const eventCalls = (mockStore.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as unknown[][];
+    const evidenceEvent = eventCalls.find(
+      call => (call[0] as { event_type: string }).event_type === 'evidence_validation_failed'
+    );
+    expect(evidenceEvent).toBeDefined();
+    const eventData = (evidenceEvent?.[0] as { data: Record<string, unknown> }).data;
+    expect(eventData.expected_path).toBe(join(artifactsDir, 'evidence.json'));
+
+    const telemetryCalls = mockCaptureWorkflowCompleted.mock.calls as unknown[][];
+    const lastTelemetry = telemetryCalls.at(-1)?.[0] as Record<string, unknown>;
+    expect(lastTelemetry.outcome).toBe('failed');
+    expect(lastTelemetry.exitReason).toBe('evidence_missing');
+  });
+
+  it('required: true + evidence.json present -> completeWorkflowRun', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+    await mkdir(artifactsDir, { recursive: true });
+    await writeFile(join(artifactsDir, 'evidence.json'), '{"proof": "landed"}');
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: true },
+    });
+
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('no evidence_policy declared -> completes without checking for evidence.json', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+
+    await runEvidenceWorkflow({ store: mockStore, platform });
+
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('required: false -> completes without checking for evidence.json', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: false },
+    });
+
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('resumed run (all nodes prior-completed) with evidence.json now present -> completes', async () => {
+    // A run that failed the gate is resumed after evidence.json was produced:
+    // every node is skipped as prior-completed, the executor re-enters the
+    // completion path, and the gate now passes.
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+    await mkdir(artifactsDir, { recursive: true });
+    await writeFile(join(artifactsDir, 'evidence.json'), '{"proof": "landed"}');
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: true },
+      priorCompletedNodes: new Map([['work', 'done']]),
+    });
+
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('resumed run without evidence.json -> fails the gate again', async () => {
+    const mockStore = createMockStore();
+    const platform = createMockPlatform();
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform,
+      evidencePolicy: { required: true },
+      priorCompletedNodes: new Map([['work', 'done']]),
+    });
+
+    expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+    expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
+  });
+});
+
 describe('provider resolution -- regression for #1610', () => {
   let testDir: string;
 
@@ -10568,6 +12312,152 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(result).toContain('iteration 2 final result');
   });
 
+  it('runs a command-backed loop node inside a loop_group body with namespaced lifecycle events', async () => {
+    // A `loop:` body node may use `loop.command` like any top-level loop. The
+    // command body must reach the AI, and the loop's persisted lifecycle events
+    // must carry the `<groupId>.<nodeId>` namespaced step_name (#2090).
+    await writeFile(
+      join(testDir, '.archon', 'commands', 'body-loop-cmd.md'),
+      'Command-file body for the inner loop.'
+    );
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'inner work done. <promise>INNER_DONE</promise>\nDONE' };
+      yield { type: 'result', sessionId: 'lg-cmd-sess' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('dag-loopgroup-cmd');
+
+    const nodes: DagNode[] = [
+      {
+        id: 'grp',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 3,
+          fresh_context: false,
+          nodes: [
+            {
+              id: 'inner-loop',
+              loop: {
+                command: 'body-loop-cmd',
+                until: 'INNER_DONE',
+                max_iterations: 2,
+                fresh_context: false,
+              },
+              depends_on: [],
+            } as unknown as DagNode,
+          ],
+        },
+        depends_on: [],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-lg',
+      testDir,
+      { name: 'dag-loopgroup-cmd', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The command file's body (not a YAML inline prompt) reached the AI.
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    expect(mockSendQueryDag.mock.calls[0][0] as string).toContain(
+      'Command-file body for the inner loop.'
+    );
+    // Inner-loop lifecycle events are namespaced under the group id.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const innerStarted = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_started' &&
+        (call[0] as Record<string, unknown>).step_name === 'grp.inner-loop'
+    );
+    expect(innerStarted.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('delivers $LOOP_USER_INPUT to a resumed body script via env, never spliced into source (#2115)', async () => {
+    // Resumed interactive group: the approval-gate free-text must reach the body script
+    // as an env var, not as text interpolated into the executed TS source.
+    const injection = '"); process.exit(1); //';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'DONE\n', stderr: '' });
+    try {
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('lg-userinput-script', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'grp',
+            iteration: 0,
+            message: 'Review and provide feedback.',
+          },
+          loop_user_input: injection,
+          loop_feedback_given: true,
+        },
+      });
+
+      const nodes: DagNode[] = [
+        {
+          id: 'grp',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            fresh_context: true,
+            interactive: true,
+            gate_message: 'Review and provide feedback.',
+            nodes: [
+              {
+                id: 'emit',
+                script: 'console.log("$LOOP_USER_INPUT"); console.log("DONE")',
+                runtime: 'bun',
+                depends_on: [],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ];
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-lg-userinput',
+        testDir,
+        { name: 'lg-userinput-script', nodes },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const scriptCall = execSpy.mock.calls.find(
+        c => (c[0] as string) === 'bun' && (c[1] as string[]).includes('-e')
+      ) as [string, string[], { env: NodeJS.ProcessEnv }] | undefined;
+      expect(scriptCall).toBeDefined();
+      // Source is byte-identical to the author's body — the payload is not interpolated.
+      expect(scriptCall?.[1][2]).toBe('console.log("$LOOP_USER_INPUT"); console.log("DONE")');
+      expect(scriptCall?.[1][2]).not.toContain('process.exit');
+      // The per-iteration feedback reaches the script through the environment.
+      expect(scriptCall?.[2].env.LOOP_USER_INPUT).toBe(injection);
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
   it('fails the loop_group when max_iterations is exceeded without the until signal', async () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(function* () {
@@ -10972,8 +12862,283 @@ describe('executeDagWorkflow -- loop_group node', () => {
 
   it('EDGE F: $LOOP_PREV.<id>.output.<field> on a missing prior node resolves to empty', () => {
     // The referenced node wasn't in the prior iteration (skipped/absent) → '' not a throw.
+    // Raw call (no knownBodyIds set) stays fully lenient — the typo check only engages when
+    // the static body-id set is threaded in via the executor path.
     const prev = new Map<string, NodeOutput>([['work', makeOutput('completed', 'ran', undefined)]]);
     expect(substituteLoopPrevRefs('other=[$LOOP_PREV.absent.output.field]', prev)).toBe('other=[]');
+  });
+
+  it('EDGE F (#2142): substituteLoopPrevRefs classifies absent refs by the two body-id sets', () => {
+    // Iteration-1 posture: no prior outputs yet. `knownBodyIds` is the TRANSITIVE set
+    // (this group + nested descendants); `directBodyIds` is only this group's immediate ids.
+    // Group body: { grader, work, refine(nested group) }; refine's inner body: { polish }.
+    const knownBodyIds = new Set(['grader', 'work', 'refine', 'polish']);
+    const directBodyIds = new Set(['grader', 'work', 'refine']);
+
+    // Typo: `grrader` matches no body node → OutputRefError('unknown-node') + did-you-mean.
+    let caught: unknown;
+    try {
+      substituteLoopPrevRefs(
+        'score=$LOOP_PREV.grrader.output.score',
+        undefined,
+        false,
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      );
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(OutputRefError);
+    expect((caught as OutputRefError).reason).toBe('unknown-node');
+    expect((caught as OutputRefError).message).toContain("'grader'"); // did-you-mean names the near miss
+
+    // Direct body id with no prior-iteration output (iteration 1) → '' (legitimate absence).
+    expect(
+      substituteLoopPrevRefs(
+        'score=$LOOP_PREV.grader.output.score',
+        undefined,
+        false,
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toBe('score=');
+
+    // Nested-owned id (`polish` ∈ known, ∉ direct): token left INTACT so the inner
+    // loop_group resolves it against its OWN prior-iteration snapshot later. Both the
+    // `.field` and whole-text forms are preserved.
+    expect(
+      substituteLoopPrevRefs(
+        'draft=[$LOOP_PREV.polish.output.draft]',
+        undefined,
+        false,
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toBe('draft=[$LOOP_PREV.polish.output.draft]');
+    expect(
+      substituteLoopPrevRefs(
+        'whole=[$LOOP_PREV.polish.output]',
+        undefined,
+        false,
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toBe('whole=[$LOOP_PREV.polish.output]');
+
+    // Whole-text `$LOOP_PREV.<id>.output` to an unknown id stays lenient (no throw), even
+    // with the set — mirrors substituteNodeOutputRefs' lenient whole-text surface.
+    expect(
+      substituteLoopPrevRefs(
+        'all=$LOOP_PREV.grrader.output',
+        undefined,
+        false,
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toBe('all=');
+
+    // Bash-escaped mode throws too (the typo would otherwise become an empty shell literal).
+    expect(() =>
+      substituteLoopPrevRefs(
+        'echo $LOOP_PREV.grrader.output.score',
+        undefined,
+        true,
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toThrow(OutputRefError);
+
+    // Raw caller with NO sets → fully lenient (pre-#2142 behavior): unknown id .field → ''.
+    expect(substituteLoopPrevRefs('x=[$LOOP_PREV.grrader.output.score]', undefined)).toBe('x=[]');
+  });
+
+  it('EDGE F (#2142): applyLoopPrevToBodyNode — typo throws, nested-owned token SURVIVES the outer pass', () => {
+    // The executor path threads the transitive `knownBodyIds` and immediate `directBodyIds`.
+    // Simulate the OUTER group's iteration-1 pass (no prior outputs). Outer body =
+    // { review, refine(nested group) }; refine's inner body = { polish }.
+    const knownBodyIds = new Set(['review', 'refine', 'polish']);
+    const directBodyIds = new Set(['review', 'refine']);
+
+    // A typo in a body prompt fails loudly.
+    expect(() =>
+      applyLoopPrevToBodyNode(
+        {
+          id: 'review',
+          prompt: 'act on $LOOP_PREV.reviw.output.verdict',
+          depends_on: [],
+        } as DagNode,
+        undefined,
+        '',
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toThrow(OutputRefError);
+
+    // A nested loop_group whose inner body references its OWN sibling id (`polish`, nested-
+    // owned) must have that token LEFT INTACT by the outer pass — otherwise the inner loop
+    // could never resolve its own prior iteration (this is the #2165 fix; before it the
+    // outer pass destroyed the token to '').
+    const nestedGroup = applyLoopPrevToBodyNode(
+      {
+        id: 'refine',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 2,
+          nodes: [
+            { id: 'polish', prompt: 'refine on $LOOP_PREV.polish.output.draft', depends_on: [] },
+          ],
+        },
+        depends_on: [],
+      } as DagNode,
+      undefined,
+      '',
+      undefined,
+      knownBodyIds,
+      directBodyIds
+    );
+    if (!('loop_group' in nestedGroup) || nestedGroup.loop_group === undefined)
+      throw new Error('expected loop_group node');
+    const polishNode = nestedGroup.loop_group.nodes[0];
+    expect('prompt' in polishNode && polishNode.prompt).toBe(
+      'refine on $LOOP_PREV.polish.output.draft'
+    );
+
+    // A ref to an OUTER-direct id (`review`) inside the nested body IS resolved now, at the
+    // outer granularity — here to '' (iteration 1, no prior output), not preserved.
+    const nestedReadsOuter = applyLoopPrevToBodyNode(
+      {
+        id: 'refine',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 2,
+          nodes: [
+            {
+              id: 'polish',
+              prompt: 'saw outer [$LOOP_PREV.review.output.verdict]',
+              depends_on: [],
+            },
+          ],
+        },
+        depends_on: [],
+      } as DagNode,
+      undefined,
+      '',
+      undefined,
+      knownBodyIds,
+      directBodyIds
+    );
+    if (!('loop_group' in nestedReadsOuter) || nestedReadsOuter.loop_group === undefined)
+      throw new Error('expected loop_group node');
+    const polishReadsOuter = nestedReadsOuter.loop_group.nodes[0];
+    expect('prompt' in polishReadsOuter && polishReadsOuter.prompt).toBe('saw outer []');
+
+    // But a typo INSIDE the nested body (id in no body node) still throws through the recursion.
+    expect(() =>
+      applyLoopPrevToBodyNode(
+        {
+          id: 'refine',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 2,
+            nodes: [
+              { id: 'polish', prompt: 'refine on $LOOP_PREV.reviw.output.verdict', depends_on: [] },
+            ],
+          },
+          depends_on: [],
+        } as DagNode,
+        undefined,
+        '',
+        undefined,
+        knownBodyIds,
+        directBodyIds
+      )
+    ).toThrow(OutputRefError);
+  });
+
+  it('EDGE F (#2165): a nested inner loop_group resolves its OWN prior-iteration $LOOP_PREV end-to-end', async () => {
+    // The semantics the L3417 comment promises: an inner loop_group body node referencing
+    // its own sibling's previous iteration (`$LOOP_PREV.w.output`) must see that output on
+    // the inner group's 2nd+ iteration — even though the inner group is nested inside an
+    // outer loop_group. Before #2165 the outer loop's substitution pass eagerly destroyed
+    // the token to '' before the inner loop ran, so it was empty on EVERY inner iteration.
+    //
+    // Body node `w` emits a distinct marker each call; we capture the prompt it receives.
+    // Inner iteration 1 → no prior output (''); inner iteration 2 → the marker from
+    // iteration 1 (proving the inner loop resolved its own prior iteration).
+    const capturedPrompts: string[] = [];
+    mockSendQueryDag.mockImplementation(function* (prompt: string) {
+      capturedPrompts.push(prompt ?? '');
+      const n = capturedPrompts.length;
+      // Call 1 emits MARK1 (no signal → inner iterates again); call 2 emits the signal.
+      yield { type: 'assistant', content: n === 1 ? 'MARK1' : 'MARK2 INNER_DONE' };
+      yield { type: 'result', sessionId: `s-${n}` };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('lg-nested-prev');
+
+    const nodes: DagNode[] = [
+      {
+        id: 'outer',
+        loop_group: {
+          until: 'OUTER_DONE',
+          // One outer iteration is enough to run the inner group to its own completion.
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [
+            {
+              id: 'inner',
+              loop_group: {
+                until: 'INNER_DONE',
+                max_iterations: 3,
+                fresh_context: false,
+                nodes: [
+                  {
+                    id: 'w',
+                    prompt: 'prev=[$LOOP_PREV.w.output] do work',
+                    depends_on: [],
+                  },
+                ],
+              },
+              depends_on: [],
+            },
+          ],
+        },
+        depends_on: [],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-lg',
+      testDir,
+      { name: 'lg-nested-prev', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Two inner iterations ran within the single outer iteration.
+    expect(capturedPrompts.length).toBe(2);
+    // Inner iteration 1: no prior output → empty.
+    expect(capturedPrompts[0]).toContain('prev=[]');
+    // Inner iteration 2: the inner loop resolved ITS OWN prior-iteration output — the token
+    // survived the outer pass and resolved against the inner snapshot. This is the fix.
+    expect(capturedPrompts[1]).toContain('prev=[MARK1]');
   });
 
   it('EDGE H: applyLoopPrevToBodyNode uses shell escaping only for shell-bound fields (unit)', () => {
@@ -11010,6 +13175,35 @@ describe('executeDagWorkflow -- loop_group node', () => {
       ''
     );
     expect('cancel' in cancelNode && cancelNode.cancel).toBe("stopping: it's done");
+  });
+
+  it('EDGE H: never splices $LOOP_USER_INPUT into a script body — env delivery only (#2115)', () => {
+    // Malicious approval-gate free-text. Raw-spliced into TS source it would close the
+    // string literal and execute; it must stay an inert literal token in the script so
+    // executeScriptNode delivers the value out-of-band via env instead.
+    const injection = '"); require("child_process").execSync("touch pwned"); //';
+
+    const scriptNode = applyLoopPrevToBodyNode(
+      {
+        id: 's',
+        script: 'console.log("$LOOP_USER_INPUT")',
+        runtime: 'bun',
+        depends_on: [],
+      } as DagNode,
+      undefined,
+      injection
+    );
+    // Literal token preserved; the payload never reaches the executed source.
+    expect('script' in scriptNode && scriptNode.script).toBe('console.log("$LOOP_USER_INPUT")');
+
+    // bash stays shell-quoted (the existing safe channel) — proving only scripts changed.
+    const bashNode = applyLoopPrevToBodyNode(
+      { id: 'b', bash: 'echo $LOOP_USER_INPUT', depends_on: [] } as DagNode,
+      undefined,
+      injection
+    );
+    // No single quotes in the payload → shellQuote wraps it verbatim in single quotes.
+    expect('bash' in bashNode && bashNode.bash).toBe(`echo '${injection}'`);
   });
 
   it('EDGE H: nested loop until_bash gets $LOOP_PREV substituted shell-safely (unit)', () => {
@@ -12976,5 +15170,1108 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
     expect('sessionProvider' in pauseCtx).toBe(true);
     expect(pauseCtx.sessionId).toBeNull();
     expect(pauseCtx.sessionProvider).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Include expansion — the "zero new runtime machinery" proof.
+//
+// Expand a parent that `include:`s a child (via expandWorkflowIncludes, exactly
+// as discovery does), then run the flattened definition through executeDagWorkflow.
+// The executor never sees an include node; the namespaced nodes behave as ordinary
+// top-level nodes for events, terminal-output selection, resume-skip, and always_run.
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- include expansion (zero runtime machinery)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-include-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  function buildWf(name: string, nodes: unknown[]): WorkflowDefinition {
+    return { name, description: name, nodes: nodes.map(n => dagNodeSchema.parse(n)) };
+  }
+
+  /**
+   * Parent that includes a 2-node bash child (a -> b) and reads `$inc.output`.
+   * Expands to: inc__a -> inc__b -> consumer(reads $inc__b.output). `alwaysRunA`
+   * flags the child's entry node so resume re-executes it.
+   */
+  function expandedParentNodes(alwaysRunA = false): DagNode[] {
+    const child = buildWf('inc-child', [
+      { id: 'a', bash: 'echo AAA', ...(alwaysRunA ? { always_run: true } : {}) },
+      { id: 'b', bash: 'echo BBB', depends_on: ['a'] },
+    ]);
+    const parent = buildWf('inc-parent', [
+      { id: 'inc', include: 'inc-child' },
+      { id: 'consumer', bash: 'echo $inc.output', depends_on: ['inc'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['inc-child', child],
+        ['inc-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('inc-parent')!.nodes];
+  }
+
+  function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
+    return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as { event_type: string; step_name: string }
+    );
+  }
+
+  it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('inc-run-id', { workflow_name: 'inc-parent' });
+
+    const terminalOutput = await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-inc',
+      testDir,
+      { name: 'inc-parent', nodes: expandedParentNodes() },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = eventList(mockDeps);
+    const completedStepNames = events
+      .filter(e => e.event_type === 'node_completed')
+      .map(e => e.step_name);
+    // Included nodes surface as ordinary namespaced top-level nodes in the event log.
+    expect(completedStepNames).toContain('inc__a');
+    expect(completedStepNames).toContain('inc__b');
+    expect(completedStepNames).toContain('consumer');
+    // No include node ever reached the executor.
+    expect(events.every(e => e.step_name !== 'inc')).toBe(true);
+
+    // $inc.output was rewritten to the child terminal ($inc__b.output = "BBB"), so the
+    // run's terminal output (consumer, the sole sink) carries it.
+    expect(terminalOutput).toContain('BBB');
+  });
+
+  it('resume skips a completed namespaced node and re-runs the rest', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('inc-resume-id', { workflow_name: 'inc-parent' });
+
+    // Prior run completed the namespaced entry node inc__a.
+    const prior = new Map<string, string>([['inc__a', 'AAA']]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-inc',
+      testDir,
+      { name: 'inc-parent', nodes: expandedParentNodes() },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      prior
+    );
+
+    const events = eventList(mockDeps);
+    // inc__a skipped as prior-success (its namespaced id matched the persisted map).
+    expect(
+      events.some(e => e.event_type === 'node_skipped_prior_success' && e.step_name === 'inc__a')
+    ).toBe(true);
+    // Downstream namespaced node + consumer still executed.
+    const completed = events.filter(e => e.event_type === 'node_completed').map(e => e.step_name);
+    expect(completed).toContain('inc__b');
+    expect(completed).toContain('consumer');
+    expect(completed).not.toContain('inc__a');
+  });
+
+  it('always_run on an included node re-executes it on resume', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('inc-always-id', { workflow_name: 'inc-parent' });
+
+    const prior = new Map<string, string>([['inc__a', 'AAA']]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-inc',
+      testDir,
+      { name: 'inc-parent', nodes: expandedParentNodes(true) },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      prior
+    );
+
+    const events = eventList(mockDeps);
+    // always_run survived inlining: inc__a is force-reset (re-executed), not skipped.
+    expect(
+      events.some(e => e.event_type === 'node_always_run_reset' && e.step_name === 'inc__a')
+    ).toBe(true);
+    expect(
+      events.some(e => e.event_type === 'node_skipped_prior_success' && e.step_name === 'inc__a')
+    ).toBe(false);
+    expect(events.some(e => e.event_type === 'node_completed' && e.step_name === 'inc__a')).toBe(
+      true
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An unexpanded include node must FAIL LOUDLY, never silently skip — the
+// fail-fast guard runs before resume-skip / when / trigger-rule handling.
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- unexpanded include node fail-fast guard', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-inc-guard-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  function events(
+    deps: WorkflowDeps
+  ): Array<{ event_type: string; step_name: string; data: unknown }> {
+    return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as { event_type: string; step_name: string; data: unknown }
+    );
+  }
+
+  it('fails (not skips) an unexpanded include node that matches a prior-completed entry', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('inc-guard-resume', { workflow_name: 'inc-guard' });
+
+    // A raw include node reaching the executor with a resume entry for its own id: the
+    // guard must fire BEFORE the resume-skip check, so it fails instead of being skipped.
+    const includeNode = dagNodeSchema.parse({ id: 'inc', include: 'some-block' });
+    const prior = new Map<string, string>([['inc', 'stale prior output']]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-inc-guard',
+      testDir,
+      { name: 'inc-guard', nodes: [includeNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      prior
+    );
+
+    const evs = events(mockDeps);
+    const failed = evs.find(e => e.event_type === 'node_failed' && e.step_name === 'inc');
+    expect(failed).toBeDefined();
+    expect((failed!.data as { error: string }).error).toContain('reached the executor unexpanded');
+    // Crucially, it was NOT silently skipped as a prior success.
+    expect(evs.some(e => e.event_type === 'node_skipped_prior_success')).toBe(false);
+  });
+
+  it('fails (not skips) an unexpanded include node whose when: would evaluate false', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('inc-guard-when', { workflow_name: 'inc-guard' });
+
+    // `flag` emits NO; the include's when checks == YES (false → would normally skip). The
+    // guard must fire first and fail the node instead.
+    const nodes = [
+      dagNodeSchema.parse({ id: 'flag', bash: 'echo NO' }),
+      dagNodeSchema.parse({
+        id: 'inc',
+        include: 'some-block',
+        depends_on: ['flag'],
+        when: "$flag.output == 'YES'",
+      }),
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-inc-guard',
+      testDir,
+      { name: 'inc-guard', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const evs = events(mockDeps);
+    const failed = evs.find(e => e.event_type === 'node_failed' && e.step_name === 'inc');
+    expect(failed).toBeDefined();
+    expect((failed!.data as { error: string }).error).toContain('reached the executor unexpanded');
+    // It was NOT skipped via the when: gate.
+    expect(evs.some(e => e.event_type === 'node_skipped' && e.step_name === 'inc')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An approval node inside an included block: pause + capture_response + no
+// cross-talk when the same block is included twice.
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- approval node inside an included block', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-inc-approval-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  function buildWf(name: string, nodes: unknown[]): WorkflowDefinition {
+    return { name, description: name, nodes: nodes.map(n => dagNodeSchema.parse(n)) };
+  }
+
+  it('pauses at the namespaced approval id and exposes capture_response via it', async () => {
+    const block = buildWf('apblk', [
+      { id: 'approve', approval: { message: 'Approve this?', capture_response: true } },
+    ]);
+    const parent = buildWf('apparent', [
+      { id: 'setup', bash: 'echo setup' },
+      { id: 'rev', include: 'apblk', depends_on: ['setup'] },
+      // Reads the include's output; the block's sole sink is the approval node, so
+      // $rev.output resolves to the captured response via the namespaced id.
+      { id: 'after', bash: 'echo $rev.output', depends_on: ['rev'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['apblk', block],
+        ['apparent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('apparent')!;
+
+    // capture_response (stored as $<approvalId>.output) is reachable via the namespaced id.
+    const after = expanded.nodes.find(n => n.id === 'after');
+    expect(after && 'bash' in after ? after.bash : '').toBe('echo $rev__approve.output');
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('inc-approval-run', { workflow_name: 'apparent' });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-inc-approval',
+      testDir,
+      { name: 'apparent', nodes: expanded.nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const pauseCalls = (
+      store.pauseWorkflowRun as Mock<(id: string, ctx: Record<string, unknown>) => Promise<void>>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    // The gate pauses under the namespaced approval id, not the bare block id.
+    expect(pauseCalls[0][1]).toMatchObject({
+      type: 'approval',
+      nodeId: 'rev__approve',
+      message: 'Approve this?',
+      captureResponse: true,
+    });
+  });
+
+  it('the same approval block included twice yields distinct namespaced approval ids', () => {
+    const block = buildWf('apblk', [{ id: 'approve', approval: { message: 'Approve?' } }]);
+    const parent = buildWf('apparent', [
+      { id: 'a', include: 'apblk' },
+      { id: 'b', include: 'apblk', depends_on: ['a'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['apblk', block],
+        ['apparent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const ids = workflows.get('apparent')!.nodes.map(n => n.id);
+    // Distinct ApprovalContext.nodeId per inclusion → no cross-talk between the two gates.
+    expect(ids).toContain('a__approve');
+    expect(ids).toContain('b__approve');
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe('containerCommandName', () => {
+  it('returns a bare command unchanged', () => {
+    expect(containerCommandName('bash')).toBe('bash');
+    expect(containerCommandName('bun')).toBe('bun');
+  });
+
+  it('strips a unix directory to the basename', () => {
+    expect(containerCommandName('/usr/local/bin/bash')).toBe('bash');
+  });
+
+  it('strips a Windows path + .exe (container is always Linux)', () => {
+    expect(containerCommandName('C:\\Program Files\\Git\\bin\\bash.exe')).toBe('bash');
+  });
+});
+
+describe('collectContainerIncompatibleProviders', () => {
+  const promptNode = (id: string, provider?: string): DagNode =>
+    ({ id, prompt: `do ${id}`, ...(provider ? { provider } : {}) }) as unknown as DagNode;
+  const bashNode = (id: string): DagNode => ({ id, bash: 'echo hi' }) as unknown as DagNode;
+
+  it('is empty when all AI nodes resolve to claude (containerExec: true)', () => {
+    const nodes = [promptNode('a'), promptNode('b', 'claude'), bashNode('c')];
+    const bad = collectContainerIncompatibleProviders(nodes, 'claude');
+    expect([...bad]).toEqual([]);
+  });
+
+  it('flags a node whose provider lacks containerExec (codex)', () => {
+    const nodes = [promptNode('a'), promptNode('b', 'codex')];
+    const bad = collectContainerIncompatibleProviders(nodes, 'claude');
+    expect([...bad]).toEqual(['codex']);
+  });
+
+  it('flags the workflow-level provider when a node does not override it', () => {
+    const nodes = [promptNode('a')];
+    const bad = collectContainerIncompatibleProviders(nodes, 'codex');
+    expect([...bad]).toEqual(['codex']);
+  });
+
+  it('ignores bash/script nodes (deterministic, no provider)', () => {
+    const nodes = [bashNode('a'), bashNode('b')];
+    const bad = collectContainerIncompatibleProviders(nodes, 'codex');
+    expect([...bad]).toEqual([]);
+  });
+
+  it('recurses loop_group bodies', () => {
+    const group = {
+      id: 'g',
+      loop_group: { max_iterations: 2, nodes: [promptNode('inner', 'codex')] },
+    } as unknown as DagNode;
+    const bad = collectContainerIncompatibleProviders([group], 'claude');
+    expect([...bad]).toEqual(['codex']);
+  });
+});
+
+describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
+  const CTX = { kind: 'container' as const, containerId: 'cid-9' };
+
+  it('delivers the Archon-managed env via -e flags only and runs at the same cwd', () => {
+    const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'echo hi'], {
+      cwd: '/tmp/ops-client',
+      env: { ARTIFACTS_DIR: '/a', ANTHROPIC_API_KEY: 'sk', BASE_BRANCH: 'main' },
+    });
+    expect(args.slice(0, 2)).toEqual(['exec', '-w']);
+    expect(args[2]).toBe('/tmp/ops-client');
+    // Every managed var is delivered as an explicit -e flag.
+    expect(args).toContain('-e');
+    expect(args).toContain('ARTIFACTS_DIR=/a');
+    expect(args).toContain('ANTHROPIC_API_KEY=sk');
+    expect(args).toContain('BASE_BRANCH=main');
+    // Container id, then the normalized command, then the node args.
+    const cidIdx = args.indexOf('cid-9');
+    expect(cidIdx).toBeGreaterThan(-1);
+    expect(args[cidIdx + 1]).toBe('bash');
+    expect(args.slice(cidIdx + 2)).toEqual(['-c', 'echo hi']);
+  });
+
+  it('does NOT leak host process.env (only the passed env bag is forwarded)', () => {
+    const canary = 'ARCHON_DAGEXEC_CANARY';
+    process.env[canary] = 'leaked';
+    try {
+      const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'true'], {
+        cwd: '/w',
+        env: { ONLY_THIS: '1' },
+      });
+      const joined = args.join(' ');
+      expect(joined).toContain('ONLY_THIS=1');
+      expect(joined).not.toContain(canary);
+    } finally {
+      delete process.env[canary];
+    }
+  });
+
+  it('normalizes a host bash path to the in-container binary name', () => {
+    const args = buildSubprocessDockerArgs(CTX, '/usr/local/bin/bash', ['-c', 'x'], {
+      cwd: '/w',
+      env: {},
+    });
+    const cidIdx = args.indexOf('cid-9');
+    expect(args[cidIdx + 1]).toBe('bash');
+  });
+
+  it('never forwards denylisted keys (PATH/HOME) — a project env var must not clobber resolution', () => {
+    const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'true'], {
+      cwd: '/w',
+      env: { PATH: '/evil/bin', HOME: '/evil', PWD: '/x', KEEP: '1' },
+    });
+    const joined = args.join(' ');
+    expect(joined).not.toContain('PATH=/evil/bin');
+    expect(joined).not.toContain('HOME=/evil');
+    expect(joined).not.toContain('PWD=/x');
+    expect(joined).toContain('KEEP=1'); // non-denylisted keys still forwarded
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Container write-back gate + suspend-on-pause (Phase C)
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- container write-back gate', () => {
+  const CONTAINER_EXEC = { kind: 'container' as const, containerId: 'cid-1' };
+  const wbTestDir = join(tmpdir(), `dag-wb-test-${Date.now()}`);
+
+  function makeWritebackBackend(over?: Partial<Record<string, unknown>>) {
+    return {
+      suspend: mock(async () => undefined),
+      finalize: mock(async () => ({ requiresApproval: false as boolean })),
+      applyChanges: mock(async () => ({
+        filesApplied: 0,
+        filesDeleted: 0,
+        warnings: [] as string[],
+      })),
+      discardChanges: mock(async () => undefined),
+      ...over,
+    };
+  }
+
+  /** Run a single pre-completed bash node under a container context so the gate runs. */
+  async function runGate(opts: {
+    backend: ReturnType<typeof makeWritebackBackend>;
+    writeBack?: 'approve' | 'auto';
+    runMetadata?: Record<string, unknown>;
+    status?: 'running' | 'paused';
+    claimed?: boolean;
+  }): Promise<IWorkflowStore> {
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(() => Promise.resolve(opts.status ?? ('running' as const)));
+    store.getWorkflowRun = mock(() =>
+      Promise.resolve(makeWorkflowRun('wb-run', { metadata: opts.runMetadata ?? {} }))
+    );
+    store.claimWriteback = mock(() => Promise.resolve({ claimed: opts.claimed ?? true }));
+    const deps = createMockDeps(store);
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-wb',
+      wbTestDir,
+      { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+      makeWorkflowRun('wb-run'),
+      'claude',
+      undefined,
+      join(wbTestDir, 'artifacts'),
+      join(wbTestDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map([['a', 'out']]), // pre-completed → node skipped, DAG reaches the gate
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      CONTAINER_EXEC,
+      { envId: 'env-x', writeBack: opts.writeBack ?? 'approve', backend: opts.backend }
+    );
+    return store;
+  }
+
+  it('empty diff → completes normally, no pause', async () => {
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({ requiresApproval: false })),
+    });
+    const store = await runGate({ backend });
+    expect(backend.finalize).toHaveBeenCalledTimes(1);
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(store.pauseWorkflowRun).not.toHaveBeenCalled();
+    expect(backend.suspend).not.toHaveBeenCalled();
+  });
+
+  it('non-empty diff + approve policy → pauses (writeback) + suspends, does NOT complete', async () => {
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({
+        requiresApproval: true,
+        changeSummary: {
+          added: ['x.md'],
+          modified: [],
+          deleted: [],
+          symlinks: [],
+          skipped: [],
+          totalCount: 1,
+          truncated: false,
+        },
+      })),
+    });
+    const store = await runGate({ backend });
+    expect(store.pauseWorkflowRun).toHaveBeenCalledTimes(1);
+    const pauseCall = (store.pauseWorkflowRun as ReturnType<typeof mock>).mock.calls[0];
+    const pauseArg = pauseCall[1] as { nodeId: string; type: string };
+    expect(pauseArg.nodeId).toBe('__writeback__');
+    expect(pauseArg.type).toBe('writeback');
+    // pending_writeback is folded into the SAME pause write (M3), not a 2nd update.
+    const extraMeta = pauseCall[2] as { pending_writeback?: { envId: string } };
+    expect(extraMeta.pending_writeback?.envId).toBe('env-x');
+    expect(backend.suspend).toHaveBeenCalledTimes(1);
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('non-empty diff + auto policy → applies without pausing, then completes', async () => {
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({
+        requiresApproval: true,
+        changeSummary: {
+          added: ['x.md'],
+          modified: [],
+          deleted: [],
+          symlinks: [],
+          skipped: [],
+          totalCount: 1,
+          truncated: false,
+        },
+      })),
+      applyChanges: mock(async () => ({ filesApplied: 1, filesDeleted: 0, warnings: [] })),
+    });
+    const store = await runGate({ backend, writeBack: 'auto' });
+    expect(backend.applyChanges).toHaveBeenCalledTimes(1);
+    expect(store.pauseWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  // Helper: a writeback approval context resolved to a given decision.
+  const wbApproval = (resolved: 'approved' | 'rejected' | null) => ({
+    nodeId: '__writeback__',
+    message: 'review',
+    type: 'writeback' as const,
+    resolved,
+  });
+
+  it('resume after approve → CLAIMS then applies overlay, marks resolved, completes', async () => {
+    const backend = makeWritebackBackend({
+      applyChanges: mock(async () => ({ filesApplied: 3, filesDeleted: 1, warnings: [] })),
+    });
+    const store = await runGate({
+      backend,
+      runMetadata: { pending_writeback: { envId: 'env-x' }, approval: wbApproval('approved') },
+    });
+    // R2-F4: the apply is claimed BEFORE the live root is mutated.
+    expect(store.claimWriteback).toHaveBeenCalledTimes(1);
+    expect(backend.applyChanges).toHaveBeenCalledTimes(1);
+    expect(backend.finalize).not.toHaveBeenCalled(); // resume path skips re-inspection
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  // R2-F4 — a lost claim (concurrent/prior resume owns the apply, or a crash left it
+  // claimed after a successful apply) must NOT re-apply; complete as applied.
+  it('resume after approve with a LOST claim does NOT re-apply', async () => {
+    const backend = makeWritebackBackend();
+    const store = await runGate({
+      backend,
+      claimed: false,
+      runMetadata: { pending_writeback: { envId: 'env-x' }, approval: wbApproval('approved') },
+    });
+    expect(store.claimWriteback).toHaveBeenCalledTimes(1);
+    expect(backend.applyChanges).not.toHaveBeenCalled(); // no double-apply
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  // R2-F4 — a failed apply RELEASES the claim (so `workflow resume` can retry) and
+  // propagates the error (run fails → volume preserved by H2).
+  it('resume after approve with a FAILED apply releases the claim and rethrows', async () => {
+    const backend = makeWritebackBackend({
+      applyChanges: mock(async () => {
+        throw new Error('cp: No space left on device');
+      }),
+    });
+    // executeDagWorkflow lets the apply error propagate; the outer executor marks the
+    // run failed. Assert release was called and the error surfaced.
+    let threw = false;
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(() => Promise.resolve('running' as const));
+    store.getWorkflowRun = mock(() =>
+      Promise.resolve(
+        makeWorkflowRun('wb-run', {
+          metadata: { pending_writeback: { envId: 'env-x' }, approval: wbApproval('approved') },
+        })
+      )
+    );
+    store.claimWriteback = mock(() => Promise.resolve({ claimed: true }));
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-wb',
+        wbTestDir,
+        { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+        makeWorkflowRun('wb-run'),
+        'claude',
+        undefined,
+        join(wbTestDir, 'artifacts'),
+        join(wbTestDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map([['a', 'out']]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        CONTAINER_EXEC,
+        { envId: 'env-x', writeBack: 'approve', backend }
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(store.releaseWritebackClaim).toHaveBeenCalledTimes(1);
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  // A stateful store that accumulates metadata from updateWorkflowRun / pauseWorkflowRun,
+  // so an apply-throw test can inspect the FINAL run metadata — the exact input the CLI
+  // teardown's `hasUnresolvedWriteback` reads to decide preserve-vs-destroy.
+  function statefulGateStore(initialMeta: Record<string, unknown>): {
+    store: IWorkflowStore;
+    metadata: Record<string, unknown>;
+  } {
+    const metadata: Record<string, unknown> = { ...initialMeta };
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(() => Promise.resolve('running' as const));
+    store.getWorkflowRun = mock(() => Promise.resolve(makeWorkflowRun('wb-run', { metadata })));
+    store.claimWriteback = mock(() => Promise.resolve({ claimed: true }));
+    store.updateWorkflowRun = mock(
+      (_id: string, updates: { metadata?: Record<string, unknown> }) => {
+        for (const [k, v] of Object.entries(updates.metadata ?? {})) {
+          if (v === null) delete metadata[k];
+          else metadata[k] = v;
+        }
+        return Promise.resolve();
+      }
+    );
+    return { store, metadata };
+  }
+
+  /** The predicate the CLI teardown uses to PRESERVE the volume (mirror of hasUnresolvedWriteback). */
+  const wouldPreserve = (m: Record<string, unknown>): boolean =>
+    m.pending_writeback !== undefined && m.writeback_resolved !== true;
+
+  async function runGateWithStore(
+    store: IWorkflowStore,
+    backend: ReturnType<typeof makeWritebackBackend>,
+    writeBack: 'approve' | 'auto'
+  ): Promise<void> {
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wb',
+      wbTestDir,
+      { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+      makeWorkflowRun('wb-run'),
+      'claude',
+      undefined,
+      join(wbTestDir, 'artifacts'),
+      join(wbTestDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map([['a', 'out']]),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      CONTAINER_EXEC,
+      { envId: 'env-x', writeBack, backend }
+    );
+  }
+
+  // N1/item-2 — an apply-throw in APPROVE mode leaves the run with pending_writeback set
+  // and unresolved, so the teardown PRESERVES the volume (never destroy the only copy).
+  it('apply-throw in approve mode leaves an unresolved write-back (teardown preserves)', async () => {
+    const { store, metadata } = statefulGateStore({
+      pending_writeback: { envId: 'env-x' },
+      approval: wbApproval('approved'),
+    });
+    const backend = makeWritebackBackend({
+      applyChanges: mock(async () => {
+        throw new Error('cp: read-only file system');
+      }),
+    });
+    await expect(runGateWithStore(store, backend, 'approve')).rejects.toThrow(/read-only/);
+    expect(wouldPreserve(metadata)).toBe(true);
+  });
+
+  // N1 — an apply-throw in AUTO mode must ALSO leave pending_writeback set (auto sets the
+  // preserve marker BEFORE mutating the live root), so the teardown preserves the volume.
+  it('apply-throw in auto mode sets the preserve marker (teardown preserves)', async () => {
+    const { store, metadata } = statefulGateStore({}); // fresh: no pending_writeback yet
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({
+        requiresApproval: true,
+        changeSummary: {
+          added: ['x.md'],
+          modified: [],
+          deleted: [],
+          symlinks: [],
+          skipped: [],
+          totalCount: 1,
+          truncated: false,
+        },
+      })),
+      applyChanges: mock(async () => {
+        throw new Error('cp: read-only file system');
+      }),
+    });
+    await expect(runGateWithStore(store, backend, 'auto')).rejects.toThrow(/read-only/);
+    expect(metadata.pending_writeback).toBeDefined(); // marker set before the throw
+    expect(wouldPreserve(metadata)).toBe(true);
+  });
+
+  it('resume after reject → discards overlay (live root untouched), completes', async () => {
+    const backend = makeWritebackBackend();
+    const store = await runGate({
+      backend,
+      runMetadata: { pending_writeback: { envId: 'env-x' }, approval: wbApproval('rejected') },
+    });
+    expect(backend.discardChanges).toHaveBeenCalledTimes(1);
+    expect(backend.applyChanges).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  // H1 — FAIL CLOSED. A bare `/workflow resume` (no decision) reaches the still-open
+  // gate: it must RE-PAUSE, never apply.
+  it('resume with an UNRESOLVED gate re-pauses (fail closed), does NOT apply', async () => {
+    const backend = makeWritebackBackend();
+    const store = await runGate({
+      backend,
+      runMetadata: {
+        pending_writeback: {
+          envId: 'env-x',
+          summary: {
+            added: ['x'],
+            modified: [],
+            deleted: [],
+            symlinks: [],
+            skipped: [],
+            totalCount: 1,
+            truncated: false,
+          },
+        },
+        approval: wbApproval(null), // gate raised but not yet decided
+      },
+    });
+    expect(backend.applyChanges).not.toHaveBeenCalled();
+    expect(backend.discardChanges).not.toHaveBeenCalled();
+    expect(store.pauseWorkflowRun).toHaveBeenCalledTimes(1); // re-raised
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  // H1 — a STALE run-wide approval_response from an earlier mid-DAG approval node must
+  // NOT auto-apply the write-back gate; only the gate's own approval.resolved counts.
+  it('stale top-level approval_response does NOT apply the write-back overlay', async () => {
+    const backend = makeWritebackBackend();
+    const store = await runGate({
+      backend,
+      runMetadata: {
+        pending_writeback: {
+          envId: 'env-x',
+          summary: {
+            added: ['x'],
+            modified: [],
+            deleted: [],
+            symlinks: [],
+            skipped: [],
+            totalCount: 1,
+            truncated: false,
+          },
+        },
+        approval: wbApproval(null),
+        approval_response: 'approved', // stale from a prior gate — must be ignored
+      },
+    });
+    expect(backend.applyChanges).not.toHaveBeenCalled();
+    expect(store.pauseWorkflowRun).toHaveBeenCalledTimes(1); // re-raised, not applied
+  });
+
+  it('mid-DAG pause suspends the container instead of completing', async () => {
+    const backend = makeWritebackBackend();
+    const store = await runGate({ backend, status: 'paused' });
+    // A node paused the run → suspend fires right after the layer walk; the gate
+    // + completion are never reached.
+    expect(backend.suspend).toHaveBeenCalledTimes(1);
+    expect(backend.finalize).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('a docker-stop failure during suspend does NOT flip the paused run to failed', async () => {
+    const backend = makeWritebackBackend({
+      suspend: mock(async () => {
+        throw new Error('Cannot connect to the Docker daemon');
+      }),
+    });
+    // status 'paused' → the mid-DAG suspend path runs; a suspend throw is best-effort.
+    const store = await runGate({ backend, status: 'paused' });
+    expect(backend.suspend).toHaveBeenCalledTimes(1);
+    // The run stays paused — suspend failure must not mark it failed or complete it.
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-pause-race-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  /** Store whose pauseWorkflowRun loses the CAS: the run was externally
+   *  transitioned (e.g. a killed CLI's signal cleanup marked it failed) in the
+   *  window between gate raise and pause commit. getWorkflowRunStatus reports
+   *  'running' until the pause attempt, then the external 'failed'. */
+  function createExternallyFailedStore(): IWorkflowStore {
+    const store = createMockStore();
+    let pauseAttempted = false;
+    store.pauseWorkflowRun = mock(() => {
+      pauseAttempted = true;
+      return Promise.reject(
+        new Error('Workflow run not found or not in running state (id: dag-test-run-id)')
+      );
+    });
+    store.getWorkflowRunStatus = mock(() =>
+      Promise.resolve(pauseAttempted ? ('failed' as const) : ('running' as const))
+    );
+    return store;
+  }
+
+  it('approval gate that loses the pause CAS to an external transition halts cleanly', async () => {
+    const store = createExternallyFailedStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const emitted: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe((event: WorkflowEmitterEvent) => {
+      if ('runId' in event && event.runId === workflowRun.id) emitted.push(event.type);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-pause-race',
+        testDir,
+        {
+          name: 'pause-race-approval',
+          nodes: [{ id: 'review', approval: { message: 'Approve this plan?' } }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    // The gate never actually paused — no approval_pending signal to live UIs.
+    expect(emitted).not.toContain('approval_pending');
+
+    // The lost CAS must NOT cascade into a node failure or any terminal write —
+    // the external transition owns the run's final state.
+    const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) => (c[0] as { event_type: string }).event_type
+    );
+    expect(events).not.toContain('node_failed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('interactive loop gate that loses the pause CAS halts cleanly', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Here is the plan. Please review.' };
+      yield { type: 'result', sessionId: 'loop-session-race' };
+    });
+
+    const store = createExternallyFailedStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const emitted: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe((event: WorkflowEmitterEvent) => {
+      if ('runId' in event && event.runId === workflowRun.id) emitted.push(event.type);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-pause-race-loop',
+        testDir,
+        {
+          name: 'pause-race-loop',
+          nodes: [
+            {
+              id: 'refine',
+              loop: {
+                prompt: 'User said: $LOOP_USER_INPUT. Refine the plan.',
+                until: 'APPROVED',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review the plan and provide feedback.',
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    expect(emitted).not.toContain('approval_pending');
+    const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) => (c[0] as { event_type: string }).event_type
+    );
+    expect(events).not.toContain('node_failed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('gate pause failure with the run still running stays a genuine node failure', async () => {
+    const store = createMockStore();
+    // Pause fails but the run is still 'running' (default mock) — a real store
+    // failure, not an external transition. Legacy behavior must hold: the node
+    // fails and the run is marked failed.
+    store.pauseWorkflowRun = mock(() => Promise.reject(new Error('database connection lost')));
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-pause-genuine-failure',
+      testDir,
+      {
+        name: 'pause-genuine-failure',
+        nodes: [{ id: 'review', approval: { message: 'Approve this plan?' } }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = (store.createWorkflowEvent as Mock<() => Promise<void>>).mock.calls.map(
+      (c: unknown[]) => (c[0] as { event_type: string }).event_type
+    );
+    expect(events).toContain('node_failed');
+    expect(store.failWorkflowRun).toHaveBeenCalled();
   });
 });

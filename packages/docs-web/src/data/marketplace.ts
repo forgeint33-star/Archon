@@ -132,6 +132,17 @@ export const marketplaceEntries: MarketplaceEntry[] = [
     archonVersionCompat: '>=0.3.0',
   },
   {
+    slug: 'archon-resolve-mr-conflicts',
+    name: 'Resolve GitLab MR Conflicts',
+    author: 'lraphael',
+    description:
+      'GitLab counterpart to archon-resolve-conflicts. Rebases an MR onto its target branch, auto-resolves simple conflicts (additions, imports, formatting, dependency-list merges), presents options for complex conflicts, validates the resolution (ruff/pytest/tsc/go), and force-pushes with --force-with-lease.',
+    sourceUrl:
+      'https://github.com/lraphael/archon-gitlab-workflows/tree/6e39b359e1b02329ebf63f7d1699e6bbc8cb001f/archon-resolve-mr-conflicts',
+    sha: '6e39b359e1b02329ebf63f7d1699e6bbc8cb001f',
+    tags: ['automation'],
+    archonVersionCompat: '>=0.3.0',
+  },
     slug: 'archon-comprehensive-mr-review',
     name: 'Comprehensive GitLab MR Review',
     author: 'lraphael',
@@ -177,6 +188,30 @@ export const marketplaceEntries: MarketplaceEntry[] = [
       'https://github.com/seanrobertwright/archon-pocock-workflow/tree/629e57716ea72bb8cf2f77fc7728d3845aa2cf92/.archon',
     sha: '629e57716ea72bb8cf2f77fc7728d3845aa2cf92',
     tags: ['development', 'planning', 'review', 'automation'],
+    archonVersionCompat: '>=0.5.0',
+  },
+  {
+    slug: 'token-max-site-factory',
+    name: 'Token-Max Site Factory',
+    author: 'TheSmokeDev',
+    description:
+      'Point-and-shoot programmatic SEO/GEO page factory. Scan any website, then expand it into hundreds of validated 2,800+ word answer-first pages with hard uniqueness gates and packet-only facts. Never deploys - generation ends at a validation report.',
+    sourceUrl:
+      'https://github.com/TheSmokeDev/token-max-site-factory/tree/d01735a1e731ff00400621d0110d112488eaa68d/marketplace/token-max-site-factory',
+    sha: 'd01735a1e731ff00400621d0110d112488eaa68d',
+    tags: ['automation', 'development'],
+    archonVersionCompat: '>=0.5.0',
+  },
+  {
+    slug: 'image-node-factory',
+    name: 'Image Node Factory',
+    author: 'TheSmokeDev',
+    description:
+      'One visual brief in, a grounded image prompt pack out (optional Codex-rendered bitmaps). Template selection cites a pinned, checksum-verified 511-case style corpus; a deterministic validator fails the run on any citation that does not resolve. Renders are opt-in and every concept ships baked and overlay variants.',
+    sourceUrl:
+      'https://github.com/TheSmokeDev/image-node-factory/tree/da7af16e3a3ba6fca7b58dd7a596dad24689a3f6/marketplace/image-node-factory',
+    sha: 'da7af16e3a3ba6fca7b58dd7a596dad24689a3f6',
+    tags: ['automation', 'development'],
     archonVersionCompat: '>=0.5.0',
   },
 ];

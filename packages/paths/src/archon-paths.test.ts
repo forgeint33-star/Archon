@@ -1,13 +1,15 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { mkdir, rm, writeFile, lstat, readlink, symlink as fsSymlink } from 'fs/promises';
 
 const isWindows = process.platform === 'win32';
 
 import {
   isDocker,
+  isWSL,
+  getWSLDistroName,
   getArchonHome,
   getArchonWorkspacesPath,
   ensureArchonWorkspacesPath,
@@ -27,6 +29,7 @@ import {
   logArchonPaths,
   validateAppDefaultsPaths,
   parseOwnerRepo,
+  resolveRepoProjectIdentity,
   getProjectRoot,
   getProjectSourcePath,
   getProjectWorktreesPath,
@@ -48,7 +51,14 @@ import {
 } from './archon-paths';
 
 /** All env vars that path functions depend on */
-const ENV_VARS = ['WORKSPACE_PATH', 'WORKTREE_BASE', 'ARCHON_HOME', 'ARCHON_DOCKER', 'HOME'];
+const ENV_VARS = [
+  'WORKSPACE_PATH',
+  'WORKTREE_BASE',
+  'ARCHON_HOME',
+  'ARCHON_DOCKER',
+  'HOME',
+  'WSL_DISTRO_NAME',
+];
 
 /**
  * Save and restore environment variables around each test.
@@ -84,6 +94,47 @@ describe('archon-paths', () => {
 
     test('returns path unchanged if no tilde', () => {
       expect(expandTilde('/absolute/path')).toBe('/absolute/path');
+    });
+  });
+
+  describe('isWSL', () => {
+    test('returns true when WSL_DISTRO_NAME is set', () => {
+      process.env.WSL_DISTRO_NAME = 'Ubuntu';
+      expect(isWSL()).toBe(true);
+    });
+
+    test('falls back to /proc/sys/kernel/osrelease when WSL_DISTRO_NAME is unset', () => {
+      delete process.env.WSL_DISTRO_NAME;
+      // Derive the expectation from the same source as the implementation:
+      // real Linux CI → no "microsoft" → false; WSL2 host → "microsoft" → true.
+      let expected = false;
+      try {
+        expected = readFileSync('/proc/sys/kernel/osrelease', 'utf8')
+          .toLowerCase()
+          .includes('microsoft');
+      } catch {
+        expected = false;
+      }
+      expect(isWSL()).toBe(expected);
+    });
+  });
+
+  describe('getWSLDistroName', () => {
+    test('returns the WSL_DISTRO_NAME env var when set', () => {
+      process.env.WSL_DISTRO_NAME = 'Debian';
+      expect(getWSLDistroName()).toBe('Debian');
+    });
+
+    test('returns undefined when WSL_DISTRO_NAME is unset', () => {
+      delete process.env.WSL_DISTRO_NAME;
+      expect(getWSLDistroName()).toBeUndefined();
+    });
+
+    test('returns the empty string when WSL_DISTRO_NAME is set but empty', () => {
+      // Pins current behaviour: '' passes through (callers filter falsy values),
+      // so a future `|| undefined` refactor would change observable behaviour.
+      process.env.WSL_DISTRO_NAME = '';
+      expect(getWSLDistroName()).toBe('');
     });
   });
 
@@ -429,6 +480,47 @@ describe('archon-paths', () => {
     test('rejects names with special characters', () => {
       expect(parseOwnerRepo('acme/repo;rm -rf')).toBeNull();
       expect(parseOwnerRepo('acme/$HOME')).toBeNull();
+    });
+  });
+
+  describe('resolveRepoProjectIdentity', () => {
+    test('returns parsed owner/repo for an owner/repo name', () => {
+      expect(resolveRepoProjectIdentity('acme/widget', '/repos/widget')).toEqual({
+        owner: 'acme',
+        repo: 'widget',
+      });
+    });
+
+    test('scopes a no-remote bare name under _local/<basename(cwd)>', () => {
+      expect(resolveRepoProjectIdentity('workspace', '/home/username/workspace')).toEqual({
+        owner: '_local',
+        repo: 'workspace',
+      });
+    });
+
+    test('derives the repo segment from cwd, not the name', () => {
+      // Name and directory basename can differ; the on-disk tree registration
+      // creates is keyed off the directory basename.
+      expect(resolveRepoProjectIdentity('some-name', '/srv/projects/checkout')).toEqual({
+        owner: '_local',
+        repo: 'checkout',
+      });
+    });
+
+    test('preserves a basename registration would have used verbatim (spaces allowed)', () => {
+      expect(resolveRepoProjectIdentity('my app', '/home/u/my app')).toEqual({
+        owner: '_local',
+        repo: 'my app',
+      });
+    });
+
+    test('returns null for a dotdot basename (no path escape)', () => {
+      expect(resolveRepoProjectIdentity('workspace', '/home/u/..')).toBeNull();
+    });
+
+    test('returns null for a dot or empty basename', () => {
+      expect(resolveRepoProjectIdentity('workspace', '/home/u/.')).toBeNull();
+      expect(resolveRepoProjectIdentity('workspace', '/')).toBeNull();
     });
   });
 
