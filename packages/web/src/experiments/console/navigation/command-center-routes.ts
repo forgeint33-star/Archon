@@ -54,6 +54,7 @@ import {
   PlugZap,
   Rocket,
   ScrollText,
+  Send,
   Server,
   Settings2,
   ShieldCheck,
@@ -1002,6 +1003,12 @@ export const NAVIGATION: readonly NavigationGroup[] = [
     labels: { en: 'Production', el: 'Παραγωγή' },
     icon: Boxes,
     destinations: [
+      {
+        id: 'submit-run',
+        labels: { en: 'Submit a run', el: 'Υποβολή εκτέλεσης' },
+        icon: Send,
+        binding: mapped('/submit'),
+      },
       {
         id: 'production-board',
         labels: { en: 'Production Board', el: 'Πίνακας Παραγωγής' },
