@@ -366,8 +366,8 @@ describe('group badges report coverage, never a health metric', () => {
     }
   });
 
-  test('overall coverage is 33 of 34 after reconciliation', () => {
-    expect(coverage()).toEqual({ mapped: 33, unmapped: 1, total: 34 });
+  test('overall coverage is 35 of 36 after reconciliation', () => {
+    expect(coverage()).toEqual({ mapped: 35, unmapped: 1, total: 36 });
   });
 
   test('a fully mapped group reports no gap', () => {

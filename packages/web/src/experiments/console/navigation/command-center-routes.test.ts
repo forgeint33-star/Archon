@@ -70,8 +70,9 @@ describe('manifest provenance', () => {
     // as a `related` entry rather than a destination of their own, and
     // Archon's own destinations answer to no manifest. It requires only
     // that nothing published as navigable is reachable by neither path.
-    if (!present) {
-      expect(present).toBe(false); // skipped by absence
+    const manifestPresent = existsSync(MANIFEST_PATH);
+    if (!manifestPresent) {
+      expect(manifestPresent).toBe(false); // skipped by absence
       return;
     }
 
@@ -260,8 +261,15 @@ const EXPECTED_GROUPS = [
 
 const EXPECTED_DESTINATIONS: Record<string, string[]> = {
   home: ['overview', 'today', 'notifications'],
-  agency: ['clients', 'crm-leads', 'projects', 'team'],
-  production: ['production-board', 'workflows', 'deliverables', 'assets', 'revisions'],
+  agency: ['clients', 'crm-leads', 'communications', 'projects', 'team'],
+  production: [
+    'submit-run',
+    'production-board',
+    'workflows',
+    'deliverables',
+    'assets',
+    'revisions',
+  ],
   'ai-workforce': ['agents', 'models', 'skills', 'tools', 'live-runs'],
   governance: ['approvals', 'quality-gates', 'audit-trail', 'quarantine'],
   integrations: [
@@ -287,8 +295,10 @@ const EXPECTED_BINDINGS: Record<string, string> = {
   notifications: '/notifications',
   clients: '/clients',
   'crm-leads': '/crm',
+  communications: '/communications',
   projects: '/projects',
   team: '/team',
+  'submit-run': '/submit',
   'production-board': '/production',
   workflows: '/workflows',
   deliverables: '/deliverables',
@@ -322,11 +332,11 @@ describe('navigation taxonomy', () => {
     expect(NAVIGATION.map(g => g.id)).toEqual(EXPECTED_GROUPS);
   });
 
-  test('has the owner-specified 34 destinations in order', () => {
+  test('has the owner-specified 36 destinations in order', () => {
     for (const group of NAVIGATION) {
       expect(group.destinations.map(d => d.id)).toEqual(EXPECTED_DESTINATIONS[group.id]);
     }
-    expect(allDestinations()).toHaveLength(34);
+    expect(allDestinations()).toHaveLength(36);
   });
 
   test('destination ids are globally unique', () => {
@@ -364,10 +374,10 @@ describe('binding contract', () => {
     expect(actual).toEqual(EXPECTED_BINDINGS);
   });
 
-  test('33 of 34 destinations are mapped after reconciliation', () => {
+  test('35 of 36 destinations are mapped after reconciliation', () => {
     const mapped = allDestinations().filter(d => d.binding.kind === 'mapped');
-    expect(mapped).toHaveLength(33);
-    expect(allDestinations()).toHaveLength(34);
+    expect(mapped).toHaveLength(35);
+    expect(allDestinations()).toHaveLength(36);
   });
 
   test('all 18 formerly-missing destinations are now bound', () => {
