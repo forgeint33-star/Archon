@@ -110,7 +110,7 @@ describe('links are feature-flagged on the health probe', () => {
 
   test('exactly the mapped destinations become actionable when it is available', () => {
     const actionable = allDestinations().filter(d => isActionable(itemState(d, AVAILABLE)));
-    expect(actionable).toHaveLength(34);
+    expect(actionable).toHaveLength(35);
   });
 });
 
@@ -418,7 +418,7 @@ describe('search', () => {
   });
 
   test('an empty query returns every destination', () => {
-    expect(searchDestinations('', 'en', AVAILABLE)).toHaveLength(35);
+    expect(searchDestinations('', 'en', AVAILABLE)).toHaveLength(36);
   });
 
   test('exact matches rank above prefix, substring and subsequence', () => {

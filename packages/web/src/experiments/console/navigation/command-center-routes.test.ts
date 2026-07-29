@@ -57,6 +57,52 @@ describe('manifest provenance', () => {
   test('carries the manifest-declared non-production exclusion', () => {
     expect(EXCLUDED_NON_PRODUCTION).toEqual(['/console/_nav-preview']);
   });
+
+  test('every navigable published route is reachable from the menu', () => {
+    // The gap this closes: the byte-for-byte check above guards
+    // COMMAND_CENTER_ROUTES, the transcription. The menu is built from
+    // NAVIGATION, which is curated by hand and had no test against the
+    // manifest at all — so `/submit`, the form that starts a run, was
+    // absent from the console and every test stayed green.
+    //
+    // This does not require NAVIGATION to mirror the manifest. The
+    // eight-group taxonomy regroups deliberately, some routes are reached
+    // as a `related` entry rather than a destination of their own, and
+    // Archon's own destinations answer to no manifest. It requires only
+    // that nothing published as navigable is reachable by neither path.
+    if (!present) {
+      expect(present).toBe(false); // skipped by absence
+      return;
+    }
+
+    const published = JSON.parse(readFileSync(MANIFEST_PATH).toString('utf8')) as {
+      routes: {
+        path: string;
+        params: string[];
+        inNav: boolean;
+        modal: boolean;
+      }[];
+    };
+
+    const reachable = new Set<string>();
+    for (const group of NAVIGATION) {
+      for (const destination of group.destinations) {
+        if (destination.binding.kind === 'mapped') {
+          reachable.add(destination.binding.route);
+        }
+        for (const path of destination.related ?? []) {
+          reachable.add(path);
+        }
+      }
+    }
+
+    const unreachable = published.routes
+      .filter(r => r.inNav && r.params.length === 0 && !r.modal)
+      .map(r => r.path)
+      .filter(path => !reachable.has(path));
+
+    expect(unreachable).toEqual([]);
+  });
 });
 
 // ─── Drift detection against the published manifest ─────────────────────────

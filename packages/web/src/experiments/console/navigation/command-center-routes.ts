@@ -50,6 +50,7 @@ import {
   LayoutDashboard,
   Link2,
   ListChecks,
+  MessagesSquare,
   Plug,
   PlugZap,
   Rocket,
@@ -934,7 +935,7 @@ const unmapped = (reason: string): Binding => ({ kind: 'unmapped', reason });
 /**
  * The owner's eight-group taxonomy, reconciled against manifest 1.0.0.
  *
- * 33 of 34 destinations now bind to a published route. The single exception is
+ * 35 of 36 destinations now bind to a published route. The single exception is
  * the Integrations "Failed / Disabled" filter: the manifest validates exactly
  * two `state` values, `connected` and `login-required`, and inventing a third
  * would assert a filter the Command Center does not implement.
@@ -982,6 +983,12 @@ export const NAVIGATION: readonly NavigationGroup[] = [
         labels: { en: 'CRM & Leads', el: 'CRM & Υποψήφιοι' },
         icon: TrendingUp,
         binding: mapped('/crm'),
+      },
+      {
+        id: 'communications',
+        labels: { en: 'Communications', el: 'Επικοινωνίες' },
+        icon: MessagesSquare,
+        binding: mapped('/communications'),
       },
       {
         id: 'projects',
