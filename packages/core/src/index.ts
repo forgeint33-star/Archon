@@ -265,3 +265,49 @@ export { getPort } from './utils/port-allocation';
 
 // Worktree sync
 export { syncArchonToWorktree } from './utils/worktree-sync';
+
+// Bounded canary execution mode (opt-in; disabled by default — see canary/index.ts)
+export {
+  CANARY_CONTRACT_VERSION,
+  CanaryRefusedError,
+  MODEL_BOUNDS,
+  admitCanaryRequest,
+  buildBoundedOptions,
+  canaryReceiptSchema,
+  canaryRequestSchema,
+  canaryReservationSchema,
+  canaryTerminalReasonSchema,
+  canaryUsageSchema,
+  canonicalJson,
+  classifyTerminalReason,
+  computeWorstCase,
+  contractDigest,
+  createPendingCanaryReceipt,
+  estimateTokens,
+  executeCanaryRun,
+  getCanaryReceiptForPrincipal,
+  getModelBounds,
+  isCanaryModeEnabled,
+  listCanaryDigestsForTask,
+  listPriceableModels,
+  loadCanaryPrincipals,
+  measureEffectivePrompt,
+  redactForReceipt,
+  resolveCanaryPrincipal,
+  settleCanaryReceipt,
+  submitCanaryRun,
+} from './canary';
+export type {
+  CanaryReceipt,
+  CanaryReceiptKey,
+  CanaryReceiptState,
+  CanaryRequest,
+  CanaryReservation,
+  CanaryRunnerDeps,
+  CanarySubmitResult,
+  CanaryTerminalReason,
+  CanaryTerminalWrite,
+  CanaryUsage,
+  EffectivePrompt,
+  ModelBounds,
+} from './canary';

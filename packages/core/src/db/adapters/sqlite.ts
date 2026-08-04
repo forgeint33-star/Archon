@@ -475,6 +475,41 @@ export class SqliteAdapter implements IDatabase {
         UNIQUE(user_id)
       );
 
+      -- Canary receipts (bounded canary execution contract). Mirrors
+      -- migrations/000_combined.sql Table 11 — see there for the full rationale.
+      -- One row per bounded dispatch, keyed by the CALLER's run/task ids plus
+      -- the digest of the exact contract, so a re-submit returns the existing
+      -- receipt and a changed contract never reuses an older run's numbers.
+      -- The principal column scopes reads. Aggregate columns are NULLABLE: a
+      -- run with no terminal aggregate leaves them NULL rather than writing 0,
+      -- which would read as "this cost nothing".
+      CREATE TABLE IF NOT EXISTS remote_agent_canary_receipts (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        contract_version TEXT NOT NULL,
+        external_run_id TEXT NOT NULL,
+        external_task_id TEXT NOT NULL,
+        contract_digest TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT,
+        requested_model TEXT NOT NULL,
+        model TEXT,
+        usage TEXT,
+        model_usage TEXT,
+        num_turns INTEGER,
+        total_cost_usd REAL,
+        sdk_subtype TEXT,
+        stop_reason TEXT,
+        errors TEXT,
+        reservation TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(external_run_id, external_task_id, contract_digest)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_canary_receipts_lookup
+        ON remote_agent_canary_receipts(external_run_id, external_task_id, principal);
+
       -- Codebases table
       CREATE TABLE IF NOT EXISTS remote_agent_codebases (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

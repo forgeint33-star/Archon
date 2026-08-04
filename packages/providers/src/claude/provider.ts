@@ -43,7 +43,9 @@ import type {
   TokenUsage,
   ProviderCapabilities,
   NodeConfig,
+  BoundedModeOptions,
 } from '../types';
+import { BoundedModeViolationError } from '../errors';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
@@ -75,16 +77,22 @@ function normalizeClaudeUsage(usage?: {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }): TokenUsage | undefined {
   if (!usage) return undefined;
   const input = usage.input_tokens;
   const output = usage.output_tokens;
   if (typeof input !== 'number' || typeof output !== 'number') return undefined;
   const total = usage.total_tokens;
+  const cacheRead = usage.cache_read_input_tokens;
+  const cacheCreation = usage.cache_creation_input_tokens;
   return {
     input,
     output,
     ...(typeof total === 'number' ? { total } : {}),
+    ...(typeof cacheRead === 'number' ? { cacheRead } : {}),
+    ...(typeof cacheCreation === 'number' ? { cacheCreation } : {}),
   };
 }
 
@@ -148,12 +156,149 @@ export function buildRequestSubprocessEnv(
     env.ANTHROPIC_API_KEY = env.CLAUDE_API_KEY;
     getLog().debug('claude.api_key_mirrored');
   }
+  // Bounded mode LAST so a caller-supplied `env` can never loosen a declared
+  // bound by pre-setting these variables.
+  if (requestOptions?.bounded) applyBoundedModeEnv(env, requestOptions.bounded);
   return env;
 }
 
-/** Max retries for transient subprocess failures */
+/**
+ * Deliver the bounded output/context caps as CLI environment variables.
+ *
+ * These are the two bounds the SDK's TypeScript surface does not expose. The
+ * installed CLI reads both (`CLAUDE_CODE_MAX_OUTPUT_TOKENS` becomes the request
+ * `max_tokens`, clamped to the model's upper limit; `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+ * is honored only when `DISABLE_COMPACT` is also set) — verified against the
+ * 0.3.209 binary this install spawns.
+ *
+ * `DISABLE_COMPACT` is set for two reasons, not one: it unlocks the context cap,
+ * AND it stops auto-compaction, whose summarization calls are extra billed model
+ * calls that `--max-turns` does not count.
+ *
+ * Because these are env vars rather than a typed SDK option, the reservation
+ * NEVER relies on them — see `computeWorstCase` in @archon/core, which prices
+ * the guaranteed ceiling from the model's authoritative maxima instead. They are
+ * defense in depth that makes real spend far lower than the ceiling.
+ */
+function applyBoundedModeEnv(env: NodeJS.ProcessEnv, bounded: BoundedModeOptions): void {
+  env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(bounded.maxOutputTokens);
+  env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(bounded.maxContextTokens);
+  env.DISABLE_COMPACT = '1';
+}
+
+/**
+ * Default max retries for transient subprocess failures.
+ *
+ * Each retry is a fresh subprocess and therefore a fresh billed model session,
+ * invisible to whoever called `sendQuery`. Bounded mode overrides this
+ * per-request via `bounded.maxSubprocessRetries` (see
+ * {@link resolveMaxSubprocessRetries}); every other path keeps this value, so
+ * normal Archon behaviour is unchanged.
+ */
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
+
+/** Retry budget for one request: bounded override, else the module default. */
+function resolveMaxSubprocessRetries(requestOptions: SendQueryOptions | undefined): number {
+  return requestOptions?.bounded?.maxSubprocessRetries ?? MAX_SUBPROCESS_RETRIES;
+}
+
+/**
+ * Tools bounded mode ALWAYS denies, regardless of what the caller asked for.
+ *
+ * `Task` spawns subagents: each is its own session with its own turn count and
+ * its own ~30s progress-summary forks, none of which `--max-turns` bounds. With
+ * Task denied, `maxTurns` is the exact ceiling on outward model calls.
+ */
+export const BOUNDED_MODE_DISALLOWED_TOOLS: readonly string[] = ['Task'];
+
+/**
+ * Request options that are incompatible with a declared bound. Returns the
+ * human-readable reasons; empty means the request is admissible.
+ *
+ * Checked before anything spawns, so a refusal costs nothing.
+ */
+export function findBoundedModeViolations(
+  resumeSessionId: string | undefined,
+  requestOptions: SendQueryOptions
+): string[] {
+  const violations: string[] = [];
+  const bounded = requestOptions.bounded;
+  if (!bounded) return violations;
+
+  if (resumeSessionId) {
+    violations.push(
+      'resumeSessionId — a resumed session replays a transcript of unknown size, so the effective prompt cannot be measured'
+    );
+  }
+  if (requestOptions.forkSession === true) {
+    violations.push('forkSession — a fork duplicates session history into a second billed session');
+  }
+  if (requestOptions.fallbackModel !== undefined) {
+    violations.push(
+      'fallbackModel — a substituted model invalidates the reservation, which is priced for one fixed model'
+    );
+  }
+  if (requestOptions.nodeConfig !== undefined) {
+    violations.push(
+      'nodeConfig — workflow node config can reintroduce agents, MCP servers and skills that bounded mode excludes'
+    );
+  }
+  if (requestOptions.nativeTools !== undefined && requestOptions.nativeTools.length > 0) {
+    violations.push('nativeTools — in-process tool definitions add unmeasured prompt content');
+  }
+  if (!Number.isInteger(bounded.maxTurns) || bounded.maxTurns < 1) {
+    violations.push(`maxTurns must be an integer >= 1 (got ${String(bounded.maxTurns)})`);
+  }
+  if (!Number.isFinite(bounded.maxBudgetUsd) || bounded.maxBudgetUsd <= 0) {
+    violations.push(
+      `maxBudgetUsd must be a finite number > 0 (got ${String(bounded.maxBudgetUsd)})`
+    );
+  }
+  if (!Number.isInteger(bounded.maxSubprocessRetries) || bounded.maxSubprocessRetries < 0) {
+    violations.push(
+      `maxSubprocessRetries must be an integer >= 0 (got ${String(bounded.maxSubprocessRetries)})`
+    );
+  }
+  if (!Number.isInteger(bounded.maxOutputTokens) || bounded.maxOutputTokens < 1) {
+    violations.push(
+      `maxOutputTokens must be an integer >= 1 (got ${String(bounded.maxOutputTokens)})`
+    );
+  }
+  if (!Number.isInteger(bounded.maxContextTokens) || bounded.maxContextTokens < 1) {
+    violations.push(
+      `maxContextTokens must be an integer >= 1 (got ${String(bounded.maxContextTokens)})`
+    );
+  }
+  return violations;
+}
+
+/**
+ * Final NARROWING pass over fully-built SDK options.
+ *
+ * Runs last on purpose: nodeConfig translation, native-tool registration and
+ * session resume have all already written to `options`, so applying the bound
+ * here means nothing downstream can widen it. Every mutation either tightens a
+ * limit or removes an escape hatch — none relaxes anything.
+ */
+function applyBoundedMode(options: Options, bounded: BoundedModeOptions): void {
+  options.maxTurns = bounded.maxTurns;
+  options.maxBudgetUsd = bounded.maxBudgetUsd;
+  options.settingSources = bounded.settingSources;
+  options.forkSession = false;
+
+  const denied = new Set<string>(options.disallowedTools ?? []);
+  for (const t of BOUNDED_MODE_DISALLOWED_TOOLS) denied.add(t);
+  for (const t of bounded.extraDisallowedTools ?? []) denied.add(t);
+  options.disallowedTools = [...denied];
+
+  // Custom subagent definitions and model fallback are escape hatches out of
+  // the declared bound. `findBoundedModeViolations` already refuses a request
+  // that ASKS for either; deleting here also covers anything a config default
+  // or nodeConfig path might have set on its own.
+  delete options.agents;
+  delete options.fallbackModel;
+}
 
 const RATE_LIMIT_PATTERNS = [
   'rate limit',
@@ -812,6 +957,10 @@ async function* streamClaudeMessages(
   // result. See ClaudeApiResultError.
   let pendingSdkError: { code: SDKAssistantMessageError; text: string } | undefined;
 
+  // Model the CLI reports it is actually running (`system`/`init`). Recorded so
+  // the terminal result can name what ran rather than what was requested.
+  let reportedModel: string | undefined;
+
   for await (const msg of events) {
     // Drain tool results captured by hooks before processing the next event
     while (toolResultQueue.length > 0) {
@@ -869,6 +1018,8 @@ async function* streamClaudeMessages(
     } else if (event.type === 'system') {
       const sysMsg = msg as {
         subtype?: string;
+        /** Model the CLI resolved for this session (`init` only). */
+        model?: string;
         mcp_servers?: { name: string; status: string }[];
         // Subagent task lifecycle (Claude SDK v0.2.89+)
         task_id?: string;
@@ -892,6 +1043,12 @@ async function* streamClaudeMessages(
         exit_code?: number;
       };
       const subtype = sysMsg.subtype;
+      // Record the resolved model on EVERY init, independently of the
+      // mcp_servers branch below — an init without MCP servers still names the
+      // model, and settlement must not lose it just because nothing was mounted.
+      if (subtype === 'init' && typeof sysMsg.model === 'string' && sysMsg.model) {
+        reportedModel = sysMsg.model;
+      }
       if (subtype === 'init' && sysMsg.mcp_servers) {
         const failed = sysMsg.mcp_servers.filter(s => s.status !== 'connected');
         if (failed.length > 0) {
@@ -995,7 +1152,13 @@ async function* streamClaudeMessages(
         session_id?: string;
         is_error?: boolean;
         subtype?: string;
-        usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          total_tokens?: number;
+          cache_read_input_tokens?: number;
+          cache_creation_input_tokens?: number;
+        };
         structured_output?: unknown;
         total_cost_usd?: number;
         stop_reason?: string | null;
@@ -1004,15 +1167,16 @@ async function* streamClaudeMessages(
         result?: string;
         terminal_reason?: TerminalReason;
         api_error_status?: number | null;
-        model_usage?: Record<
-          string,
-          {
-            input_tokens: number;
-            output_tokens: number;
-            cache_read_input_tokens?: number;
-            cache_creation_input_tokens?: number;
-          }
-        >;
+        /**
+         * Per-model usage map. The SDK's own type (`SDKResultSuccess` /
+         * `SDKResultError` in sdk.d.ts) declares this CAMEL-cased, and the
+         * wire payload matches — `model_usage` appears nowhere in sdk.mjs.
+         * The snake_cased alias is kept only so an older or re-shaped payload
+         * still resolves instead of silently yielding `undefined`; camelCase
+         * is authoritative when both are present.
+         */
+        modelUsage?: Record<string, Record<string, unknown>>;
+        model_usage?: Record<string, Record<string, unknown>>;
       };
       // The terminal result resolves any recorded synthetic error message.
       const syntheticError = pendingSdkError;
@@ -1103,9 +1267,18 @@ async function* streamClaudeMessages(
           'claude.result_success_validated'
         );
       }
+      const modelUsage = resultMsg.modelUsage ?? resultMsg.model_usage;
+      // Prefer the model the CLI announced at init; fall back to a single-entry
+      // usage map. A multi-model run (fallback/subagents) is left unnamed rather
+      // than guessed — bounded mode forbids both, so an unnamed model there is
+      // itself a signal worth surfacing instead of papering over.
+      const modelUsageKeys = modelUsage ? Object.keys(modelUsage) : [];
+      const resolvedModel =
+        reportedModel ?? (modelUsageKeys.length === 1 ? modelUsageKeys[0] : undefined);
       yield {
         type: 'result',
         sessionId: resultMsg.session_id,
+        ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
         ...(tokens ? { tokens } : {}),
         ...(resultMsg.structured_output !== undefined
           ? { structuredOutput: resultMsg.structured_output }
@@ -1115,9 +1288,7 @@ async function* streamClaudeMessages(
         ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
         ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
         ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),
-        ...(resultMsg.model_usage
-          ? { modelUsage: resultMsg.model_usage as Record<string, unknown> }
-          : {}),
+        ...(modelUsage ? { modelUsage: modelUsage as Record<string, unknown> } : {}),
       };
     }
   }
@@ -1260,6 +1431,20 @@ export class ClaudeProvider implements IAgentProvider {
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
     let lastError: Error | undefined;
+
+    // Bounded mode is refused-or-honored before ANY work happens: resolution,
+    // env building and subprocess spawn all cost something, and a request that
+    // cannot be bounded must not reach any of them.
+    const bounded = requestOptions?.bounded;
+    if (bounded && requestOptions) {
+      const violations = findBoundedModeViolations(resumeSessionId, requestOptions);
+      if (violations.length > 0) {
+        getLog().error({ violations }, 'claude.bounded_mode_refused');
+        throw new BoundedModeViolationError(violations);
+      }
+    }
+    const maxSubprocessRetries = resolveMaxSubprocessRetries(requestOptions);
+
     const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
 
     // Resolve Claude CLI path once before the retry loop. In binary mode this
@@ -1306,7 +1491,7 @@ export class ClaudeProvider implements IAgentProvider {
       requestOptions.abortSignal.addEventListener('abort', onAbort, { once: true });
     }
 
-    for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= maxSubprocessRetries; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
         throw new Error('Query aborted');
       }
@@ -1357,6 +1542,22 @@ export class ClaudeProvider implements IAgentProvider {
         getLog().debug({ cwd, attempt }, 'starting_new_session');
       }
 
+      // 3b. Bounded mode LAST — after nodeConfig, native tools and resume have
+      //     all written to `options`, so the declared bound is the final word.
+      if (bounded) {
+        applyBoundedMode(options, bounded);
+        getLog().info(
+          {
+            maxTurns: options.maxTurns,
+            maxBudgetUsd: options.maxBudgetUsd,
+            maxSubprocessRetries,
+            disallowedTools: options.disallowedTools,
+            settingSources: options.settingSources,
+          },
+          'claude.bounded_mode_applied'
+        );
+      }
+
       try {
         // 4. Run query with first-event timeout protection
         const rawEvents = query({ prompt, options });
@@ -1390,12 +1591,12 @@ export class ClaudeProvider implements IAgentProvider {
             stderrContext: stderrLines.join('\n'),
             errorClass,
             attempt,
-            maxRetries: MAX_SUBPROCESS_RETRIES,
+            maxRetries: maxSubprocessRetries,
           },
           'query_error'
         );
 
-        if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
+        if (!shouldRetry || attempt >= maxSubprocessRetries) {
           throw enrichedError;
         }
 

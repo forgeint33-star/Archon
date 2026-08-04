@@ -2,7 +2,7 @@
 -- Version: Combined (final state after migrations 001-020)
 -- Description: Complete database schema (idempotent - safe to run multiple times)
 --
--- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
+-- 15 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
 --   1. remote_agent_codebases
 --   1b. remote_agent_codebase_env_vars
 --   1c. remote_agent_users
@@ -17,6 +17,7 @@
 --   8. remote_agent_user_github_tokens
 --   9. remote_agent_user_provider_keys
 --   10. remote_agent_user_ai_prefs
+--   11. remote_agent_canary_receipts
 --
 -- Dropped tables (via migrations):
 --   - remote_agent_command_templates (017)
@@ -507,6 +508,63 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
 -- this column existed.
 ALTER TABLE remote_agent_user_ai_prefs
   ADD COLUMN IF NOT EXISTS default_model VARCHAR(255);
+
+-- ============================================================================
+-- Table 11: Canary receipts (bounded canary execution contract)
+-- ============================================================================
+--
+-- One row per bounded dispatch, addressed by the CALLER's own identifiers plus
+-- the digest of the exact contract they submitted. That triple is the natural
+-- key: re-submitting the same contract must return the existing receipt rather
+-- than start a second billed run, and a CHANGED contract for the same task must
+-- never silently reuse an older run's numbers.
+--
+-- `principal` records which authenticated client submitted the row. Reads are
+-- filtered on it, so one task cannot read another principal's receipt.
+--
+-- `state` is 'pending' or 'terminal'. A submit acknowledgement only ever
+-- creates 'pending' — settlement reads must require 'terminal'.
+--
+-- Aggregate columns are NULLABLE on purpose. A run that ended with no terminal
+-- aggregate (dead subprocess, deadline abort, pre-spawn refusal) leaves them
+-- NULL; writing 0 would read as "this cost nothing", which is precisely the lie
+-- this table exists to prevent.
+--
+-- `usage` / `model_usage` / `errors` / `reservation` are JSON-as-TEXT so SQLite
+-- and Postgres behave identically (same choice as user_ai_prefs.tiers).
+CREATE TABLE IF NOT EXISTS remote_agent_canary_receipts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  contract_version VARCHAR(64) NOT NULL,
+  external_run_id VARCHAR(200) NOT NULL,
+  external_task_id VARCHAR(200) NOT NULL,
+  contract_digest VARCHAR(64) NOT NULL,
+  principal VARCHAR(200) NOT NULL,
+
+  state VARCHAR(16) NOT NULL,
+  reason VARCHAR(32),
+
+  requested_model VARCHAR(255) NOT NULL,
+  model VARCHAR(255),
+
+  usage TEXT,
+  model_usage TEXT,
+  num_turns INTEGER,
+  total_cost_usd DOUBLE PRECISION,
+  sdk_subtype VARCHAR(64),
+  stop_reason VARCHAR(64),
+  errors TEXT,
+
+  reservation TEXT NOT NULL,
+
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(external_run_id, external_task_id, contract_digest)
+);
+
+-- Read path: (run, task) + principal, then digest. Matches the lookup the
+-- governed read endpoint performs.
+CREATE INDEX IF NOT EXISTS idx_canary_receipts_lookup
+  ON remote_agent_canary_receipts(external_run_id, external_task_id, principal);
 
 -- ============================================================================
 -- Web auth (opt-in): role on the canonical user + Better Auth tables

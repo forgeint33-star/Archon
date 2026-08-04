@@ -14,6 +14,7 @@ export type {
   CredentialKind,
   CredentialSpec,
   ProviderCredentialCatalog,
+  BoundedModeOptions,
 } from './types';
 export { CREDENTIAL_KINDS } from './types';
 
@@ -34,8 +35,12 @@ export {
   clearRegistry,
 } from './registry';
 
-// Error
-export { UnknownProviderError } from './errors';
+// Errors
+export {
+  UnknownProviderError,
+  BoundedModeViolationError,
+  BoundedModeUnsupportedError,
+} from './errors';
 
 // Shared structured-output helpers (cross-provider; the dag-executor validates
 // every provider's output_format result against the declared schema).
@@ -46,7 +51,11 @@ export {
 } from './shared/structured-output';
 
 // Provider classes
-export { ClaudeProvider } from './claude/provider';
+export {
+  ClaudeProvider,
+  BOUNDED_MODE_DISALLOWED_TOOLS,
+  findBoundedModeViolations,
+} from './claude/provider';
 export { CodexProvider } from './codex/provider';
 
 // Config parsers
