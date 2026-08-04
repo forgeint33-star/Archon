@@ -219,6 +219,33 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    // Canary receipts: governed-output columns. Unlike the v1 identity change
+    // (which needed a table rebuild because SQLite cannot drop the autoindex an
+    // inline UNIQUE creates), these are plain additive columns, so an existing
+    // v2 table is upgraded in place with no data loss.
+    try {
+      const cols = this.db.prepare("PRAGMA table_info('remote_agent_canary_receipts')").all() as {
+        name: string;
+      }[];
+      if (cols.length > 0) {
+        const names = new Set(cols.map(c => c.name));
+        const additions: [string, string][] = [
+          ['output_available', 'INTEGER'],
+          ['output_text', 'TEXT'],
+          ['output_bytes', 'INTEGER'],
+          ['output_sha256', 'TEXT'],
+          ['output_content_type', 'TEXT'],
+        ];
+        for (const [name, type] of additions) {
+          if (!names.has(name)) {
+            this.db.run(`ALTER TABLE remote_agent_canary_receipts ADD COLUMN ${name} ${type}`);
+          }
+        }
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_canary_output_columns_failed');
+    }
+
     // Users columns. `role` is the web-auth identity seam (default 'admin').
     // Better Auth's own tables are PostgreSQL-only — web auth is never enabled
     // on SQLite — so only the role column is backfilled here.
@@ -541,6 +568,15 @@ export class SqliteAdapter implements IDatabase {
         usage TEXT,
         model_usage TEXT,
         total_cost_usd REAL,
+        -- Governed deliverable. NULL output_available = still pending;
+        -- 0/1 = terminal without / with a deliverable. Payload columns are
+        -- populated only when output_available is 1. Size is capped in code;
+        -- oversized output fails the run rather than being truncated here.
+        output_available INTEGER,
+        output_text TEXT,
+        output_bytes INTEGER,
+        output_sha256 TEXT,
+        output_content_type TEXT,
         sdk_subtype TEXT,
         stop_reason TEXT,
         errors TEXT,

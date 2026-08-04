@@ -22,7 +22,7 @@
     },
     "success_status": 200
   },
-  "$description": "A settled receipt for a run that completed. terminal_status \"succeeded\" iff reason is \"completed\".",
+  "$description": "A settled receipt for a run that completed, carrying its governed deliverable. terminal_status \"succeeded\" iff reason is \"completed\", and a succeeded receipt ALWAYS carries output_available:true — Archon fails the run closed rather than report success with nothing to show for it. Verify output_sha256 over the UTF-8 bytes of output_text before acting.",
   "terminal_vocabulary": {
     "state": [
       "pending",
@@ -39,7 +39,9 @@
       "sdk_error",
       "no_terminal_aggregate",
       "deadline_exceeded",
-      "refused"
+      "refused",
+      "missing_output",
+      "output_too_large"
     ],
     "succeeded_iff": "reason === 'completed'",
     "settle_only_when": "state === 'terminal'",
@@ -48,6 +50,20 @@
       "deadline_exceeded",
       "receipt unreadable or absent past the deadline"
     ]
+  },
+  "output_contract": {
+    "content_type": "text/plain; charset=utf-8",
+    "max_output_bytes": 1048576,
+    "output_bytes_is": "UTF-8 byte length of output_text, NOT its UTF-16 string length",
+    "output_sha256_is": "lowercase hex sha256 over exactly those UTF-8 bytes",
+    "available_only_when": "state === 'terminal' && terminal_status === 'succeeded'",
+    "absent_on": [
+      "pending receipts (no output block at all)",
+      "every failed terminal receipt"
+    ],
+    "never_truncated": "output exceeding max_output_bytes FAILS the run with reason output_too_large; a truncated deliverable is never published",
+    "succeeded_requires_output": "a terminal receipt cannot be succeeded without an available output — an SDK success that produced no final text is downgraded to reason missing_output",
+    "verify": "recompute sha256 over the UTF-8 bytes of output_text and compare to output_sha256 before acting on the deliverable"
   },
   "response": {
     "receipt": {
@@ -85,6 +101,11 @@
         }
       },
       "total_cost_usd": 0.0087,
+      "output_available": true,
+      "output_text": "bounded canary output",
+      "output_bytes": 21,
+      "output_sha256": "0b3a6527b693cdb7eab3a95e0b316b9592200c845f7c724cf0d01a29de82af4b",
+      "output_content_type": "text/plain; charset=utf-8",
       "sdk_subtype": "success",
       "stop_reason": "end_turn",
       "reservation": {

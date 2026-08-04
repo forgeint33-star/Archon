@@ -263,6 +263,23 @@ export const canaryTerminalReasonSchema = z.enum([
   'deadline_exceeded',
   /** Refused before any subprocess spawned. Zero spend. */
   'refused',
+  /**
+   * The SDK reported success but produced no usable final text.
+   *
+   * FAILS CLOSED: a receipt that says "succeeded" while carrying no deliverable
+   * would let a caller settle spend for an outcome nobody can inspect. The run
+   * still happened and still cost money, so its aggregate is persisted — only
+   * the success claim is withheld.
+   */
+  'missing_output',
+  /**
+   * The final text exceeded {@link CANARY_MAX_OUTPUT_BYTES}.
+   *
+   * FAILS CLOSED and is NEVER truncated: a truncated deliverable that still
+   * reported success would be silently wrong, and its hash would attest to
+   * bytes the agent did not produce. As above, the cost aggregate is kept.
+   */
+  'output_too_large',
 ]);
 export type CanaryTerminalReason = z.infer<typeof canaryTerminalReasonSchema>;
 
@@ -324,6 +341,67 @@ export const canaryReservationSchema = z.object({
   declared_bound_worst_case_usd: z.number().nonnegative(),
 });
 export type CanaryReservation = z.infer<typeof canaryReservationSchema>;
+
+/**
+ * The ONE canonical media type for a governed output.
+ *
+ * A single literal rather than a negotiated set: the deliverable is the agent's
+ * final assistant text, always, and letting it vary would make every consumer
+ * branch on a value that never actually changes. If a future contract carries
+ * a second representation it gets a version bump, not a widened enum.
+ */
+export const CANARY_OUTPUT_CONTENT_TYPE = 'text/plain; charset=utf-8' as const;
+
+/**
+ * Hard ceiling on persisted output, in UTF-8 bytes (1 MiB).
+ *
+ * Explicit rather than implicit-by-column-type: the limit is part of the
+ * contract a caller plans against, and a database that silently accepted more
+ * on one dialect than another would make the contract dialect-dependent.
+ * Exceeding it is a FAILURE, never a truncation — see `output_too_large`.
+ */
+export const CANARY_MAX_OUTPUT_BYTES = 1_048_576;
+
+/**
+ * The governed deliverable attached to a terminal receipt.
+ *
+ * Present as a block only on `terminal` receipts. `output_available` is the
+ * single field a consumer branches on; when it is false the remaining fields
+ * are absent rather than empty, so "no deliverable" cannot be misread as "an
+ * empty deliverable".
+ */
+export const canaryOutputSchema = z.object({
+  /** True iff a valid deliverable was captured and persisted. */
+  output_available: z.boolean(),
+  /** The agent's final assistant text, byte-for-byte as the SDK produced it. */
+  output_text: z.string().optional(),
+  /** UTF-8 byte length of `output_text` — not its UTF-16 `.length`. */
+  output_bytes: z.number().int().nonnegative().optional(),
+  /** Lowercase hex sha256 over exactly those UTF-8 bytes. */
+  output_sha256: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
+  /** Always {@link CANARY_OUTPUT_CONTENT_TYPE} when output is available. */
+  output_content_type: z.literal(CANARY_OUTPUT_CONTENT_TYPE).optional(),
+});
+export type CanaryOutput = z.infer<typeof canaryOutputSchema>;
+
+/**
+ * Compute the governed attestation over a deliverable.
+ *
+ * The bytes are taken verbatim: no trimming, no normalisation, no redaction.
+ * The hash must attest to exactly what is persisted and returned, so any
+ * transformation here would make `output_sha256` a claim about text that was
+ * never delivered.
+ */
+export function describeCanaryOutput(text: string): {
+  bytes: number;
+  sha256: string;
+} {
+  const buf = Buffer.from(text, 'utf8');
+  return { bytes: buf.byteLength, sha256: createHash('sha256').update(buf).digest('hex') };
+}
 
 /**
  * The governed receipt. This is what a caller settles against.
@@ -393,6 +471,17 @@ export const canaryReceiptSchema = z.object({
   model_usage: z.record(z.string(), z.unknown()).optional(),
   total_cost_usd: z.number().nonnegative().optional(),
 
+  // ─── Governed output ───────────────────────────────────────────────────
+  // Present only on a `terminal` receipt. See canaryOutputSchema.
+  output_available: z.boolean().optional(),
+  output_text: z.string().optional(),
+  output_bytes: z.number().int().nonnegative().optional(),
+  output_sha256: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
+  output_content_type: z.literal(CANARY_OUTPUT_CONTENT_TYPE).optional(),
+
   // ─── Failure details ───────────────────────────────────────────────────
   /** SDK result subtype (`success`, `error_max_turns`, …), verbatim. */
   sdk_subtype: z.string().optional(),
@@ -407,3 +496,86 @@ export const canaryReceiptSchema = z.object({
   updated_at: z.string(),
 });
 export type CanaryReceipt = z.infer<typeof canaryReceiptSchema>;
+
+/**
+ * Structural invariants the output block must satisfy. Returns the violations;
+ * empty means the receipt is coherent.
+ *
+ * This is the fail-closed check required by the contract: it is impossible for
+ * a coherent receipt to claim `succeeded` while carrying no deliverable. The
+ * schema alone cannot express that — it is a cross-field rule — so it lives
+ * here and is enforced at BOTH ends: the runner refuses to write a violating
+ * receipt, and `rowToReceipt` refuses to return one.
+ *
+ * Returning violations rather than throwing keeps it usable as a plain
+ * assertion in tests and as a guard at each boundary.
+ */
+export function findReceiptOutputViolations(receipt: CanaryReceipt): string[] {
+  const v: string[] = [];
+  const hasAnyOutputField =
+    receipt.output_text !== undefined ||
+    receipt.output_bytes !== undefined ||
+    receipt.output_sha256 !== undefined ||
+    receipt.output_content_type !== undefined;
+
+  if (receipt.state === 'pending') {
+    // A pending acknowledgement exposes NO output at all — not even
+    // `output_available: false`, which a caller could mistake for a settled
+    // "this produced nothing".
+    if (receipt.output_available !== undefined) {
+      v.push('pending receipt must not carry output_available');
+    }
+    if (hasAnyOutputField) v.push('pending receipt must not carry output fields');
+    return v;
+  }
+
+  if (receipt.output_available === undefined) {
+    v.push('terminal receipt must state output_available');
+    return v;
+  }
+
+  if (receipt.output_available) {
+    if (receipt.output_text === undefined) v.push('output_available requires output_text');
+    if (receipt.output_bytes === undefined) v.push('output_available requires output_bytes');
+    if (receipt.output_sha256 === undefined) v.push('output_available requires output_sha256');
+    if (receipt.output_content_type === undefined) {
+      v.push('output_available requires output_content_type');
+    }
+    if (receipt.output_text !== undefined) {
+      // Re-derive rather than trust the stored numbers: these are the two
+      // fields a consumer verifies against, so a mismatch between them and the
+      // text is a corrupt receipt, not a cosmetic drift.
+      const actual = describeCanaryOutput(receipt.output_text);
+      if (receipt.output_bytes !== undefined && receipt.output_bytes !== actual.bytes) {
+        v.push(`output_bytes ${receipt.output_bytes} does not match text (${actual.bytes})`);
+      }
+      if (receipt.output_sha256 !== undefined && receipt.output_sha256 !== actual.sha256) {
+        v.push('output_sha256 does not match output_text');
+      }
+      if (actual.bytes > CANARY_MAX_OUTPUT_BYTES) {
+        v.push(`output_bytes ${actual.bytes} exceeds the ${CANARY_MAX_OUTPUT_BYTES}-byte ceiling`);
+      }
+    }
+  } else {
+    // Unavailable means absent, never empty — an empty string would read as a
+    // real deliverable that happened to say nothing.
+    if (receipt.output_text !== undefined) {
+      v.push('output_available:false must not carry output_text');
+    }
+    if (receipt.output_sha256 !== undefined) {
+      v.push('output_available:false must not carry output_sha256');
+    }
+  }
+
+  // THE fail-closed rule: success is a claim about a deliverable.
+  // (`output_available` is narrowed to boolean by the undefined guard above.)
+  if (receipt.terminal_status === 'succeeded' && !receipt.output_available) {
+    v.push('terminal_status succeeded requires an available output');
+  }
+  // ...and its converse: only a completed run may carry one.
+  if (receipt.output_available && receipt.terminal_status !== 'succeeded') {
+    v.push('output_available:true requires terminal_status succeeded');
+  }
+
+  return v;
+}

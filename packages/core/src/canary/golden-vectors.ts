@@ -21,12 +21,22 @@
  */
 import {
   CANARY_CONTRACT_VERSION,
+  CANARY_MAX_OUTPUT_BYTES,
+  CANARY_OUTPUT_CONTENT_TYPE,
   canaryReceiptSchema,
   canaryRequestSchema,
   contractDigest,
+  describeCanaryOutput,
   type CanaryReceipt,
   type CanaryRequest,
 } from './contract';
+
+/**
+ * The deliverable the success vector attests to. Its byte length and hash are
+ * DERIVED below rather than written by hand, so the published vector can never
+ * disagree with the hashing function a consumer is told to verify against.
+ */
+export const GOLDEN_OUTPUT_TEXT = 'bounded canary output';
 
 /** Placeholders standing in for values that cannot be deterministic. */
 export const GOLDEN_SENTINELS = {
@@ -138,8 +148,17 @@ export function goldenPendingAcknowledgement(): {
   };
 }
 
-/** A settled, successful terminal receipt. */
+/**
+ * A settled, successful terminal receipt — WITH its governed deliverable.
+ *
+ * `output_available: true` is what makes this receipt settleable as a success:
+ * a terminal aggregate proves what the run cost, and the output block proves
+ * what it produced. `output_sha256` is over exactly the UTF-8 bytes of
+ * `output_text`, so a consumer can verify the deliverable it received is the
+ * one the receipt attests to.
+ */
 export function goldenTerminalSuccess(): CanaryReceipt {
+  const attestation = describeCanaryOutput(GOLDEN_OUTPUT_TEXT);
   return canaryReceiptSchema.parse({
     ...baseReceipt(),
     state: 'terminal',
@@ -149,6 +168,11 @@ export function goldenTerminalSuccess(): CanaryReceipt {
     session_id: 'fake-session',
     resolved_model: 'claude-sonnet-5',
     actual_turns: 2,
+    output_available: true,
+    output_text: GOLDEN_OUTPUT_TEXT,
+    output_bytes: attestation.bytes,
+    output_sha256: attestation.sha256,
+    output_content_type: CANARY_OUTPUT_CONTENT_TYPE,
     usage: {
       input_tokens: 1200,
       output_tokens: 340,
@@ -193,6 +217,10 @@ export function goldenTerminalFailure(): CanaryReceipt {
     session_id: 'fake-session',
     resolved_model: 'claude-sonnet-5',
     actual_turns: 2,
+    // A ceiling hit publishes NO deliverable, even though the run was real and
+    // billed. `output_text` is absent rather than empty: a caller must not be
+    // able to read "nothing was produced" as "an empty result was produced".
+    output_available: false,
     usage: { input_tokens: 4200, output_tokens: 900 },
     model_usage: {
       'claude-sonnet-5': {
@@ -230,6 +258,8 @@ export const GOLDEN_TERMINAL_VOCABULARY = {
     'no_terminal_aggregate',
     'deadline_exceeded',
     'refused',
+    'missing_output',
+    'output_too_large',
   ],
   succeeded_iff: "reason === 'completed'",
   settle_only_when: "state === 'terminal'",
@@ -238,4 +268,29 @@ export const GOLDEN_TERMINAL_VOCABULARY = {
     'deadline_exceeded',
     'receipt unreadable or absent past the deadline',
   ],
+} as const;
+
+/**
+ * How a consumer must treat the governed deliverable.
+ *
+ * Published alongside the vocabulary because the failure modes here are the
+ * ones a consumer is most likely to paper over: treating an absent output as an
+ * empty one, or trusting a hash it never recomputed.
+ */
+export const GOLDEN_OUTPUT_CONTRACT = {
+  content_type: CANARY_OUTPUT_CONTENT_TYPE,
+  max_output_bytes: CANARY_MAX_OUTPUT_BYTES,
+  output_bytes_is: 'UTF-8 byte length of output_text, NOT its UTF-16 string length',
+  output_sha256_is: 'lowercase hex sha256 over exactly those UTF-8 bytes',
+  available_only_when: "state === 'terminal' && terminal_status === 'succeeded'",
+  absent_on: ['pending receipts (no output block at all)', 'every failed terminal receipt'],
+  never_truncated:
+    'output exceeding max_output_bytes FAILS the run with reason output_too_large; a truncated ' +
+    'deliverable is never published',
+  succeeded_requires_output:
+    'a terminal receipt cannot be succeeded without an available output — an SDK success that ' +
+    'produced no final text is downgraded to reason missing_output',
+  verify:
+    'recompute sha256 over the UTF-8 bytes of output_text and compare to output_sha256 before ' +
+    'acting on the deliverable',
 } as const;

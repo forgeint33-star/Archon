@@ -198,6 +198,19 @@ export type MessageChunk =
       type: 'result';
       sessionId?: string;
       /**
+       * The agent's final assistant text — the SDK's `result` field on a
+       * successful terminal message.
+       *
+       * This is the DELIVERABLE, distinct from `structuredOutput` (which is
+       * only populated when the caller declared an output schema). Forwarded
+       * because a terminal aggregate proves what a run cost while saying
+       * nothing about what it produced; a consumer settling spend against a
+       * receipt with no deliverable is paying for an unverifiable outcome.
+       *
+       * Absent on error subtypes — SDKResultError has no `result` field.
+       */
+      result?: string;
+      /**
        * Model the provider actually ran, as reported by the SDK itself (Claude:
        * the `system`/`init` message) rather than the model Archon asked for.
        * Settlement must price what ran, not what was requested — a silent

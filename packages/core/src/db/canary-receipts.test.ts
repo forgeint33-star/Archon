@@ -7,6 +7,7 @@
  * behaviours, so the test uses a database.
  */
 import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { SqliteAdapter, sqliteDialect } from './adapters/sqlite';
@@ -46,6 +47,15 @@ const RESERVATION = {
 
 const PRINCIPAL = 'goviral';
 const OTHER_PRINCIPAL = 'someone-else';
+
+/** A valid governed deliverable, hashed the same way the runner does. */
+const OUTPUT_TEXT = 'bounded canary output';
+const OUTPUT = {
+  text: OUTPUT_TEXT,
+  bytes: Buffer.byteLength(OUTPUT_TEXT, 'utf8'),
+  sha256: createHash('sha256').update(Buffer.from(OUTPUT_TEXT, 'utf8')).digest('hex'),
+  contentType: 'text/plain; charset=utf-8',
+};
 
 const KEY = {
   principal: PRINCIPAL,
@@ -169,6 +179,7 @@ describe('settleCanaryReceipt', () => {
       reason: 'completed',
       resolvedModel: 'claude-sonnet-5',
       sessionId: 'fake-session',
+      output: OUTPUT,
       usage: { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 64 },
       modelUsage: { 'claude-sonnet-5': { inputTokens: 1200, outputTokens: 340 } },
       actualTurns: 2,
@@ -194,6 +205,37 @@ describe('settleCanaryReceipt', () => {
     expect(receipt?.total_cost_usd).toBe(0.0087);
     expect(receipt?.sdk_subtype).toBe('success');
     expect(receipt?.stop_reason).toBe('end_turn');
+    // The governed deliverable rides the same record as the aggregate.
+    expect(receipt?.output_available).toBe(true);
+    expect(receipt?.output_text).toBe(OUTPUT.text);
+    expect(receipt?.output_bytes).toBe(OUTPUT.bytes);
+    expect(receipt?.output_sha256).toBe(OUTPUT.sha256);
+    expect(receipt?.output_content_type).toBe(OUTPUT.contentType);
+  });
+
+  test('a completed settle with NO output is refused rather than stored', async () => {
+    await seedPending();
+    // The store will write it, but the read must refuse to return a receipt
+    // that claims success with nothing to show — fail closed at both ends.
+    await settleCanaryReceipt(KEY, { reason: 'completed', totalCostUsd: 0.5 });
+    await expect(getCanaryReceiptForPrincipal(KEY)).rejects.toThrow(
+      /succeeded requires an available output/
+    );
+  });
+
+  test('a failed settle records output_available:false with no payload', async () => {
+    await seedPending();
+    await settleCanaryReceipt(KEY, {
+      reason: 'max_budget_exhausted',
+      totalCostUsd: 1.07,
+      actualTurns: 2,
+    });
+
+    const receipt = await getCanaryReceiptForPrincipal(KEY);
+    expect(receipt?.output_available).toBe(false);
+    // Absent, not empty — an empty string would read as a real deliverable.
+    expect(receipt?.output_text).toBeUndefined();
+    expect(receipt?.output_sha256).toBeUndefined();
   });
 
   test.each([
@@ -239,7 +281,12 @@ describe('settleCanaryReceipt', () => {
   test('settling twice does not overwrite the first terminal aggregate', async () => {
     await seedPending();
     expect(
-      await settleCanaryReceipt(KEY, { reason: 'completed', totalCostUsd: 0.5, actualTurns: 2 })
+      await settleCanaryReceipt(KEY, {
+        reason: 'completed',
+        totalCostUsd: 0.5,
+        actualTurns: 2,
+        output: OUTPUT,
+      })
     ).toBe(true);
 
     // A late deadline-abort racing the real result must lose.

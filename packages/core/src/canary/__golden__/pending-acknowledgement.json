@@ -19,7 +19,7 @@
     "path": "/api/canary/runs",
     "success_status": 202
   },
-  "$description": "The 202 acknowledgement. NOT a settlement: state is \"pending\" and every settleable field is ABSENT (not zero). Poll the read endpoint for the terminal receipt before releasing or charging a reservation.",
+  "$description": "The 202 acknowledgement. NOT a settlement: state is \"pending\", every settleable field is ABSENT (not zero), and there is no output block at all — not even output_available:false, which would read as a settled \"this produced nothing\". Poll the read endpoint for the terminal receipt.",
   "response": {
     "accepted": true,
     "started": true,

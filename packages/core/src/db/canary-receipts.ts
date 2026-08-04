@@ -39,7 +39,12 @@ import type {
   CanaryTerminalStatus,
   CanaryUsage,
 } from '../canary/contract';
-import { CANARY_CONTRACT_VERSION, terminalStatusForReason } from '../canary/contract';
+import {
+  CANARY_CONTRACT_VERSION,
+  CANARY_OUTPUT_CONTENT_TYPE,
+  findReceiptOutputViolations,
+  terminalStatusForReason,
+} from '../canary/contract';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -67,6 +72,11 @@ interface CanaryReceiptRow {
   usage: string | null;
   model_usage: string | null;
   total_cost_usd: number | null;
+  output_available: number | boolean | null;
+  output_text: string | null;
+  output_bytes: number | null;
+  output_sha256: string | null;
+  output_content_type: string | null;
   sdk_subtype: string | null;
   stop_reason: string | null;
   errors: string | null;
@@ -101,6 +111,12 @@ export interface CanaryTerminalWrite {
   modelUsage?: Record<string, unknown>;
   /** Turns the SDK reported it USED (the declared ceiling is on the row already). */
   actualTurns?: number;
+  /**
+   * The governed deliverable, already validated and hashed by the runner.
+   * Absent on every non-success path — the store never derives it, so there is
+   * exactly one place (the runner) that can decide output exists.
+   */
+  output?: { text: string; bytes: number; sha256: string; contentType: string };
   totalCostUsd?: number;
   sdkSubtype?: string;
   stopReason?: string;
@@ -155,7 +171,7 @@ function rowToReceipt(row: CanaryReceiptRow): CanaryReceipt {
     throw new Error(`Canary receipt ${key} has an unreadable reservation column`);
   }
 
-  return {
+  const receipt: CanaryReceipt = {
     contract_version: CANARY_CONTRACT_VERSION,
     principal: row.principal,
     external_run_id: row.external_run_id,
@@ -176,6 +192,17 @@ function rowToReceipt(row: CanaryReceiptRow): CanaryReceipt {
     ...(usage ? { usage } : {}),
     ...(modelUsage ? { model_usage: modelUsage } : {}),
     ...(row.total_cost_usd !== null ? { total_cost_usd: row.total_cost_usd } : {}),
+    // SQLite has no boolean type, so the column round-trips as 0/1. NULL means
+    // "pending" (no output block at all), which is distinct from 0.
+    ...(row.output_available === null || row.output_available === undefined
+      ? {}
+      : { output_available: Boolean(row.output_available) }),
+    ...(row.output_text !== null ? { output_text: row.output_text } : {}),
+    ...(row.output_bytes !== null ? { output_bytes: row.output_bytes } : {}),
+    ...(row.output_sha256 ? { output_sha256: row.output_sha256 } : {}),
+    ...(row.output_content_type
+      ? { output_content_type: row.output_content_type as typeof CANARY_OUTPUT_CONTENT_TYPE }
+      : {}),
     ...(row.sdk_subtype ? { sdk_subtype: row.sdk_subtype } : {}),
     ...(row.stop_reason ? { stop_reason: row.stop_reason } : {}),
     ...(errors?.length ? { errors } : {}),
@@ -183,11 +210,23 @@ function rowToReceipt(row: CanaryReceiptRow): CanaryReceipt {
     created_at: toIso(row.created_at),
     updated_at: toIso(row.updated_at),
   };
+
+  // Fail closed on READ as well as on write. A row that claims success while
+  // carrying no deliverable (or whose hash does not match its text) is corrupt,
+  // and returning it would let a caller settle against an unverifiable outcome.
+  // Mirrors the existing unreadable-reservation behaviour above.
+  const violations = findReceiptOutputViolations(receipt);
+  if (violations.length > 0) {
+    getLog().error({ key, violations }, 'db.canary_receipt_output_invariant_violated');
+    throw new Error(`Canary receipt ${key} violates its output contract: ${violations.join('; ')}`);
+  }
+  return receipt;
 }
 
 const SELECT_COLUMNS = `id, contract_version, external_run_id, external_task_id, contract_digest,
    principal, session_id, state, terminal_status, reason, terminal_at, requested_model,
    resolved_model, declared_max_turns, actual_turns, usage, model_usage, total_cost_usd,
+   output_available, output_text, output_bytes, output_sha256, output_content_type,
    sdk_subtype, stop_reason, errors, reservation, created_at, updated_at`;
 
 /**
@@ -326,12 +365,17 @@ export async function settleCanaryReceipt(
               model_usage = $7,
               actual_turns = $8,
               total_cost_usd = $9,
-              sdk_subtype = $10,
-              stop_reason = $11,
-              errors = $12,
+              output_available = $10,
+              output_text = $11,
+              output_bytes = $12,
+              output_sha256 = $13,
+              output_content_type = $14,
+              sdk_subtype = $15,
+              stop_reason = $16,
+              errors = $17,
               updated_at = ${dialect.now()}
-        WHERE principal = $13 AND external_run_id = $14 AND external_task_id = $15
-          AND contract_digest = $16 AND state = 'pending'`,
+        WHERE principal = $18 AND external_run_id = $19 AND external_task_id = $20
+          AND contract_digest = $21 AND state = 'pending'`,
       [
         terminalStatus,
         terminal.reason,
@@ -342,6 +386,13 @@ export async function settleCanaryReceipt(
         terminal.modelUsage ? JSON.stringify(terminal.modelUsage) : null,
         terminal.actualTurns ?? null,
         terminal.totalCostUsd ?? null,
+        // Every terminal receipt states availability; only a success carries
+        // the payload. Booleans are written as 0/1 so the two dialects agree.
+        terminal.output ? 1 : 0,
+        terminal.output?.text ?? null,
+        terminal.output?.bytes ?? null,
+        terminal.output?.sha256 ?? null,
+        terminal.output?.contentType ?? null,
         terminal.sdkSubtype ?? null,
         terminal.stopReason ?? null,
         terminal.errors?.length ? JSON.stringify(terminal.errors) : null,

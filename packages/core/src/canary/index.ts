@@ -7,6 +7,9 @@
  */
 export {
   CANARY_CONTRACT_VERSION,
+  CANARY_MAX_OUTPUT_BYTES,
+  CANARY_OUTPUT_CONTENT_TYPE,
+  canaryOutputSchema,
   canaryRequestSchema,
   canaryReceiptSchema,
   canaryReceiptStateSchema,
@@ -17,10 +20,13 @@ export {
   canonicalJson,
   canonicalRequestIdentity,
   contractDigest,
+  describeCanaryOutput,
+  findReceiptOutputViolations,
   terminalStatusForReason,
 } from './contract';
 export type {
   CanaryCanonicalIdentity,
+  CanaryOutput,
   CanaryReceipt,
   CanaryReceiptState,
   CanaryRequest,
@@ -45,6 +51,7 @@ export {
   buildBoundedOptions,
   classifyTerminalReason,
   executeCanaryRun,
+  governSuccessOutput,
   measureEffectivePrompt,
   redactForReceipt,
   submitCanaryRun,

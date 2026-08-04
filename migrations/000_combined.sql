@@ -564,6 +564,19 @@ CREATE TABLE IF NOT EXISTS remote_agent_canary_receipts (
   usage TEXT,
   model_usage TEXT,
   total_cost_usd DOUBLE PRECISION,
+
+  -- Governed deliverable. NULL output_available means the receipt is still
+  -- pending; 0/1 means terminal-without / terminal-with a deliverable. The
+  -- payload columns are populated only when output_available is 1, so "no
+  -- deliverable" can never be misread as "an empty deliverable".
+  -- Size is capped in code (CANARY_MAX_OUTPUT_BYTES); oversized output FAILS
+  -- the run rather than being truncated into this column.
+  output_available SMALLINT,
+  output_text TEXT,
+  output_bytes INTEGER,
+  output_sha256 VARCHAR(64),
+  output_content_type VARCHAR(64),
+
   sdk_subtype VARCHAR(64),
   stop_reason VARCHAR(64),
   errors TEXT,
@@ -604,6 +617,11 @@ END $$;
 
 -- Columns added by v2. Idempotent, for the same developer-machine case above.
 ALTER TABLE remote_agent_canary_receipts
+  ADD COLUMN IF NOT EXISTS output_available SMALLINT,
+  ADD COLUMN IF NOT EXISTS output_text TEXT,
+  ADD COLUMN IF NOT EXISTS output_bytes INTEGER,
+  ADD COLUMN IF NOT EXISTS output_sha256 VARCHAR(64),
+  ADD COLUMN IF NOT EXISTS output_content_type VARCHAR(64),
   ADD COLUMN IF NOT EXISTS session_id VARCHAR(200),
   ADD COLUMN IF NOT EXISTS terminal_status VARCHAR(16),
   ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMP WITH TIME ZONE,

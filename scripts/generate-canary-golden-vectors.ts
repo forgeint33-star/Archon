@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import {
   GOLDEN_AUTHENTICATION,
   GOLDEN_ENDPOINTS,
+  GOLDEN_OUTPUT_CONTRACT,
   GOLDEN_PRINCIPAL,
   GOLDEN_SENTINELS,
   GOLDEN_TERMINAL_VOCABULARY,
@@ -62,18 +63,23 @@ export const GOLDEN_FILES: Record<string, unknown> = {
   'pending-acknowledgement.json': envelope({
     endpoint: GOLDEN_ENDPOINTS.submit,
     $description:
-      'The 202 acknowledgement. NOT a settlement: state is "pending" and every ' +
-      'settleable field is ABSENT (not zero). Poll the read endpoint for the ' +
-      'terminal receipt before releasing or charging a reservation.',
+      'The 202 acknowledgement. NOT a settlement: state is "pending", every ' +
+      'settleable field is ABSENT (not zero), and there is no output block at ' +
+      'all — not even output_available:false, which would read as a settled ' +
+      '"this produced nothing". Poll the read endpoint for the terminal receipt.',
     response: goldenPendingAcknowledgement(),
   }),
 
   'terminal-receipt-success.json': envelope({
     endpoint: GOLDEN_ENDPOINTS.read,
     $description:
-      'A settled receipt for a run that completed. terminal_status "succeeded" ' +
-      'iff reason is "completed".',
+      'A settled receipt for a run that completed, carrying its governed ' +
+      'deliverable. terminal_status "succeeded" iff reason is "completed", and ' +
+      'a succeeded receipt ALWAYS carries output_available:true — Archon fails ' +
+      'the run closed rather than report success with nothing to show for it. ' +
+      'Verify output_sha256 over the UTF-8 bytes of output_text before acting.',
     terminal_vocabulary: GOLDEN_TERMINAL_VOCABULARY,
+    output_contract: GOLDEN_OUTPUT_CONTRACT,
     response: { receipt: goldenTerminalSuccess() },
   }),
 
@@ -82,8 +88,11 @@ export const GOLDEN_FILES: Record<string, unknown> = {
     $description:
       'A settled receipt for a run that hit its budget ceiling. The aggregate ' +
       'is present and must be settled from — a ceiling hit is a real, billed ' +
-      'run, reported as failed because it did not do the work.',
+      'run, reported as failed because it did not do the work. ' +
+      'output_available is false and output_text is ABSENT, not empty: a failed ' +
+      'run publishes no deliverable even if the agent left partial text behind.',
     terminal_vocabulary: GOLDEN_TERMINAL_VOCABULARY,
+    output_contract: GOLDEN_OUTPUT_CONTRACT,
     response: { receipt: goldenTerminalFailure() },
   }),
 };

@@ -1279,6 +1279,10 @@ async function* streamClaudeMessages(
         type: 'result',
         sessionId: resultMsg.session_id,
         ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+        // The final assistant text. Only SDKResultSuccess carries it, and only
+        // as a string — anything else is treated as absent rather than coerced,
+        // so a consumer never receives a deliverable Archon invented.
+        ...(typeof resultMsg.result === 'string' ? { result: resultMsg.result } : {}),
         ...(tokens ? { tokens } : {}),
         ...(resultMsg.structured_output !== undefined
           ? { structuredOutput: resultMsg.structured_output }

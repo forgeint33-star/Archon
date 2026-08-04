@@ -27,8 +27,15 @@
  *   FAKE_CLAUDE_LOG        append a JSONL record of argv, stdin and env here.
  *                          This is how tests assert on what the SDK really sent.
  *   FAKE_CLAUDE_SCENARIO   success | max_turns | max_budget | no_usage |
- *                          crash | hang | no_result   (default: success)
+ *                          crash | hang | no_result | empty_output |
+ *                          whitespace_output | oversized_output |
+ *                          unicode_output | failure_with_output
+ *                          (default: success)
  *   FAKE_CLAUDE_EXIT_CODE  exit code for the `crash` scenario (default 1)
+ *   FAKE_CLAUDE_OUTPUT     override the final assistant text for `success`
+ *   FAKE_CLAUDE_OVERSIZE_BYTES
+ *                          size of the `oversized_output` payload (default
+ *                          1048577 — one byte past the contract ceiling)
  */
 import { appendFileSync } from 'node:fs';
 
@@ -77,6 +84,35 @@ const MODEL_USAGE = {
   },
 };
 
+/** Default deliverable for the success path. */
+const DEFAULT_OUTPUT = 'bounded canary output';
+
+/**
+ * Final assistant text per scenario. `undefined` means the SDK omits the field
+ * entirely, which is distinct from an empty string — Archon must fail closed on
+ * both, and the tests need to prove it does so for each separately.
+ */
+function outputForScenario() {
+  switch (SCENARIO) {
+    case 'empty_output':
+      return '';
+    case 'whitespace_output':
+      return '   \n\t  ';
+    case 'no_output_field':
+      return undefined;
+    case 'oversized_output':
+      // One byte past the ceiling by default: the interesting case is the
+      // boundary, not an obviously absurd payload.
+      return 'x'.repeat(Number(process.env.FAKE_CLAUDE_OVERSIZE_BYTES || 1048577));
+    case 'unicode_output':
+      // Multi-byte on purpose: UTF-16 .length would report 8 here while the
+      // UTF-8 byte length is 20, so a wrong implementation is caught.
+      return 'héllo → 世界';
+    default:
+      return process.env.FAKE_CLAUDE_OUTPUT ?? DEFAULT_OUTPUT;
+  }
+}
+
 const BASE_RESULT = {
   type: 'result',
   session_id: 'fake-session',
@@ -112,6 +148,20 @@ function resultForScenario() {
         stop_reason: 'max_budget_usd',
         errors: ['Exceeded the maximum budget of $1.00'],
       };
+    case 'failure_with_output':
+      // A ceiling hit that ALSO left text behind. Archon must not attach it:
+      // a partial result on a failed run is not a deliverable.
+      return {
+        ...BASE_RESULT,
+        subtype: 'error_max_turns',
+        is_error: true,
+        num_turns: 3,
+        total_cost_usd: 0.42,
+        usage: { input_tokens: 1200, output_tokens: 340 },
+        stop_reason: 'max_turns',
+        result: 'partial work that must never be published as a deliverable',
+        errors: ['Reached the maximum number of turns (3)'],
+      };
     case 'no_usage':
       // A terminal result that carries NO usage aggregate. The receipt must
       // record the turn count and reason it does have, and must NOT invent a
@@ -123,13 +173,17 @@ function resultForScenario() {
         num_turns: 1,
         errors: ['Execution failed before any usage was reported'],
       };
-    default:
+    default: {
+      const output = outputForScenario();
       return {
         ...BASE_RESULT,
         subtype: 'success',
         is_error: false,
         num_turns: 2,
-        result: 'bounded canary output',
+        // Omit the field entirely when undefined, exactly as an SDK that
+        // produced nothing would — not `result: undefined`, which JSON drops
+        // anyway but which would read as intentional in the fixture.
+        ...(output === undefined ? {} : { result: output }),
         total_cost_usd: 0.0087,
         usage: {
           input_tokens: 1200,
@@ -138,6 +192,7 @@ function resultForScenario() {
           cache_creation_input_tokens: 16,
         },
       };
+    }
   }
 }
 

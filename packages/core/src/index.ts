@@ -269,10 +269,13 @@ export { syncArchonToWorktree } from './utils/worktree-sync';
 // Bounded canary execution mode (opt-in; disabled by default — see canary/index.ts)
 export {
   CANARY_CONTRACT_VERSION,
+  CANARY_MAX_OUTPUT_BYTES,
+  CANARY_OUTPUT_CONTENT_TYPE,
   CanaryRefusedError,
   MODEL_BOUNDS,
   admitCanaryRequest,
   buildBoundedOptions,
+  canaryOutputSchema,
   canaryReceiptSchema,
   canaryRequestSchema,
   canaryReservationSchema,
@@ -285,10 +288,13 @@ export {
   computeWorstCase,
   contractDigest,
   createPendingCanaryReceipt,
+  describeCanaryOutput,
   estimateTokens,
   executeCanaryRun,
+  findReceiptOutputViolations,
   getCanaryReceiptForPrincipal,
   getModelBounds,
+  governSuccessOutput,
   isCanaryModeEnabled,
   listCanaryDigestsForTask,
   listPriceableModels,
@@ -302,6 +308,7 @@ export {
 } from './canary';
 export type {
   CanaryCanonicalIdentity,
+  CanaryOutput,
   CanaryReceipt,
   CanaryReceiptKey,
   CanaryReceiptState,

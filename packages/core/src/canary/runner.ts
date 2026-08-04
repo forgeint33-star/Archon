@@ -28,7 +28,10 @@ import {
 import type { CanaryReceiptKey, CanaryTerminalWrite } from '../db/canary-receipts';
 import {
   CANARY_CONTRACT_VERSION,
+  CANARY_MAX_OUTPUT_BYTES,
+  CANARY_OUTPUT_CONTENT_TYPE,
   contractDigest,
+  describeCanaryOutput,
   type CanaryReceipt,
   type CanaryRequest,
   type CanaryReservation,
@@ -270,6 +273,54 @@ export function buildBoundedOptions(request: CanaryRequest): BoundedModeOptions 
   };
 }
 
+/**
+ * Decide the governed output for a dispatch that the SDK reported as success.
+ *
+ * Returns either the attested deliverable, or a REPLACEMENT terminal reason
+ * that fails the run closed. It never returns "success with nothing", and it
+ * never truncates: a shortened deliverable carrying a hash of the shortened
+ * bytes would attest to text the agent never produced.
+ *
+ * Whitespace-only counts as absent — a run whose entire deliverable is a
+ * newline produced nothing a caller can act on. The emptiness TEST trims; the
+ * persisted bytes never do, so `output_sha256` always covers exactly what is
+ * returned.
+ */
+export function governSuccessOutput(
+  resultText: string | undefined
+):
+  | { ok: true; output: { text: string; bytes: number; sha256: string; contentType: string } }
+  | { ok: false; reason: CanaryTerminalReason; error: string } {
+  if (resultText === undefined || resultText.trim() === '') {
+    return {
+      ok: false,
+      reason: 'missing_output',
+      error:
+        'The SDK reported success but produced no final assistant text. Failing closed: a ' +
+        'succeeded receipt must carry a deliverable. The run still executed and its cost ' +
+        'aggregate is recorded below.',
+    };
+  }
+
+  const { bytes, sha256 } = describeCanaryOutput(resultText);
+  if (bytes > CANARY_MAX_OUTPUT_BYTES) {
+    return {
+      ok: false,
+      reason: 'output_too_large',
+      error:
+        `The final assistant text is ${bytes} UTF-8 bytes, over the ${CANARY_MAX_OUTPUT_BYTES}-byte ` +
+        'ceiling. Failing closed rather than truncating: a truncated deliverable reported as ' +
+        'success would be silently wrong. The run still executed and its cost aggregate is ' +
+        'recorded below.',
+    };
+  }
+
+  return {
+    ok: true,
+    output: { text: resultText, bytes, sha256, contentType: CANARY_OUTPUT_CONTENT_TYPE },
+  };
+}
+
 /** Injected so tests can drive a fake provider without a real subprocess. */
 export interface CanaryRunnerDeps {
   /** Provider factory. Defaults to a fresh ClaudeProvider. */
@@ -325,18 +376,34 @@ export async function executeCanaryRun(
       // would otherwise have its later, possibly-emptier aggregate overwrite
       // the real one.
       if (terminal) continue;
+      const sdkReason = classifyTerminalReason(chunk);
+
+      // Output is governed ONLY on the success path. A run that hit a ceiling
+      // or errored is a failure regardless of what text it happened to leave
+      // behind, and attaching a deliverable to it would invite settling on a
+      // partial result as though the work were done.
+      const governed = sdkReason === 'completed' ? governSuccessOutput(chunk.result) : undefined;
+      const reason = governed && !governed.ok ? governed.reason : sdkReason;
+      const outputErrors = governed && !governed.ok ? [governed.error] : [];
+      const sdkErrors = chunk.errors?.length ? chunk.errors.map(redactForReceipt) : [];
+      const errors = [...outputErrors, ...sdkErrors];
+
       terminal = {
-        reason: classifyTerminalReason(chunk),
+        reason,
         ...(chunk.model !== undefined ? { resolvedModel: chunk.model } : {}),
         ...(chunk.sessionId !== undefined ? { sessionId: chunk.sessionId } : {}),
         ...(toCanaryUsage(chunk) ? { usage: toCanaryUsage(chunk) } : {}),
         ...(chunk.modelUsage ? { modelUsage: chunk.modelUsage } : {}),
         ...(chunk.numTurns !== undefined ? { actualTurns: chunk.numTurns } : {}),
         ...(chunk.cost !== undefined ? { totalCostUsd: chunk.cost } : {}),
+        ...(governed?.ok ? { output: governed.output } : {}),
+        // The SDK's own subtype is reported verbatim even when Archon
+        // downgrades the outcome: the caller needs to see that the SDK said
+        // `success` AND that Archon refused it, not just the refusal.
         ...(chunk.errorSubtype !== undefined ? { sdkSubtype: chunk.errorSubtype } : {}),
         ...(chunk.isError ? {} : { sdkSubtype: 'success' }),
         ...(chunk.stopReason !== undefined ? { stopReason: chunk.stopReason } : {}),
-        ...(chunk.errors?.length ? { errors: chunk.errors.map(redactForReceipt) } : {}),
+        ...(errors.length ? { errors } : {}),
       };
     }
 
