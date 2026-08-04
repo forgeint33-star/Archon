@@ -11,7 +11,9 @@ import {
   CANARY_CONTRACT_VERSION,
   canaryRequestSchema,
   canonicalJson,
+  canonicalRequestIdentity,
   contractDigest,
+  terminalStatusForReason,
   type CanaryRequest,
 } from './contract';
 import { MODEL_BOUNDS, computeWorstCase, estimateTokens, getModelBounds } from './model-bounds';
@@ -69,10 +71,21 @@ describe('canaryRequestSchema', () => {
     expect(canaryRequestSchema.safeParse(body).success).toBe(false);
   });
 
-  test('rejects a contract version other than the current one', () => {
+  test.each(['archon.canary.v1', 'archon.canary.v3', 'v2', ''])(
+    'rejects contract version %p — only the current literal is accepted',
+    version => {
+      expect(
+        canaryRequestSchema.safeParse({ ...validRequest(), contract_version: version }).success
+      ).toBe(false);
+    }
+  );
+
+  test('rejects a caller-supplied principal — authority is never payload', () => {
+    // The principal is resolved from the bearer token. A body that carries one
+    // must be REFUSED rather than have it silently ignored, or a caller could
+    // believe they scoped a request they did not.
     expect(
-      canaryRequestSchema.safeParse({ ...validRequest(), contract_version: 'archon.canary.v2' })
-        .success
+      canaryRequestSchema.safeParse({ ...validRequest(), principal: 'someone-else' }).success
     ).toBe(false);
   });
 
@@ -94,6 +107,8 @@ describe('canaryRequestSchema', () => {
   });
 });
 
+const PRINCIPAL = 'goviral';
+
 describe('canonicalJson and contractDigest', () => {
   test('key order does not change the digest', () => {
     const a = validRequest();
@@ -104,21 +119,43 @@ describe('canonicalJson and contractDigest', () => {
     ) as unknown as CanaryRequest;
 
     expect(canonicalJson(a)).toBe(canonicalJson(reordered));
-    expect(contractDigest(a)).toBe(contractDigest(reordered));
+    expect(contractDigest(a, PRINCIPAL)).toBe(contractDigest(reordered, PRINCIPAL));
   });
 
   test('any meaningful change produces a different digest', () => {
-    const base = contractDigest(validRequest());
-    expect(contractDigest(validRequest({ max_turns: 4 }))).not.toBe(base);
-    expect(contractDigest(validRequest({ prompt: 'build a different thing' }))).not.toBe(base);
-    expect(contractDigest(validRequest({ model: 'claude-haiku-4-5' }))).not.toBe(base);
-    expect(contractDigest(validRequest({ system_prompt: 'other' }))).not.toBe(base);
+    const base = contractDigest(validRequest(), PRINCIPAL);
+    expect(contractDigest(validRequest({ max_turns: 4 }), PRINCIPAL)).not.toBe(base);
+    expect(contractDigest(validRequest({ prompt: 'build a different thing' }), PRINCIPAL)).not.toBe(
+      base
+    );
+    expect(contractDigest(validRequest({ model: 'claude-haiku-4-5' }), PRINCIPAL)).not.toBe(base);
+    expect(contractDigest(validRequest({ system_prompt: 'other' }), PRINCIPAL)).not.toBe(base);
+  });
+
+  test('a DIFFERENT principal digests the SAME body differently', () => {
+    // This is the v1 collision, closed at the digest layer. Two principals
+    // sending byte-identical bodies must not address one identity.
+    const body = validRequest();
+    expect(contractDigest(body, 'alpha')).not.toBe(contractDigest(body, 'beta'));
+  });
+
+  test('the principal is part of the canonical identity, not appended to it', () => {
+    const body = validRequest();
+    expect(canonicalRequestIdentity(body, PRINCIPAL)).toEqual({
+      authenticated_principal: PRINCIPAL,
+      request: body,
+    });
+  });
+
+  test('an empty principal is refused rather than digested', () => {
+    // Digesting '' would give every unauthenticated submission one identity.
+    expect(() => contractDigest(validRequest(), '')).toThrow(/authenticated principal/);
   });
 
   test('the digest is a stable 64-char hex sha256', () => {
-    const d = contractDigest(validRequest());
+    const d = contractDigest(validRequest(), PRINCIPAL);
     expect(d).toMatch(/^[0-9a-f]{64}$/);
-    expect(contractDigest(validRequest())).toBe(d);
+    expect(contractDigest(validRequest(), PRINCIPAL)).toBe(d);
   });
 
   test('canonicalJson sorts nested keys and drops undefined', () => {
@@ -288,5 +325,25 @@ describe('computeWorstCase', () => {
     });
     // 10 * 0.003 + 128 * 0.015 = 0.03 + 1.92
     expect(result.fullTurnsUsd).toBeCloseTo(1.95, 6);
+  });
+});
+
+describe('terminal vocabulary', () => {
+  test('the current wire version is v2', () => {
+    expect(CANARY_CONTRACT_VERSION).toBe('archon.canary.v2');
+  });
+
+  test('succeeded means exactly "completed"; every ceiling hit is failed', () => {
+    expect(terminalStatusForReason('completed')).toBe('succeeded');
+    for (const reason of [
+      'max_turns_exhausted',
+      'max_budget_exhausted',
+      'sdk_error',
+      'no_terminal_aggregate',
+      'deadline_exceeded',
+      'refused',
+    ] as const) {
+      expect(terminalStatusForReason(reason)).toBe('failed');
+    }
   });
 });

@@ -215,10 +215,14 @@ export function registerCanaryRoutes(app: OpenAPIHono): void {
     const externalTaskId = c.req.param('externalTaskId') ?? '';
     const digest = c.req.query('contract_digest') ?? '';
 
-    const receipt = await getCanaryReceiptForPrincipal(
-      { externalRunId, externalTaskId, contractDigest: digest },
-      principal
-    );
+    // The principal is part of the LOOKUP KEY, not a post-filter: a receipt
+    // belonging to anyone else is never selected in the first place.
+    const receipt = await getCanaryReceiptForPrincipal({
+      principal,
+      externalRunId,
+      externalTaskId,
+      contractDigest: digest,
+    });
 
     if (!receipt) {
       // Identical response whether the receipt does not exist or belongs to

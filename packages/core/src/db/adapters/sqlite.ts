@@ -170,8 +170,46 @@ export class SqliteAdapter implements IDatabase {
    * ensuring new tables from migrations are created in existing databases.
    */
   private initSchema(): void {
+    this.dropLegacyCanaryV1Table();
     this.createSchema();
     this.migrateColumns();
+  }
+
+  /**
+   * Remove a contract-v1-shaped canary receipts table so createSchema() can
+   * build the v2 one.
+   *
+   * WHY A DROP AND NOT AN ALTER. v1 declared its uniqueness as an inline
+   * `UNIQUE(external_run_id, external_task_id, contract_digest)`, which SQLite
+   * implements as an internal `sqlite_autoindex_*` that cannot be dropped. That
+   * index is precisely the v1 defect — it rejects a second principal's row — so
+   * leaving it in place would mean the v2 fix silently did not apply on SQLite.
+   *
+   * WHY THE DROP IS SAFE. Contract v1 was never deployed; the only databases
+   * that can have this shape are developer machines that ran the unreleased
+   * branch. Any rows in them carry `contract_version = 'archon.canary.v1'`,
+   * which the v2 receipt schema refuses to parse — so no code path can return
+   * them and nothing is losable. Detection is by the absence of a v2-only NOT
+   * NULL column, never by version string, so a partially-built table is caught
+   * too.
+   */
+  private dropLegacyCanaryV1Table(): void {
+    try {
+      const cols = this.db.prepare("PRAGMA table_info('remote_agent_canary_receipts')").all() as {
+        name: string;
+      }[];
+      // No table yet — nothing to do; createSchema() will build v2.
+      if (cols.length === 0) return;
+      if (cols.some(c => c.name === 'declared_max_turns')) return;
+
+      const [{ n }] = this.db
+        .prepare('SELECT COUNT(*) AS n FROM remote_agent_canary_receipts')
+        .all() as { n: number }[];
+      this.db.run('DROP TABLE remote_agent_canary_receipts');
+      getLog().warn({ discardedRows: n }, 'db.sqlite_canary_v1_table_dropped_for_v2_identity_key');
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_canary_v1_table_drop_failed');
+    }
   }
 
   /**
@@ -475,14 +513,15 @@ export class SqliteAdapter implements IDatabase {
         UNIQUE(user_id)
       );
 
-      -- Canary receipts (bounded canary execution contract). Mirrors
+      -- Canary receipts (bounded canary execution contract, v2). Mirrors
       -- migrations/000_combined.sql Table 11 — see there for the full rationale.
-      -- One row per bounded dispatch, keyed by the CALLER's run/task ids plus
-      -- the digest of the exact contract, so a re-submit returns the existing
-      -- receipt and a changed contract never reuses an older run's numbers.
-      -- The principal column scopes reads. Aggregate columns are NULLABLE: a
-      -- run with no terminal aggregate leaves them NULL rather than writing 0,
-      -- which would read as "this cost nothing".
+      -- One row per bounded dispatch, keyed by WHO asked plus the caller's
+      -- run/task ids plus the digest of the exact contract. The principal is
+      -- part of the key because external ids are the CALLER's namespace: two
+      -- callers using 'run-1/task-1' is ordinary, and contract v1 keyed without
+      -- the principal and collided them into a single row.
+      -- Aggregate columns are NULLABLE: a run with no terminal aggregate leaves
+      -- them NULL rather than writing 0, which would read as "this cost nothing".
       CREATE TABLE IF NOT EXISTS remote_agent_canary_receipts (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
         contract_version TEXT NOT NULL,
@@ -490,25 +529,35 @@ export class SqliteAdapter implements IDatabase {
         external_task_id TEXT NOT NULL,
         contract_digest TEXT NOT NULL,
         principal TEXT NOT NULL,
+        session_id TEXT,
         state TEXT NOT NULL,
+        terminal_status TEXT,
         reason TEXT,
+        terminal_at TEXT,
         requested_model TEXT NOT NULL,
-        model TEXT,
+        resolved_model TEXT,
+        declared_max_turns INTEGER NOT NULL,
+        actual_turns INTEGER,
         usage TEXT,
         model_usage TEXT,
-        num_turns INTEGER,
         total_cost_usd REAL,
         sdk_subtype TEXT,
         stop_reason TEXT,
         errors TEXT,
         reservation TEXT NOT NULL,
         created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now')),
-        UNIQUE(external_run_id, external_task_id, contract_digest)
+        updated_at TEXT DEFAULT (datetime('now'))
       );
 
+      -- THE identity key. A named unique index rather than an inline UNIQUE so
+      -- it can be inspected and replaced; SQLite cannot drop the autoindex an
+      -- inline UNIQUE creates, which is what made the v1 shape unfixable in
+      -- place (see migrateColumns).
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_receipts_identity
+        ON remote_agent_canary_receipts(principal, external_run_id, external_task_id, contract_digest);
+
       CREATE INDEX IF NOT EXISTS idx_canary_receipts_lookup
-        ON remote_agent_canary_receipts(external_run_id, external_task_id, principal);
+        ON remote_agent_canary_receipts(principal, external_run_id, external_task_id);
 
       -- Codebases table
       CREATE TABLE IF NOT EXISTS remote_agent_codebases (

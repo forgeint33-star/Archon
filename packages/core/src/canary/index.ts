@@ -13,15 +13,20 @@ export {
   canaryReservationSchema,
   canaryTerminalReasonSchema,
   canaryUsageSchema,
+  canaryTerminalStatusSchema,
   canonicalJson,
+  canonicalRequestIdentity,
   contractDigest,
+  terminalStatusForReason,
 } from './contract';
 export type {
+  CanaryCanonicalIdentity,
   CanaryReceipt,
   CanaryReceiptState,
   CanaryRequest,
   CanaryReservation,
   CanaryTerminalReason,
+  CanaryTerminalStatus,
   CanaryUsage,
 } from './contract';
 

@@ -26,8 +26,21 @@ import { createHash } from 'node:crypto';
 /**
  * Contract version. Part of the digest, so a version bump necessarily produces
  * a different receipt key and can never be confused with an older run.
+ *
+ * v2 (this version) closes a cross-principal collision in v1. v1 keyed receipts
+ * by `(external_run_id, external_task_id, contract_digest)` with the principal
+ * absent from BOTH the digest and the uniqueness key. Two principals submitting
+ * the same external ids with identical bodies therefore produced one row: the
+ * second principal's insert was suppressed by ON CONFLICT, its principal-scoped
+ * read-back found nothing, and the submit failed. Worse than the error was the
+ * shape of the bug — external ids are the CALLER's namespace, so two unrelated
+ * callers colliding on `run-1/task-1` is ordinary, not exotic.
+ *
+ * v2 makes the authenticated principal part of the canonical identity, the
+ * digest, and the uniqueness key. There is no v1→v2 upgrade path because v1 was
+ * never deployed; a v1 payload is refused outright by the version literal.
  */
-export const CANARY_CONTRACT_VERSION = 'archon.canary.v1' as const;
+export const CANARY_CONTRACT_VERSION = 'archon.canary.v2' as const;
 
 /**
  * External identifier: the caller's own run/task id. Kept deliberately narrow
@@ -142,6 +155,13 @@ export const canaryRequestSchema = z
 
     /** Tool names denied on top of the mandatory bounded-mode set. */
     extra_disallowed_tools: z.array(z.string().min(1)).max(100).optional(),
+
+    // NOTE: there is deliberately no `principal` field. The principal is
+    // AUTHORITY, and authority is never taken from the payload — it is derived
+    // server-side from the validated bearer token (see `resolveCanaryPrincipal`)
+    // and folded into the canonical identity by `contractDigest`. `.strict()`
+    // below turns a caller-supplied `principal` into a 400 rather than letting
+    // it sit ignored in a body the caller believes was honoured.
   })
   .strict();
 
@@ -164,12 +184,44 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * Stable digest of a VALIDATED contract. Half of the receipt key, so the same
- * contract always addresses the same receipt and a changed contract never
- * silently reuses one.
+ * The canonical request identity: the AUTHENTICATED principal plus the
+ * validated request, and nothing else.
+ *
+ * The principal is the first key on purpose. External run/task ids belong to
+ * the caller's own namespace, so two unrelated callers using `run-1/task-1` is
+ * ordinary. Identity that omits who is asking is therefore not an identity at
+ * all — which is exactly how v1 collided.
  */
-export function contractDigest(request: CanaryRequest): string {
-  return createHash('sha256').update(canonicalJson(request), 'utf8').digest('hex');
+export interface CanaryCanonicalIdentity {
+  /** Resolved from the bearer token server-side. Never read from the body. */
+  authenticated_principal: string;
+  request: CanaryRequest;
+}
+
+export function canonicalRequestIdentity(
+  request: CanaryRequest,
+  authenticatedPrincipal: string
+): CanaryCanonicalIdentity {
+  return { authenticated_principal: authenticatedPrincipal, request };
+}
+
+/**
+ * Stable digest over the canonical identity. Part of the receipt key, so the
+ * same principal re-submitting the same contract always addresses the same
+ * receipt, a changed contract never silently reuses one, and a DIFFERENT
+ * principal never addresses another's receipt at all.
+ *
+ * `authenticatedPrincipal` must come from token resolution. Passing a
+ * caller-supplied value here would reintroduce the v1 flaw in a new place.
+ */
+export function contractDigest(request: CanaryRequest, authenticatedPrincipal: string): string {
+  if (!authenticatedPrincipal) {
+    // Fail loudly rather than digest an empty principal, which would make every
+    // unauthenticated submission share one identity.
+    throw new Error('contractDigest requires a resolved authenticated principal');
+  }
+  const identity = canonicalRequestIdentity(request, authenticatedPrincipal);
+  return createHash('sha256').update(canonicalJson(identity), 'utf8').digest('hex');
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +265,26 @@ export const canaryTerminalReasonSchema = z.enum([
   'refused',
 ]);
 export type CanaryTerminalReason = z.infer<typeof canaryTerminalReasonSchema>;
+
+/**
+ * Coarse terminal outcome, present only on a `terminal` receipt.
+ *
+ * Deliberately separate from `reason`: a consumer deciding "did this work?"
+ * must not have to enumerate every reason value, and a reason added in a later
+ * version must not silently read as success to an older consumer. `reason`
+ * remains the precise answer; this is the safe one.
+ *
+ * `succeeded` means exactly `reason === 'completed'`. Every ceiling hit —
+ * turns, budget, deadline — is `failed`, because a run that stopped at a bound
+ * did not do the work it was asked to do.
+ */
+export const canaryTerminalStatusSchema = z.enum(['succeeded', 'failed']);
+export type CanaryTerminalStatus = z.infer<typeof canaryTerminalStatusSchema>;
+
+/** The single place the reason → status mapping is decided. */
+export function terminalStatusForReason(reason: CanaryTerminalReason): CanaryTerminalStatus {
+  return reason === 'completed' ? 'succeeded' : 'failed';
+}
 
 /** Per-dispatch usage aggregate. NEVER per model attempt — see file header. */
 export const canaryUsageSchema = z.object({
@@ -262,30 +334,71 @@ export type CanaryReservation = z.infer<typeof canaryReservationSchema>;
  * exactly the lie the whole contract exists to avoid.
  */
 export const canaryReceiptSchema = z.object({
+  // ─── Identity ──────────────────────────────────────────────────────────
   contract_version: z.literal(CANARY_CONTRACT_VERSION),
+  /**
+   * The AUTHENTICATED principal that submitted this run, echoed back so a
+   * settling caller can verify the receipt is theirs rather than inferring it
+   * from the fact that a read succeeded.
+   */
+  principal: z.string(),
   external_run_id: z.string(),
   external_task_id: z.string(),
+  /** sha256 over `{authenticated_principal, request}` — see `contractDigest`. */
   contract_digest: z.string(),
+  /**
+   * Archon-side identity of this submission, stable for the life of the
+   * receipt. Distinct from the caller's external ids: it identifies the record
+   * in Archon regardless of what the caller called it.
+   */
+  request_id: z.string(),
+  /**
+   * Provider conversation identity — the SDK session the dispatch ran in.
+   * Absent when the run never reached a session (refusal, dead subprocess
+   * before init). This is the handle for correlating with provider-side logs.
+   */
+  session_id: z.string().optional(),
 
+  // ─── Lifecycle ─────────────────────────────────────────────────────────
   state: canaryReceiptStateSchema,
-  /** Absent while `pending`. */
+  /** Coarse outcome. Absent while `pending`. */
+  terminal_status: canaryTerminalStatusSchema.optional(),
+  /** Precise outcome. Absent while `pending`. */
   reason: canaryTerminalReasonSchema.optional(),
+  /** ISO-8601 instant of settlement. Absent while `pending`. */
+  terminal_at: z.string().optional(),
 
-  /** Model requested by the contract. */
+  // ─── Model ─────────────────────────────────────────────────────────────
+  /** Model the contract asked for. */
   requested_model: z.string(),
-  /** Model the SDK reported it actually ran. Absent if the run never started. */
-  model: z.string().optional(),
+  /**
+   * Model the SDK reported it actually RAN. Absent if the run never started.
+   * A settling caller must price this one, not `requested_model` — they differ
+   * exactly when something went wrong enough to matter.
+   */
+  resolved_model: z.string().optional(),
 
+  // ─── Turns ─────────────────────────────────────────────────────────────
+  /** The ceiling the contract declared (`max_turns`). Always present. */
+  declared_max_turns: z.number().int().positive(),
+  /**
+   * Turns the SDK reported it actually used. Absent when no terminal aggregate
+   * arrived — absent, never 0, since 0 would read as "it did nothing".
+   */
+  actual_turns: z.number().int().nonnegative().optional(),
+
+  // ─── Aggregate (per-DISPATCH, never per model attempt) ─────────────────
   usage: canaryUsageSchema.optional(),
   /** Raw per-model usage map exactly as the SDK reported it. */
   model_usage: z.record(z.string(), z.unknown()).optional(),
-  num_turns: z.number().int().nonnegative().optional(),
   total_cost_usd: z.number().nonnegative().optional(),
+
+  // ─── Failure details ───────────────────────────────────────────────────
   /** SDK result subtype (`success`, `error_max_turns`, …), verbatim. */
   sdk_subtype: z.string().optional(),
   /** SDK `stop_reason`, verbatim. */
   stop_reason: z.string().optional(),
-  /** SDK-reported error strings, or the refusal reasons. Never contains secrets. */
+  /** SDK error strings or refusal reasons, credential-redacted and truncated. */
   errors: z.array(z.string()).optional(),
 
   reservation: canaryReservationSchema,

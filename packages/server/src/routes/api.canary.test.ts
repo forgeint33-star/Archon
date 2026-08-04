@@ -71,14 +71,17 @@ const RESERVATION = {
   declared_bound_worst_case_usd: 0.72,
 };
 
-function pendingReceipt(req: CanaryRequest): CanaryReceipt {
+function pendingReceipt(req: CanaryRequest, principal: string): CanaryReceipt {
   return {
     contract_version: CANARY_CONTRACT_VERSION,
+    principal,
     external_run_id: req.external_run_id,
     external_task_id: req.external_task_id,
-    contract_digest: contractDigest(req),
+    contract_digest: contractDigest(req, principal),
+    request_id: `req-${principal}-${req.external_task_id}`,
     state: 'pending',
     requested_model: req.model,
+    declared_max_turns: req.max_turns,
     reservation: RESERVATION,
     created_at: '2026-08-04T10:00:00.000Z',
     updated_at: '2026-08-04T10:00:00.000Z',
@@ -95,7 +98,7 @@ const mockSubmit = mock(async (req: CanaryRequest, principal: string) => {
   if (submitBehaviour === 'throw') {
     throw new Error('internal detail that must not leak: /opt/secret/path');
   }
-  const receipt = pendingReceipt(req);
+  const receipt = pendingReceipt(req, principal);
   const key = `${principal}|${receipt.external_run_id}|${receipt.external_task_id}|${receipt.contract_digest}`;
   const already = receipts.has(key);
   if (!already) receipts.set(key, receipt);
@@ -103,10 +106,15 @@ const mockSubmit = mock(async (req: CanaryRequest, principal: string) => {
 });
 
 const mockGetReceipt = mock(
-  async (
-    key: { externalRunId: string; externalTaskId: string; contractDigest: string },
-    principal: string
-  ) => receipts.get(`${principal}|${key.externalRunId}|${key.externalTaskId}|${key.contractDigest}`)
+  async (key: {
+    principal: string;
+    externalRunId: string;
+    externalTaskId: string;
+    contractDigest: string;
+  }) =>
+    receipts.get(
+      `${key.principal}|${key.externalRunId}|${key.externalTaskId}|${key.contractDigest}`
+    )
 );
 
 // The REAL schemas are re-exported through the mock: route validation is part
@@ -259,8 +267,10 @@ describe('submit is an acknowledgement, never a settlement', () => {
     // Nothing settleable is present. A caller cannot mistake this for a receipt.
     expect(body.receipt.total_cost_usd).toBeUndefined();
     expect(body.receipt.usage).toBeUndefined();
-    expect(body.receipt.num_turns).toBeUndefined();
+    expect(body.receipt.actual_turns).toBeUndefined();
     expect(body.receipt.reason).toBeUndefined();
+    expect(body.receipt.terminal_status).toBeUndefined();
+    expect(body.receipt.terminal_at).toBeUndefined();
     // The reservation IS returned, so the caller can hold it immediately.
     expect(body.reservation.worst_case_usd).toBe(3.784);
     expect(body.reservation.declared_bound_worst_case_usd).toBe(0.72);
@@ -326,7 +336,7 @@ describe('governed read', () => {
   test("returns the caller's own receipt", async () => {
     const app = buildApp();
     await submit(app, validBody(), TOKEN_A);
-    const digest = contractDigest(canaryRequestSchema.parse(validBody()));
+    const digest = contractDigest(canaryRequestSchema.parse(validBody()), 'goviral');
 
     const res = await readReceipt(app, 'canary-a', 'task-1', digest, TOKEN_A);
     expect(res.status).toBe(200);
@@ -338,7 +348,8 @@ describe('governed read', () => {
   test("one task cannot read another principal's receipt", async () => {
     const app = buildApp();
     await submit(app, validBody(), TOKEN_A);
-    const digest = contractDigest(canaryRequestSchema.parse(validBody()));
+    // Principal A's digest, presented by principal B.
+    const digest = contractDigest(canaryRequestSchema.parse(validBody()), 'goviral');
 
     const res = await readReceipt(app, 'canary-a', 'task-1', digest, TOKEN_B);
     // Indistinguishable from a receipt that does not exist — no 403, which
@@ -368,16 +379,19 @@ describe('governed read', () => {
   test('a terminal receipt exposes the full aggregate', async () => {
     const app = buildApp();
     await submit(app, validBody(), TOKEN_A);
-    const digest = contractDigest(canaryRequestSchema.parse(validBody()));
+    const digest = contractDigest(canaryRequestSchema.parse(validBody()), 'goviral');
     const key = `goviral|canary-a|task-1|${digest}`;
 
     receipts.set(key, {
       ...(receipts.get(key) as CanaryReceipt),
       state: 'terminal',
+      terminal_status: 'failed',
       reason: 'max_budget_exhausted',
-      model: 'claude-sonnet-5',
+      terminal_at: '2026-08-04T10:00:05.000Z',
+      resolved_model: 'claude-sonnet-5',
+      session_id: 'fake-session',
       usage: { input_tokens: 4200, output_tokens: 900 },
-      num_turns: 2,
+      actual_turns: 2,
       total_cost_usd: 1.07,
       sdk_subtype: 'error_max_budget_usd',
     });
@@ -385,8 +399,11 @@ describe('governed read', () => {
     const res = await readReceipt(app, 'canary-a', 'task-1', digest, TOKEN_A);
     const body = (await res.json()) as { receipt: CanaryReceipt };
     expect(body.receipt.state).toBe('terminal');
+    expect(body.receipt.terminal_status).toBe('failed');
     expect(body.receipt.reason).toBe('max_budget_exhausted');
+    expect(body.receipt.terminal_at).toBe('2026-08-04T10:00:05.000Z');
     expect(body.receipt.total_cost_usd).toBe(1.07);
-    expect(body.receipt.num_turns).toBe(2);
+    expect(body.receipt.actual_turns).toBe(2);
+    expect(body.receipt.declared_max_turns).toBe(3);
   });
 });

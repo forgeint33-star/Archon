@@ -1,16 +1,25 @@
 /**
- * Storage for bounded-canary receipts.
+ * Storage for bounded-canary receipts (contract v2).
  *
- * KEYING. A receipt is addressed by `(external_run_id, external_task_id,
- * contract_digest)` — the caller's own identifiers plus a digest of the exact
- * contract they submitted. That triple is what makes submission idempotent:
+ * KEYING. A receipt is addressed by `(principal, external_run_id,
+ * external_task_id, contract_digest)` — WHO asked, what they called it, and a
+ * digest of the exact contract. All four, because external ids belong to the
+ * caller's own namespace: two unrelated callers using `run-1/task-1` is
+ * ordinary, and v1's principal-free key made them collide into a single row.
+ *
+ * That quadruple is what makes submission idempotent per principal:
  * re-submitting the same contract returns the existing receipt instead of
- * starting a second billed run, while a CHANGED contract for the same task
- * cannot silently reuse an older run's numbers.
+ * starting a second billed run, a CHANGED contract for the same task cannot
+ * silently reuse an older run's numbers, and a DIFFERENT principal gets its own
+ * independent record.
  *
- * PRINCIPAL. Every row records the authenticated client that created it, and
- * every read is filtered on it. A caller therefore cannot read a receipt
- * belonging to another principal — not even one whose run/task ids they guess.
+ * The principal is also folded into `contract_digest` itself, so the two
+ * defences are independent: even a digest collision could not cross principals,
+ * and even a mis-specified index could not either.
+ *
+ * PRINCIPAL SCOPING ON READ. Every read filters on the principal, so a caller
+ * cannot read a receipt belonging to another — not even one whose run/task ids
+ * they guess.
  *
  * NULLS ARE MEANINGFUL. Aggregate columns stay NULL when a dispatch produced no
  * terminal aggregate. Writing 0 would read as "this run cost nothing", which is
@@ -27,9 +36,10 @@ import type {
   CanaryReceiptState,
   CanaryReservation,
   CanaryTerminalReason,
+  CanaryTerminalStatus,
   CanaryUsage,
 } from '../canary/contract';
-import { CANARY_CONTRACT_VERSION } from '../canary/contract';
+import { CANARY_CONTRACT_VERSION, terminalStatusForReason } from '../canary/contract';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -39,18 +49,23 @@ function getLog(): ReturnType<typeof createLogger> {
 
 /** Raw row shape. JSON columns arrive as TEXT on both dialects. */
 interface CanaryReceiptRow {
+  id: string;
   contract_version: string;
   external_run_id: string;
   external_task_id: string;
   contract_digest: string;
   principal: string;
+  session_id: string | null;
   state: string;
+  terminal_status: string | null;
   reason: string | null;
+  terminal_at: string | Date | null;
   requested_model: string;
-  model: string | null;
+  resolved_model: string | null;
+  declared_max_turns: number;
+  actual_turns: number | null;
   usage: string | null;
   model_usage: string | null;
-  num_turns: number | null;
   total_cost_usd: number | null;
   sdk_subtype: string | null;
   stop_reason: string | null;
@@ -60,8 +75,16 @@ interface CanaryReceiptRow {
   updated_at: string | Date;
 }
 
-/** Natural key of a receipt. All three parts are required for any lookup. */
+/**
+ * Natural key of a receipt.
+ *
+ * The PRINCIPAL is part of it (v2). External run/task ids live in the caller's
+ * own namespace, so two callers using `run-1/task-1` is ordinary — a key that
+ * omitted the principal made those two collide into one row, which is the
+ * defect v2 exists to close. Every lookup requires all four parts.
+ */
 export interface CanaryReceiptKey {
+  principal: string;
   externalRunId: string;
   externalTaskId: string;
   contractDigest: string;
@@ -70,14 +93,32 @@ export interface CanaryReceiptKey {
 /** Terminal aggregate to settle a receipt with. */
 export interface CanaryTerminalWrite {
   reason: CanaryTerminalReason;
-  model?: string;
+  /** Model the SDK reported it RAN. */
+  resolvedModel?: string;
+  /** Provider conversation identity. */
+  sessionId?: string;
   usage?: CanaryUsage;
   modelUsage?: Record<string, unknown>;
-  numTurns?: number;
+  /** Turns the SDK reported it USED (the declared ceiling is on the row already). */
+  actualTurns?: number;
   totalCostUsd?: number;
   sdkSubtype?: string;
   stopReason?: string;
   errors?: string[];
+}
+
+/**
+ * Log-safe view of a key. The principal NAME is not a secret (the token is, and
+ * never reaches here), but the digest is long and noisy — trim it so log lines
+ * stay readable while still distinguishing two contracts.
+ */
+function redactKey(key: CanaryReceiptKey): Record<string, string> {
+  return {
+    principal: key.principal,
+    externalRunId: key.externalRunId,
+    externalTaskId: key.externalTaskId,
+    contractDigest: `${key.contractDigest.slice(0, 12)}…`,
+  };
 }
 
 function parseJsonColumn(key: string, column: string, raw: string | null): unknown {
@@ -116,16 +157,24 @@ function rowToReceipt(row: CanaryReceiptRow): CanaryReceipt {
 
   return {
     contract_version: CANARY_CONTRACT_VERSION,
+    principal: row.principal,
     external_run_id: row.external_run_id,
     external_task_id: row.external_task_id,
     contract_digest: row.contract_digest,
+    request_id: row.id,
+    ...(row.session_id ? { session_id: row.session_id } : {}),
     state: row.state as CanaryReceiptState,
+    ...(row.terminal_status
+      ? { terminal_status: row.terminal_status as CanaryTerminalStatus }
+      : {}),
     ...(row.reason ? { reason: row.reason as CanaryTerminalReason } : {}),
+    ...(row.terminal_at ? { terminal_at: toIso(row.terminal_at) } : {}),
     requested_model: row.requested_model,
-    ...(row.model ? { model: row.model } : {}),
+    ...(row.resolved_model ? { resolved_model: row.resolved_model } : {}),
+    declared_max_turns: row.declared_max_turns,
+    ...(row.actual_turns !== null ? { actual_turns: row.actual_turns } : {}),
     ...(usage ? { usage } : {}),
     ...(modelUsage ? { model_usage: modelUsage } : {}),
-    ...(row.num_turns !== null ? { num_turns: row.num_turns } : {}),
     ...(row.total_cost_usd !== null ? { total_cost_usd: row.total_cost_usd } : {}),
     ...(row.sdk_subtype ? { sdk_subtype: row.sdk_subtype } : {}),
     ...(row.stop_reason ? { stop_reason: row.stop_reason } : {}),
@@ -136,9 +185,10 @@ function rowToReceipt(row: CanaryReceiptRow): CanaryReceipt {
   };
 }
 
-const SELECT_COLUMNS = `contract_version, external_run_id, external_task_id, contract_digest,
-   principal, state, reason, requested_model, model, usage, model_usage, num_turns,
-   total_cost_usd, sdk_subtype, stop_reason, errors, reservation, created_at, updated_at`;
+const SELECT_COLUMNS = `id, contract_version, external_run_id, external_task_id, contract_digest,
+   principal, session_id, state, terminal_status, reason, terminal_at, requested_model,
+   resolved_model, declared_max_turns, actual_turns, usage, model_usage, total_cost_usd,
+   sdk_subtype, stop_reason, errors, reservation, created_at, updated_at`;
 
 /**
  * Create the `pending` row for a submission, or return the existing receipt if
@@ -151,11 +201,11 @@ const SELECT_COLUMNS = `contract_version, external_run_id, external_task_id, con
  */
 export async function createPendingCanaryReceipt(params: {
   key: CanaryReceiptKey;
-  principal: string;
   requestedModel: string;
+  declaredMaxTurns: number;
   reservation: CanaryReservation;
 }): Promise<{ created: boolean; receipt: CanaryReceipt }> {
-  const { key, principal, requestedModel, reservation } = params;
+  const { key, requestedModel, declaredMaxTurns, reservation } = params;
   const dialect = getDialect();
   const id = dialect.generateUuid();
 
@@ -164,28 +214,32 @@ export async function createPendingCanaryReceipt(params: {
     inserted = await pool.query(
       `INSERT INTO remote_agent_canary_receipts
          (id, contract_version, external_run_id, external_task_id, contract_digest,
-          principal, state, requested_model, reservation)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
-       ON CONFLICT (external_run_id, external_task_id, contract_digest) DO NOTHING`,
+          principal, state, requested_model, declared_max_turns, reservation)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)
+       ON CONFLICT (principal, external_run_id, external_task_id, contract_digest) DO NOTHING`,
       [
         id,
         CANARY_CONTRACT_VERSION,
         key.externalRunId,
         key.externalTaskId,
         key.contractDigest,
-        principal,
+        key.principal,
         requestedModel,
+        declaredMaxTurns,
         JSON.stringify(reservation),
       ]
     );
   } catch (err) {
-    getLog().error({ err: err as Error, key }, 'db.canary_receipt_insert_failed');
+    getLog().error({ err: err as Error, key: redactKey(key) }, 'db.canary_receipt_insert_failed');
     throw err;
   }
 
   // Read back unconditionally: the row exists either way, and re-reading is the
   // only way to return the WINNER's receipt rather than the loser's local view.
-  const existing = await getCanaryReceiptForPrincipal(key, principal);
+  // Under v2 the conflict target and this read are scoped to the SAME principal,
+  // so a suppressed insert always has a readable row behind it. Under v1 they
+  // disagreed, and a second principal's submit hit the throw below.
+  const existing = await getCanaryReceiptForPrincipal(key);
   if (!existing) {
     throw new Error(
       `Canary receipt ${key.externalRunId}/${key.externalTaskId} vanished immediately after insert`
@@ -207,15 +261,14 @@ export async function createPendingCanaryReceipt(params: {
  * principal cannot be used to probe for the existence of another's task.
  */
 export async function getCanaryReceiptForPrincipal(
-  key: CanaryReceiptKey,
-  principal: string
+  key: CanaryReceiptKey
 ): Promise<CanaryReceipt | undefined> {
   const result = await pool.query<CanaryReceiptRow>(
     `SELECT ${SELECT_COLUMNS}
        FROM remote_agent_canary_receipts
       WHERE external_run_id = $1 AND external_task_id = $2
         AND contract_digest = $3 AND principal = $4`,
-    [key.externalRunId, key.externalTaskId, key.contractDigest, principal]
+    [key.externalRunId, key.externalTaskId, key.contractDigest, key.principal]
   );
   const row = result.rows[0];
   return row ? rowToReceipt(row) : undefined;
@@ -251,54 +304,69 @@ export async function listCanaryDigestsForTask(
  */
 export async function settleCanaryReceipt(
   key: CanaryReceiptKey,
-  terminal: CanaryTerminalWrite
+  terminal: CanaryTerminalWrite,
+  /** Settlement instant. Injectable so golden vectors are reproducible. */
+  terminalAt: Date = new Date()
 ): Promise<boolean> {
   const dialect = getDialect();
+  // Derived in one place (contract.ts) so `terminal_status` and `reason` can
+  // never disagree about whether a run worked.
+  const terminalStatus = terminalStatusForReason(terminal.reason);
   let result: { rowCount?: number | null };
   try {
     result = await pool.query(
       `UPDATE remote_agent_canary_receipts
           SET state = 'terminal',
-              reason = $1,
-              model = $2,
-              usage = $3,
-              model_usage = $4,
-              num_turns = $5,
-              total_cost_usd = $6,
-              sdk_subtype = $7,
-              stop_reason = $8,
-              errors = $9,
+              terminal_status = $1,
+              reason = $2,
+              terminal_at = $3,
+              resolved_model = $4,
+              session_id = $5,
+              usage = $6,
+              model_usage = $7,
+              actual_turns = $8,
+              total_cost_usd = $9,
+              sdk_subtype = $10,
+              stop_reason = $11,
+              errors = $12,
               updated_at = ${dialect.now()}
-        WHERE external_run_id = $10 AND external_task_id = $11
-          AND contract_digest = $12 AND state = 'pending'`,
+        WHERE principal = $13 AND external_run_id = $14 AND external_task_id = $15
+          AND contract_digest = $16 AND state = 'pending'`,
       [
+        terminalStatus,
         terminal.reason,
-        terminal.model ?? null,
+        terminalAt.toISOString(),
+        terminal.resolvedModel ?? null,
+        terminal.sessionId ?? null,
         terminal.usage ? JSON.stringify(terminal.usage) : null,
         terminal.modelUsage ? JSON.stringify(terminal.modelUsage) : null,
-        terminal.numTurns ?? null,
+        terminal.actualTurns ?? null,
         terminal.totalCostUsd ?? null,
         terminal.sdkSubtype ?? null,
         terminal.stopReason ?? null,
         terminal.errors?.length ? JSON.stringify(terminal.errors) : null,
+        key.principal,
         key.externalRunId,
         key.externalTaskId,
         key.contractDigest,
       ]
     );
   } catch (err) {
-    getLog().error({ err: err as Error, key }, 'db.canary_receipt_settle_failed');
+    getLog().error({ err: err as Error, key: redactKey(key) }, 'db.canary_receipt_settle_failed');
     throw err;
   }
 
   const settled = (result.rowCount ?? 0) > 0;
   if (!settled) {
     getLog().warn(
-      { key, reason: terminal.reason },
+      { key: redactKey(key), reason: terminal.reason },
       'db.canary_receipt_settle_skipped_already_terminal'
     );
   } else {
-    getLog().info({ key, reason: terminal.reason }, 'db.canary_receipt_settle_completed');
+    getLog().info(
+      { key: redactKey(key), reason: terminal.reason, terminalStatus },
+      'db.canary_receipt_settle_completed'
+    );
   }
   return settled;
 }

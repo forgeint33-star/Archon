@@ -44,21 +44,23 @@ const RESERVATION = {
   declared_bound_worst_case_usd: 0.72,
 };
 
+const PRINCIPAL = 'goviral';
+const OTHER_PRINCIPAL = 'someone-else';
+
 const KEY = {
+  principal: PRINCIPAL,
   externalRunId: 'run-a',
   externalTaskId: 'task-1',
   contractDigest: 'a'.repeat(64),
 };
 
-const PRINCIPAL = 'goviral';
-
 async function seedPending(
-  overrides: Partial<{ key: typeof KEY; principal: string }> = {}
+  overrides: Partial<{ key: typeof KEY }> = {}
 ): Promise<{ created: boolean }> {
   const result = await createPendingCanaryReceipt({
     key: overrides.key ?? KEY,
-    principal: overrides.principal ?? PRINCIPAL,
     requestedModel: 'claude-sonnet-5',
+    declaredMaxTurns: 3,
     reservation: RESERVATION,
   });
   return { created: result.created };
@@ -84,7 +86,7 @@ describe('createPendingCanaryReceipt', () => {
     const { created } = await seedPending();
     expect(created).toBe(true);
 
-    const receipt = await getCanaryReceiptForPrincipal(KEY, PRINCIPAL);
+    const receipt = await getCanaryReceiptForPrincipal(KEY);
     expect(receipt?.state).toBe('pending');
     expect(receipt?.requested_model).toBe('claude-sonnet-5');
     expect(receipt?.reservation).toEqual(RESERVATION);
@@ -95,7 +97,7 @@ describe('createPendingCanaryReceipt', () => {
     expect(receipt?.reason).toBeUndefined();
     expect(receipt?.usage).toBeUndefined();
     expect(receipt?.total_cost_usd).toBeUndefined();
-    expect(receipt?.num_turns).toBeUndefined();
+    expect(receipt?.actual_turns).toBeUndefined();
     expect(receipt?.model).toBeUndefined();
   });
 
@@ -129,27 +131,27 @@ describe('principal scoping', () => {
   test('another principal cannot read the receipt, and cannot tell it exists', async () => {
     await seedPending();
 
-    const asOwner = await getCanaryReceiptForPrincipal(KEY, PRINCIPAL);
+    const asOwner = await getCanaryReceiptForPrincipal(KEY);
     expect(asOwner).toBeDefined();
 
     // Indistinguishable from "no such receipt": same undefined, no error, no
     // partial data. A caller cannot probe for another task's existence.
-    const asStranger = await getCanaryReceiptForPrincipal(KEY, 'someone-else');
+    const asStranger = await getCanaryReceiptForPrincipal({ ...KEY, principal: OTHER_PRINCIPAL });
     expect(asStranger).toBeUndefined();
 
-    const missing = await getCanaryReceiptForPrincipal(
-      { ...KEY, externalTaskId: 'does-not-exist' },
-      PRINCIPAL
-    );
+    const missing = await getCanaryReceiptForPrincipal({
+      ...KEY,
+      externalTaskId: 'does-not-exist',
+    });
     expect(missing).toBeUndefined();
   });
 
   test('a wrong contract digest does not fall back to another digest of the same task', async () => {
     await seedPending();
-    const wrongDigest = await getCanaryReceiptForPrincipal(
-      { ...KEY, contractDigest: 'c'.repeat(64) },
-      PRINCIPAL
-    );
+    const wrongDigest = await getCanaryReceiptForPrincipal({
+      ...KEY,
+      contractDigest: 'c'.repeat(64),
+    });
     expect(wrongDigest).toBeUndefined();
   });
 
@@ -165,20 +167,21 @@ describe('settleCanaryReceipt', () => {
 
     const settled = await settleCanaryReceipt(KEY, {
       reason: 'completed',
-      model: 'claude-sonnet-5',
+      resolvedModel: 'claude-sonnet-5',
+      sessionId: 'fake-session',
       usage: { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 64 },
       modelUsage: { 'claude-sonnet-5': { inputTokens: 1200, outputTokens: 340 } },
-      numTurns: 2,
+      actualTurns: 2,
       totalCostUsd: 0.0087,
       sdkSubtype: 'success',
       stopReason: 'end_turn',
     });
     expect(settled).toBe(true);
 
-    const receipt = await getCanaryReceiptForPrincipal(KEY, PRINCIPAL);
+    const receipt = await getCanaryReceiptForPrincipal(KEY);
     expect(receipt?.state).toBe('terminal');
     expect(receipt?.reason).toBe('completed');
-    expect(receipt?.model).toBe('claude-sonnet-5');
+    expect(receipt?.resolved_model).toBe('claude-sonnet-5');
     expect(receipt?.usage).toEqual({
       input_tokens: 1200,
       output_tokens: 340,
@@ -187,7 +190,7 @@ describe('settleCanaryReceipt', () => {
     expect(receipt?.model_usage).toEqual({
       'claude-sonnet-5': { inputTokens: 1200, outputTokens: 340 },
     });
-    expect(receipt?.num_turns).toBe(2);
+    expect(receipt?.actual_turns).toBe(2);
     expect(receipt?.total_cost_usd).toBe(0.0087);
     expect(receipt?.sdk_subtype).toBe('success');
     expect(receipt?.stop_reason).toBe('end_turn');
@@ -202,12 +205,12 @@ describe('settleCanaryReceipt', () => {
     await settleCanaryReceipt(KEY, {
       reason,
       sdkSubtype: subtype,
-      numTurns: 3,
+      actualTurns: 3,
       totalCostUsd: 0.42,
       usage: { input_tokens: 100, output_tokens: 20 },
     });
 
-    const receipt = await getCanaryReceiptForPrincipal(KEY, PRINCIPAL);
+    const receipt = await getCanaryReceiptForPrincipal(KEY);
     expect(receipt?.reason).toBe(reason);
     expect(receipt?.sdk_subtype).toBe(subtype);
     // Exhaustion still carries the aggregate — that is what makes settling on
@@ -222,7 +225,7 @@ describe('settleCanaryReceipt', () => {
       errors: ['Stream ended with no terminal result'],
     });
 
-    const receipt = await getCanaryReceiptForPrincipal(KEY, PRINCIPAL);
+    const receipt = await getCanaryReceiptForPrincipal(KEY);
     expect(receipt?.state).toBe('terminal');
     expect(receipt?.reason).toBe('no_terminal_aggregate');
     // Absent, not 0. A zero would read as "this run cost nothing" and would let
@@ -236,13 +239,13 @@ describe('settleCanaryReceipt', () => {
   test('settling twice does not overwrite the first terminal aggregate', async () => {
     await seedPending();
     expect(
-      await settleCanaryReceipt(KEY, { reason: 'completed', totalCostUsd: 0.5, numTurns: 2 })
+      await settleCanaryReceipt(KEY, { reason: 'completed', totalCostUsd: 0.5, actualTurns: 2 })
     ).toBe(true);
 
     // A late deadline-abort racing the real result must lose.
     expect(await settleCanaryReceipt(KEY, { reason: 'deadline_exceeded' })).toBe(false);
 
-    const receipt = await getCanaryReceiptForPrincipal(KEY, PRINCIPAL);
+    const receipt = await getCanaryReceiptForPrincipal(KEY);
     expect(receipt?.reason).toBe('completed');
     expect(receipt?.total_cost_usd).toBe(0.5);
   });

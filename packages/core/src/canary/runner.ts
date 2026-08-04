@@ -327,10 +327,11 @@ export async function executeCanaryRun(
       if (terminal) continue;
       terminal = {
         reason: classifyTerminalReason(chunk),
-        ...(chunk.model !== undefined ? { model: chunk.model } : {}),
+        ...(chunk.model !== undefined ? { resolvedModel: chunk.model } : {}),
+        ...(chunk.sessionId !== undefined ? { sessionId: chunk.sessionId } : {}),
         ...(toCanaryUsage(chunk) ? { usage: toCanaryUsage(chunk) } : {}),
         ...(chunk.modelUsage ? { modelUsage: chunk.modelUsage } : {}),
-        ...(chunk.numTurns !== undefined ? { numTurns: chunk.numTurns } : {}),
+        ...(chunk.numTurns !== undefined ? { actualTurns: chunk.numTurns } : {}),
         ...(chunk.cost !== undefined ? { totalCostUsd: chunk.cost } : {}),
         ...(chunk.errorSubtype !== undefined ? { sdkSubtype: chunk.errorSubtype } : {}),
         ...(chunk.isError ? {} : { sdkSubtype: 'success' }),
@@ -374,7 +375,7 @@ export async function executeCanaryRun(
     clearTimeout(deadlineTimer);
   }
 
-  await settleCanaryReceipt(key, terminal);
+  await settleCanaryReceipt(key, terminal, now());
 }
 
 /**
@@ -391,8 +392,12 @@ export async function submitCanaryRun(
   deps: CanaryRunnerDeps = {}
 ): Promise<CanarySubmitResult> {
   const now = (deps.now ?? ((): Date => new Date()))();
-  const digest = contractDigest(request);
+  // The digest covers the AUTHENTICATED principal, so two principals sending
+  // byte-identical bodies produce different digests — and the key carries the
+  // principal explicitly as well, so neither defence stands alone.
+  const digest = contractDigest(request, principal);
   const key: CanaryReceiptKey = {
+    principal,
     externalRunId: request.external_run_id,
     externalTaskId: request.external_task_id,
     contractDigest: digest,
@@ -420,8 +425,8 @@ export async function submitCanaryRun(
 
   const { created, receipt } = await createPendingCanaryReceipt({
     key,
-    principal,
     requestedModel: request.model,
+    declaredMaxTurns: request.max_turns,
     reservation,
   });
 

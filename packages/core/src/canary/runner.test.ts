@@ -26,6 +26,17 @@ const FIXTURE = resolve(
   'fake-claude-cli.mjs'
 );
 
+/**
+ * The run cwd is created ONCE for the file and never deleted between tests.
+ *
+ * `submitCanaryRun` is fire-and-forget by design, so a dispatch can outlive the
+ * test that started it. Deleting its cwd in afterEach made those stragglers die
+ * with "current working directory was deleted" and flood the output with error
+ * logs — noise that would hide a real failure. Per-test scratch (database, fake
+ * CLI log) still gets its own directory and is still cleaned up.
+ */
+const RUN_CWD = mkdtempSync(join(tmpdir(), 'archon-canary-cwd-'));
+
 let db: SqliteAdapter;
 let dbPath: string;
 let workDir: string;
@@ -81,7 +92,7 @@ function request(overrides: Partial<CanaryRequestType> = {}): CanaryRequestType 
     deadline_at: '2026-08-04T10:05:00.000Z',
     prompt: 'build the bounded thing',
     system_prompt: 'You are a bounded canary worker.',
-    cwd: workDir,
+    cwd: RUN_CWD,
     ...overrides,
   });
 }
@@ -93,18 +104,47 @@ async function waitForTerminal(
   timeoutMs = 20_000
 ): Promise<NonNullable<Awaited<ReturnType<typeof getCanaryReceiptForPrincipal>>>> {
   const key = {
+    principal,
     externalRunId: req.external_run_id,
     externalTaskId: req.external_task_id,
-    contractDigest: contractDigest(req),
+    contractDigest: contractDigest(req, principal),
   };
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const receipt = await getCanaryReceiptForPrincipal(key, principal);
+    const receipt = await getCanaryReceiptForPrincipal(key);
     if (receipt?.state === 'terminal') return receipt;
     if (Date.now() > deadline) {
       throw new Error(`receipt never became terminal (last state: ${receipt?.state ?? 'missing'})`);
     }
     await new Promise(r => setTimeout(r, 25));
+  }
+}
+
+/**
+ * Wait for every dispatch started by the finished test to reach `terminal`.
+ *
+ * `submitCanaryRun` is fire-and-forget, and `proxyPool` always reads the
+ * CURRENT `db`. Without this drain a straggler from one test settles into the
+ * NEXT test's database and corrupts it — which is exactly what happened when
+ * the shared run cwd first stopped stragglers from dying on their own.
+ *
+ * Capped rather than unbounded: a test that deliberately leaves a run hanging
+ * should cost a bounded pause, not hang the suite.
+ */
+async function drainInFlightDispatches(capMs = 5_000): Promise<void> {
+  const deadline = Date.now() + capMs;
+  for (;;) {
+    let pending = 0;
+    try {
+      const r = await db.query<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM remote_agent_canary_receipts WHERE state = 'pending'"
+      );
+      pending = r.rows[0].n;
+    } catch {
+      return; // database already closed — nothing left to drain
+    }
+    if (pending === 0 || Date.now() > deadline) return;
+    await new Promise(res => setTimeout(res, 25));
   }
 }
 
@@ -122,7 +162,8 @@ beforeEach(() => {
   process.env.IS_SANDBOX = '1';
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await drainInFlightDispatches();
   db.close?.();
   for (const k of ENV_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
@@ -277,9 +318,14 @@ describe('submitCanaryRun — end to end through the fake SDK subprocess', () =>
 
     const terminal = await waitForTerminal(req);
     expect(terminal.reason).toBe('completed');
+    expect(terminal.terminal_status).toBe('succeeded');
+    expect(terminal.terminal_at).toBeDefined();
     expect(terminal.sdk_subtype).toBe('success');
-    expect(terminal.model).toBe('claude-sonnet-5');
-    expect(terminal.num_turns).toBe(2);
+    expect(terminal.resolved_model).toBe('claude-sonnet-5');
+    expect(terminal.session_id).toBe('fake-session');
+    expect(terminal.principal).toBe(PRINCIPAL);
+    expect(terminal.declared_max_turns).toBe(3);
+    expect(terminal.actual_turns).toBe(2);
     expect(terminal.total_cost_usd).toBe(0.0087);
     expect(terminal.usage).toEqual({
       input_tokens: 1200,
@@ -299,8 +345,10 @@ describe('submitCanaryRun — end to end through the fake SDK subprocess', () =>
 
     const terminal = await waitForTerminal(req);
     expect(terminal.reason).toBe('max_turns_exhausted');
+    expect(terminal.terminal_status).toBe('failed');
     expect(terminal.sdk_subtype).toBe('error_max_turns');
-    expect(terminal.num_turns).toBe(3);
+    expect(terminal.declared_max_turns).toBe(3);
+    expect(terminal.actual_turns).toBe(3);
     expect(terminal.total_cost_usd).toBe(0.42);
     expect(terminal.errors?.join(' ')).toContain('maximum number of turns');
   });
@@ -312,6 +360,7 @@ describe('submitCanaryRun — end to end through the fake SDK subprocess', () =>
 
     const terminal = await waitForTerminal(req);
     expect(terminal.reason).toBe('max_budget_exhausted');
+    expect(terminal.terminal_status).toBe('failed');
     expect(terminal.sdk_subtype).toBe('error_max_budget_usd');
     expect(terminal.total_cost_usd).toBe(1.07);
   });
@@ -323,8 +372,9 @@ describe('submitCanaryRun — end to end through the fake SDK subprocess', () =>
 
     const terminal = await waitForTerminal(req);
     expect(terminal.reason).toBe('sdk_error');
+    expect(terminal.terminal_status).toBe('failed');
     expect(terminal.sdk_subtype).toBe('error_during_execution');
-    expect(terminal.num_turns).toBe(1);
+    expect(terminal.actual_turns).toBe(1);
     // Absent, not zero — settlement must charge the reservation, not $0.
     expect(terminal.usage).toBeUndefined();
     expect(terminal.total_cost_usd).toBeUndefined();
@@ -413,30 +463,51 @@ describe('submitCanaryRun — identity and idempotency', () => {
     const terminal = await waitForTerminal(req);
     expect(terminal.state).toBe('terminal');
 
-    const key = {
-      externalRunId: req.external_run_id,
-      externalTaskId: req.external_task_id,
-      contractDigest: contractDigest(req),
-    };
-    // Same key, wrong principal: indistinguishable from "no such receipt".
-    expect(await getCanaryReceiptForPrincipal(key, OTHER_PRINCIPAL)).toBeUndefined();
+    // Same external identity, wrong principal: indistinguishable from "no such
+    // receipt" — and note the digest itself differs too, so a cross-principal
+    // read cannot even be addressed, let alone answered.
+    expect(
+      await getCanaryReceiptForPrincipal({
+        principal: OTHER_PRINCIPAL,
+        externalRunId: req.external_run_id,
+        externalTaskId: req.external_task_id,
+        contractDigest: contractDigest(req, PRINCIPAL),
+      })
+    ).toBeUndefined();
   });
 
-  test('two principals submitting the same task ids keep separate receipts', async () => {
+  test('two principals submitting identical bodies get INDEPENDENT records', async () => {
+    // This is the v1 collision, end to end. Under v1 the second submit threw
+    // ("receipt vanished immediately after insert") because the conflict target
+    // omitted the principal while the read-back included it.
     const req = request({ external_task_id: 'task-shared-id' });
+
     const mine = await submitCanaryRun(req, PRINCIPAL, { now: () => NOW });
     expect(mine.started).toBe(true);
-    await waitForTerminal(req, PRINCIPAL);
+    const theirs = await submitCanaryRun(req, OTHER_PRINCIPAL, { now: () => NOW });
+    expect(theirs.started).toBe(true);
 
-    // The other principal's submit collides on the DB key (which is
-    // principal-independent by design, so one contract means one run), but the
-    // row it reads back is NOT theirs — the read stays principal-scoped.
-    const key = {
-      externalRunId: req.external_run_id,
-      externalTaskId: req.external_task_id,
-      contractDigest: contractDigest(req),
-    };
-    expect(await getCanaryReceiptForPrincipal(key, PRINCIPAL)).toBeDefined();
-    expect(await getCanaryReceiptForPrincipal(key, OTHER_PRINCIPAL)).toBeUndefined();
-  });
+    // Two rows, two digests, two independent runs.
+    expect(theirs.receipt.contract_digest).not.toBe(mine.receipt.contract_digest);
+    expect(mine.receipt.principal).toBe(PRINCIPAL);
+    expect(theirs.receipt.principal).toBe(OTHER_PRINCIPAL);
+
+    const count = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM remote_agent_canary_receipts'
+    );
+    expect(count.rows[0].n).toBe(2);
+
+    // Each settles on its own, and neither can read the other.
+    const a = await waitForTerminal(req, PRINCIPAL);
+    const b = await waitForTerminal(req, OTHER_PRINCIPAL);
+    expect(a.request_id).not.toBe(b.request_id);
+    expect(
+      await getCanaryReceiptForPrincipal({
+        principal: OTHER_PRINCIPAL,
+        externalRunId: req.external_run_id,
+        externalTaskId: req.external_task_id,
+        contractDigest: a.contract_digest,
+      })
+    ).toBeUndefined();
+  }, 40_000);
 });
