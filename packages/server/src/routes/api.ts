@@ -8,6 +8,7 @@ import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
 import { registerGoviralRoutes } from './goviral-control-plane';
 import { registerGoviralBrainRoutes } from './goviral-brain-api';
+import { registerCanaryRoutes } from './canary';
 import { boundMetadataToolOutputs } from '../adapters/web/truncate';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
@@ -1343,6 +1344,11 @@ export function registerApiRoutes(
 ): void {
   registerGoviralRoutes(app);
   registerGoviralBrainRoutes(app);
+  // Bounded canary contract. Registering is unconditional; the routes
+  // themselves 404 unless the mode is explicitly enabled, so the OpenAPI spec
+  // stays stable and enablement is a single runtime decision rather than a
+  // wiring difference between installs.
+  registerCanaryRoutes(app);
   function apiError(
     c: Context,
     status: 400 | 401 | 404 | 422 | 500 | 503,
@@ -1385,7 +1391,13 @@ export function registerApiRoutes(
   // STRIPS it from inbound requests (or the app binds 127.0.0.1). If you retire
   // the proxy auth sidecar, the proxy MUST still strip that header — otherwise a
   // client can forge it and walk straight through this gate.
-  const PUBLIC_API_GATE_PREFIXES = ['/api/auth/', '/api/health'];
+  // `/api/canary/` is exempt from the WEB-auth gate because it enforces its own,
+  // STRICTER auth: a bearer token that must resolve to a configured principal,
+  // with no anonymous path at all and a 404 when the mode is disabled. Leaving
+  // it gated would instead require a web user session for a machine contract
+  // that has no user. This is an exemption from one auth scheme in favour of
+  // another, never an exemption from authentication.
+  const PUBLIC_API_GATE_PREFIXES = ['/api/auth/', '/api/health', '/api/canary/'];
   app.use('/api/*', async (c, next) => {
     if (!isApiGateEnabled()) return next();
     const path = c.req.path;

@@ -23,6 +23,10 @@ export default tseslint.config(
       '*.mjs',
       '**/*.test.ts',
       '**/src/test/**', // Test helper files (mock factories, fixtures)
+      // Standalone test fixtures spawned as their own process (e.g. the fake
+      // Claude CLI). Not in any tsconfig project, so typed linting cannot run
+      // on them. Scoped to .mjs so a future TypeScript fixture is still linted.
+      '**/__fixtures__/*.mjs',
       '*.d.ts', // Root-level declaration files (not in tsconfig project scope)
       '**/*.generated.d.ts', // Auto-generated declaration files (e.g. openapi-typescript output)
       'packages/web/vite.config.ts', // Vite config doesn't need type-checked linting

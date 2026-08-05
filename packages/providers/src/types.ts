@@ -163,12 +163,19 @@ export type ProviderDefaultsMap = Record<string, ProviderDefaults>;
 
 /**
  * Token usage statistics from AI provider responses.
+ *
+ * `cacheRead` / `cacheCreation` are populated only by providers that report a
+ * prompt-cache split (Claude). They are NOT folded into `input` — the SDK
+ * already reports cache tokens separately from `input_tokens`, and settlement
+ * needs the split intact to price them at their own rates.
  */
 export interface TokenUsage {
   input: number;
   output: number;
   total?: number;
   cost?: number;
+  cacheRead?: number;
+  cacheCreation?: number;
 }
 
 /**
@@ -190,6 +197,26 @@ export type MessageChunk =
   | {
       type: 'result';
       sessionId?: string;
+      /**
+       * The agent's final assistant text — the SDK's `result` field on a
+       * successful terminal message.
+       *
+       * This is the DELIVERABLE, distinct from `structuredOutput` (which is
+       * only populated when the caller declared an output schema). Forwarded
+       * because a terminal aggregate proves what a run cost while saying
+       * nothing about what it produced; a consumer settling spend against a
+       * receipt with no deliverable is paying for an unverifiable outcome.
+       *
+       * Absent on error subtypes — SDKResultError has no `result` field.
+       */
+      result?: string;
+      /**
+       * Model the provider actually ran, as reported by the SDK itself (Claude:
+       * the `system`/`init` message) rather than the model Archon asked for.
+       * Settlement must price what ran, not what was requested — a silent
+       * substitution would otherwise be billed at the wrong rate.
+       */
+      model?: string;
       tokens?: TokenUsage;
       structuredOutput?: unknown;
       isError?: boolean;
@@ -409,6 +436,61 @@ export const CONTAINER_ENV_DENYLIST: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Opt-in bounded execution posture for ONE request — the provider half of the
+ * canary usage contract.
+ *
+ * Absent (the default, and the only value normal Archon traffic ever produces)
+ * every provider behaves exactly as before. Present, a provider that honors it
+ * MUST apply it as a final NARROWING pass over the options it would otherwise
+ * have built, so nothing earlier in the pipeline can widen a declared bound.
+ *
+ * Every field is required: a partially-declared bound is not a bound, and
+ * defaulting a missing one would silently invent a ceiling the caller never
+ * agreed to.
+ *
+ * Providers that cannot enforce these bounds must reject a request carrying
+ * this field rather than run it unbounded — see `BoundedModeUnsupportedError`.
+ */
+export interface BoundedModeOptions {
+  /** Hard cap on agentic turns. Claude: `--max-turns`. */
+  maxTurns: number;
+  /**
+   * Hard cap on spend. Claude: `--max-budget-usd`.
+   *
+   * STOP-AFTER, not refuse-before: the SDK aborts once the budget is exceeded,
+   * so the call that crosses the line has already been made and billed. A
+   * guaranteed ceiling is `maxBudgetUsd + one worst-case turn`.
+   */
+  maxBudgetUsd: number;
+  /**
+   * Subprocess retry attempts for THIS request only. `0` disables Archon's own
+   * retry loop, whose default multiplies spend invisibly to the caller.
+   */
+  maxSubprocessRetries: number;
+  /**
+   * Filesystem setting sources the agent may load. `[]` loads no CLAUDE.md,
+   * skills, commands or agents — the largest uncontrolled source of prompt
+   * growth, and the reason the effective prompt is measurable at all.
+   */
+  settingSources: ('project' | 'user')[];
+  /**
+   * Per-turn output cap, delivered to the Claude CLI as
+   * `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. The CLI clamps it to the model's
+   * `max_output_tokens.upper`, so it can only ever tighten.
+   */
+  maxOutputTokens: number;
+  /**
+   * Context cap, delivered as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. The CLI only
+   * honors it alongside `DISABLE_COMPACT`, which bounded mode also sets —
+   * auto-compaction spends extra summarization calls that `maxTurns` does not
+   * count, so a bounded run must fail at its limit rather than compact past it.
+   */
+  maxContextTokens: number;
+  /** Tool names to deny on top of the mandatory bounded-mode set. */
+  extraDisallowedTools?: string[];
+}
+
+/**
  * Universal request options accepted by all providers.
  * Provider-specific fields go through `nodeConfig` and `assistantConfig` in SendQueryOptions.
  */
@@ -432,6 +514,11 @@ export interface AgentRequestOptions {
    * `nativeTools` capability.
    */
   nativeTools?: NativeTool[];
+  /**
+   * Opt-in bounded execution posture. Omitted on every normal Archon path.
+   * See {@link BoundedModeOptions}.
+   */
+  bounded?: BoundedModeOptions;
 }
 
 /**

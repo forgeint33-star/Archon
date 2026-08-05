@@ -2,7 +2,7 @@
 -- Version: Combined (final state after migrations 001-020)
 -- Description: Complete database schema (idempotent - safe to run multiple times)
 --
--- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
+-- 15 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
 --   1. remote_agent_codebases
 --   1b. remote_agent_codebase_env_vars
 --   1c. remote_agent_users
@@ -17,6 +17,7 @@
 --   8. remote_agent_user_github_tokens
 --   9. remote_agent_user_provider_keys
 --   10. remote_agent_user_ai_prefs
+--   11. remote_agent_canary_receipts
 --
 -- Dropped tables (via migrations):
 --   - remote_agent_command_templates (017)
@@ -507,6 +508,136 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
 -- this column existed.
 ALTER TABLE remote_agent_user_ai_prefs
   ADD COLUMN IF NOT EXISTS default_model VARCHAR(255);
+
+-- ============================================================================
+-- Table 11: Canary receipts (bounded canary execution contract, v2)
+-- ============================================================================
+--
+-- One row per bounded dispatch, addressed by WHO asked plus what they called it
+-- plus a digest of the exact contract:
+--     (principal, external_run_id, external_task_id, contract_digest)
+--
+-- The principal is part of the key because external ids belong to the CALLER's
+-- namespace. Two unrelated callers both using 'run-1/task-1' is ordinary, not
+-- exotic. Contract v1 keyed without the principal and those two callers
+-- collided into a single row: the second principal's insert was suppressed by
+-- ON CONFLICT and its principal-scoped read-back then found nothing.
+--
+-- The principal is ALSO folded into contract_digest itself (see contract.ts),
+-- so the two defences are independent — neither a digest collision nor a
+-- mis-specified index alone could cross principals.
+--
+-- state is 'pending' or 'terminal'. A submit acknowledgement only ever creates
+-- 'pending'; settlement reads must require 'terminal'.
+--
+-- terminal_status ('succeeded' | 'failed') is the coarse outcome, derived from
+-- reason in one place in code. reason is the precise one. Both are stored so a
+-- consumer need not enumerate every reason value to answer "did this work?".
+--
+-- Aggregate columns are NULLABLE on purpose. A run that ended with no terminal
+-- aggregate (dead subprocess, deadline abort, pre-spawn refusal) leaves them
+-- NULL; writing 0 would read as "this cost nothing", precisely the lie this
+-- table exists to prevent.
+--
+-- usage / model_usage / errors / reservation are JSON-as-TEXT so SQLite and
+-- Postgres behave identically (same choice as user_ai_prefs.tiers).
+CREATE TABLE IF NOT EXISTS remote_agent_canary_receipts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  contract_version VARCHAR(64) NOT NULL,
+  external_run_id VARCHAR(200) NOT NULL,
+  external_task_id VARCHAR(200) NOT NULL,
+  contract_digest VARCHAR(64) NOT NULL,
+  principal VARCHAR(200) NOT NULL,
+  session_id VARCHAR(200),
+
+  state VARCHAR(16) NOT NULL,
+  terminal_status VARCHAR(16),
+  reason VARCHAR(32),
+  terminal_at TIMESTAMP WITH TIME ZONE,
+
+  requested_model VARCHAR(255) NOT NULL,
+  resolved_model VARCHAR(255),
+
+  declared_max_turns INTEGER NOT NULL,
+  actual_turns INTEGER,
+
+  usage TEXT,
+  model_usage TEXT,
+  total_cost_usd DOUBLE PRECISION,
+
+  -- Governed deliverable. NULL output_available means the receipt is still
+  -- pending; 0/1 means terminal-without / terminal-with a deliverable. The
+  -- payload columns are populated only when output_available is 1, so "no
+  -- deliverable" can never be misread as "an empty deliverable".
+  -- Size is capped in code (CANARY_MAX_OUTPUT_BYTES); oversized output FAILS
+  -- the run rather than being truncated into this column.
+  output_available SMALLINT,
+  output_text TEXT,
+  output_bytes INTEGER,
+  output_sha256 VARCHAR(64),
+  output_content_type VARCHAR(64),
+
+  sdk_subtype VARCHAR(64),
+  stop_reason VARCHAR(64),
+  errors TEXT,
+
+  reservation TEXT NOT NULL,
+
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- v1 → v2 defence. Contract v1 was never deployed, so there is no data to
+-- migrate; this exists only so a developer machine that ran v1 cannot keep a
+-- principal-free UNIQUE constraint that would silently reject a second
+-- principal. Discovered by INTROSPECTION rather than by name, because the
+-- inline UNIQUE(...) of v1 got a server-generated (and truncated) name.
+DO $$
+DECLARE
+  v1_constraint TEXT;
+BEGIN
+  SELECT con.conname INTO v1_constraint
+  FROM pg_constraint con
+  JOIN pg_class rel ON rel.oid = con.conrelid
+  WHERE rel.relname = 'remote_agent_canary_receipts'
+    AND con.contype = 'u'
+    AND (
+      SELECT array_agg(att.attname ORDER BY att.attname)
+      FROM unnest(con.conkey) AS k(attnum)
+      JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = k.attnum
+    ) = ARRAY['contract_digest', 'external_run_id', 'external_task_id']
+  LIMIT 1;
+
+  IF v1_constraint IS NOT NULL THEN
+    EXECUTE format(
+      'ALTER TABLE remote_agent_canary_receipts DROP CONSTRAINT %I', v1_constraint);
+    RAISE NOTICE 'Dropped canary v1 principal-free unique constraint %', v1_constraint;
+  END IF;
+END $$;
+
+-- Columns added by v2. Idempotent, for the same developer-machine case above.
+ALTER TABLE remote_agent_canary_receipts
+  ADD COLUMN IF NOT EXISTS output_available SMALLINT,
+  ADD COLUMN IF NOT EXISTS output_text TEXT,
+  ADD COLUMN IF NOT EXISTS output_bytes INTEGER,
+  ADD COLUMN IF NOT EXISTS output_sha256 VARCHAR(64),
+  ADD COLUMN IF NOT EXISTS output_content_type VARCHAR(64),
+  ADD COLUMN IF NOT EXISTS session_id VARCHAR(200),
+  ADD COLUMN IF NOT EXISTS terminal_status VARCHAR(16),
+  ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMP WITH TIME ZONE,
+  ADD COLUMN IF NOT EXISTS resolved_model VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS declared_max_turns INTEGER,
+  ADD COLUMN IF NOT EXISTS actual_turns INTEGER;
+
+-- THE identity key. A plain unique index rather than an inline constraint so it
+-- is addressable by name and so ON CONFLICT can target exactly these columns.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_receipts_identity
+  ON remote_agent_canary_receipts(principal, external_run_id, external_task_id, contract_digest);
+
+-- Read path: the governed read filters on principal + external ids + digest.
+CREATE INDEX IF NOT EXISTS idx_canary_receipts_lookup
+  ON remote_agent_canary_receipts(principal, external_run_id, external_task_id);
+
 
 -- ============================================================================
 -- Web auth (opt-in): role on the canonical user + Better Auth tables
